@@ -1383,6 +1383,16 @@ class MainWindow(QMainWindow):
             if hasattr(w, "paste"):
                 w.paste()
             return
+        # Finder/资源管理器里 Cmd+C 复制的文件：直接作为文件打开（与拖拽一致）
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path.lower().endswith((".xlsx", ".xls", ".csv", ".tsv")):
+                    self.load_file(path)
+                    return
+            QMessageBox.information(self, tr("粘贴打开"), tr("仅支持 Excel / CSV 文件"))
+            return
         text = QApplication.clipboard().text()
         if not text:
             return
