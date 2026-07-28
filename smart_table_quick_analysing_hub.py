@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import QApplication
 from qtui.main_window import MainWindow
 
 ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "assets", "smart_python_excel_blue_v3.png")
+                         "assets", "smart_table_quick_analysing_hub.png")
 
 
 def main():
