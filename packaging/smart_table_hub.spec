@@ -29,6 +29,7 @@ a = Analysis(
     hiddenimports=[
         "openpyxl", "xlrd", "python_calamine",
         "PIL", "PIL.Image", "PIL.ImageQt",
+        "certifi",
     ],
     excludes=[
         # 只保留 PyQt6 一套 Qt 绑定（Anaconda 环境常同时装有 PyQt5）

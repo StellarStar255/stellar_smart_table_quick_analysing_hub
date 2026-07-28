@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,18 @@ from qtui.i18n import tr
 API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 _HEADERS = {"User-Agent": f"{APP_NAME.replace(' ', '')}/{__version__}",
             "Accept": "application/vnd.github+json"}
+
+# PyInstaller 打包后的 Python 找不到系统 CA 证书（SSL: CERTIFICATE_VERIFY_FAILED），
+# 显式使用 certifi 内置的 CA 证书包（PyInstaller 会将其打进应用）。
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+
+
+def _urlopen(request, timeout):
+    return urllib.request.urlopen(request, timeout=timeout, context=_SSL_CTX)
 
 
 def _parse_version(text):
@@ -59,7 +72,7 @@ class UpdateChecker(QThread):
     def run(self):
         try:
             req = urllib.request.Request(API_LATEST, headers=_HEADERS)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _urlopen(req, timeout=15) as resp:
                 release = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # 网络失败不打扰用户
             self.failed.emit(str(exc))
@@ -88,7 +101,7 @@ class Downloader(QThread):
     def run(self):
         try:
             req = urllib.request.Request(self.url, headers=_HEADERS)
-            with urllib.request.urlopen(req, timeout=30) as resp, \
+            with _urlopen(req, timeout=30) as resp, \
                     open(self.dest, "wb") as fh:
                 total = int(resp.headers.get("Content-Length") or 0)
                 received = 0
@@ -121,7 +134,7 @@ def _fetch_checksum(release, asset_name):
             try:
                 req = urllib.request.Request(
                     asset["browser_download_url"], headers=_HEADERS)
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                with _urlopen(req, timeout=15) as resp:
                     for line in resp.read().decode("utf-8").splitlines():
                         parts = line.split()
                         if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
