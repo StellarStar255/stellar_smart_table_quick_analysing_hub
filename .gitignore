@@ -29,6 +29,12 @@ MODE_*
 # 敏感信息
 *.env
 **/*_credential*
+*.p12
+*.pfx
+
+# 打包产物
+/build/
+/dist/
 
 # 数据 / 二进制文件（运行时产生，不提交）
 **/*.xlsx
@@ -69,3 +75,4 @@ GenerateTraceFile.py
 
 # 旧的参考实现（不随开源发布）
 reference
+.venv-build/

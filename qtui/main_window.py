@@ -302,6 +302,11 @@ class MainWindow(QMainWindow):
             # 恢复上次会话（与 Tkinter 版行为一致）
             QTimer.singleShot(100, lambda: self.load_file(self.recent_files[0]))
 
+        # ---------- 启动后静默检查更新 ----------
+        from qtui.updater import UpdateManager
+        self._update_manager = UpdateManager(self)
+        QTimer.singleShot(3000, lambda: self._update_manager.check(silent=True))
+
     # ================= UI 构建 =================
 
     def _build_menu(self):
@@ -374,6 +379,21 @@ class MainWindow(QMainWindow):
                             ("最小值", "min"), ("计数", "count")):
             self._add_action(stats_menu, label,
                              lambda checked=False, f=func: self.apply_function(f))
+
+        # 帮助
+        help_menu = menubar.addMenu("帮助")
+        self._add_action(help_menu, "检查更新...",
+                         lambda: self._update_manager.check(silent=False))
+        self._add_action(help_menu, "关于", self._show_about)
+
+    def _show_about(self):
+        from version import __version__, APP_NAME, GITHUB_REPO
+        QMessageBox.about(
+            self, f"关于 {APP_NAME}",
+            f"<b>{APP_NAME}</b> v{__version__}<br><br>"
+            f"智能表格快速分析工具<br>"
+            f"<a href='https://github.com/{GITHUB_REPO}'>"
+            f"github.com/{GITHUB_REPO}</a>")
 
     def _add_action(self, menu, text, slot, shortcut=None):
         action = QAction(text, self)
