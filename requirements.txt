@@ -1,0 +1,7 @@
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+xlrd>=2.0.0
+Pillow>=10.0.0
+PyQt6>=6.6.0  # PyQt 界面（smart_table_quick_analysing_hub_qt.py）
+python-calamine>=0.2.0  # 快速 Excel 读取引擎（大文件提速数倍，缺失时自动回退 openpyxl）

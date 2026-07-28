@@ -1,0 +1,71 @@
+# Python
+**/__pycache__/
+*.py[cod]
+
+# IDE / 编辑器
+**/.idea/*
+.vscode/
+.claude/
+
+# 操作系统
+.DS_Store
+
+# 日志 / 临时文件
+**/*.log
+/tmp/
+**/bkp
+**/archive/
+MODE_*
+
+# 运行时输出 / 数据目录（不纳入版本库）
+/input/
+/output/
+/data/
+/model/
+/library/
+/supplement_data/
+/test/
+
+# 敏感信息
+*.env
+**/*_credential*
+
+# 数据 / 二进制文件（运行时产生，不提交）
+**/*.xlsx
+**/*.docx
+**/*.json
+**/*.pptx
+*.mp4
+*.jpeg
+*.jpg
+*.png
+*.webp
+*.gif
+*.bmp
+*.tiff
+
+# 保留打包的资源文件（图标等）
+!assets/*
+
+# 本机个人辅助脚本（非项目内容）
+/PyCharmStarter.py
+/ListFile.py
+/recycle.py
+/start_jupyter.bat
+/TAG_TO_BACKUP.py
+/TAG_XX.py
+/GitAddBasicFile.sh
+/CreateBasicFolder.sh
+/CreateNewREADME.py
+CreateReadme.py
+AddSourceInfo.sh
+RevealCurrentFolder.py
+GetNewPython.py
+TraeStarterMac.py
+GenerateTraceFile.py
+**/VSCodeStarter*.py
+**/CursorStarter*.py
+**/OpenTerminalOnCurrentFolderMac*
+
+# 旧的参考实现（不随开源发布）
+reference
