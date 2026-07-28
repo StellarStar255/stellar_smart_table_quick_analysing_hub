@@ -191,6 +191,8 @@ TRANSLATIONS = {
     '仅支持 Excel / CSV 文件': 'Only Excel / CSV files are supported',
 
     '粘贴打开': 'Paste to Open',
+    '正在读取 {} ...': 'Reading {} ...',
+    '正在写入 {} ({}/{}) ...': 'Writing {} ({}/{}) ...',
     '切换语言': 'Switch Language',
     '语言设置已保存，重启应用后生效。\n是否立即重启？':
         'Language preference saved. It takes effect after restart.\nRestart now?',

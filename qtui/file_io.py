@@ -126,22 +126,25 @@ def _dedupe_headers(headers):
 
 # ---------- 保存 ----------
 
-def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None):
+def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
+                  progress_cb=None):
     """把 {sheet名: DataFrame} 全量写入 xlsx。
 
     formulas: 可选 {sheet名: {(row, col): "=..."}}，公式覆盖写入对应单元格，
     Excel 打开时仍是可计算的公式（df 中已存计算结果，作为兜底值先写入）。
+    progress_cb: 可选 (sheet名, 序号从1起, 总数) -> None，逐 sheet 汇报进度。
     先写临时文件再原子替换，避免写一半损坏原文件（与旧版后台保存策略一致）。
     """
     order = sheet_order or list(sheets.keys())
+    order = [n for n in order if n in sheets]
     formulas = formulas or {}
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(file_path) or ".")
     os.close(fd)
     try:
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-            for name in order:
-                if name not in sheets:
-                    continue
+            for i, name in enumerate(order):
+                if progress_cb:
+                    progress_cb(name, i + 1, len(order))
                 safe_name = name[:31]
                 sheets[name].to_excel(writer, sheet_name=safe_name, index=False)
                 for (row, col), formula in formulas.get(name, {}).items():

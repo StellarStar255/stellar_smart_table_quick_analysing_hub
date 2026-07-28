@@ -752,11 +752,16 @@ class MainWindow(QMainWindow):
         self._do_save(path, switch_to=False)
 
     def _collect_all_sheets(self):
-        """收集所有 sheet 的完整数据（当前 sheet 用筛选前数据）。"""
+        """收集所有 sheet 的数据引用（当前 sheet 用筛选前数据）。
+
+        只取内存中已有的数据，不读盘；未缓存的 sheet 返回在 missing 列表里，
+        由调用方在后台线程读取（大文件读盘放 UI 线程会冻结界面）。
+        返回 (sheets, order, missing)。
+        """
         current_full = self.original_df if self.original_df is not None else self.model.df
         if not self.sheet_names:
-            return {"Sheet1": current_full}, ["Sheet1"]
-        sheets = {}
+            return {"Sheet1": current_full}, ["Sheet1"], []
+        sheets, missing = {}, []
         for name in self.sheet_names:
             if name == self.current_sheet:
                 sheets[name] = current_full
@@ -765,8 +770,8 @@ class MainWindow(QMainWindow):
             elif name in self.sheet_filters and self.sheet_filters[name].get("original_df") is not None:
                 sheets[name] = self.sheet_filters[name]["original_df"]
             elif self._excel_file is not None:
-                sheets[name] = file_io.read_sheet(self._excel_file, name)
-        return sheets, list(self.sheet_names)
+                missing.append(name)
+        return sheets, list(self.sheet_names), missing
 
     def _do_save(self, path, switch_to=True):
         ext = os.path.splitext(path)[1].lower()
@@ -777,13 +782,23 @@ class MainWindow(QMainWindow):
             df = self.original_df if self.original_df is not None else self.model.df
             work = lambda: file_io.save_csv(path, df)
         else:
-            sheets, order = self._collect_all_sheets()
+            sheets, order, missing = self._collect_all_sheets()
+            excel_file = self._excel_file
             formulas_map = dict(self._sheet_formulas)
             if self.current_sheet and not self.active_filters:
                 formulas_map[self.current_sheet] = dict(self.model.formulas)
             elif not self.sheet_names and self.model.formulas:
                 formulas_map["Sheet1"] = dict(self.model.formulas)
-            work = lambda: file_io.save_workbook(path, sheets, order, formulas_map)
+
+            def work():
+                # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
+                for name in missing:
+                    dialog.report(tr("正在读取 {} ...").format(name))
+                    sheets[name] = file_io.read_sheet(excel_file, name)
+                file_io.save_workbook(
+                    path, sheets, order, formulas_map,
+                    progress_cb=lambda name, i, total: dialog.report(
+                        tr("正在写入 {} ({}/{}) ...").format(name, i, total)))
 
         def done(result):
             # run_in_background 失败时回调 None；成功且 work 返回 None 无法区分，

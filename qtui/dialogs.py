@@ -19,17 +19,25 @@ from qtui.i18n import tr
 class _Worker(QThread):
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
+    progressed = pyqtSignal(str)
 
     def __init__(self, func, parent=None):
         super().__init__(parent)
         self._func = func
 
     def run(self):
+        # 纯 Python 密集任务（如 openpyxl 写盘）会长时间占住 GIL，
+        # 把主线程 UI 一起拖卡；缩短切换间隔让 UI 线程更容易抢到 GIL。
+        import sys
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.001)
         try:
             result = self._func()
             self.finished_ok.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())
+        finally:
+            sys.setswitchinterval(old_interval)
 
 
 class LoadingProgressDialog(QDialog):
@@ -90,9 +98,15 @@ class LoadingProgressDialog(QDialog):
         if message is not None:
             self._label.setText(message)
 
+    def report(self, message):
+        """供后台任务（工作线程）更新进度文案，线程安全。"""
+        if self._worker is not None:
+            self._worker.progressed.emit(message)
+
     def run_in_background(self, func, callback=None):
         """后台线程执行 func，完成后在主线程回调 callback(result)。"""
         self._worker = _Worker(func, self)
+        self._worker.progressed.connect(self._label.setText)
 
         def _done(result):
             self.close()
