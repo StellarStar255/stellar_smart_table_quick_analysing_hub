@@ -76,3 +76,5 @@ GenerateTraceFile.py
 # 旧的参考实现（不随开源发布）
 reference
 .venv-build/
+
+**/.DS_Store
