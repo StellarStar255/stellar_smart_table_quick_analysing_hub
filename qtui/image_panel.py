@@ -188,6 +188,13 @@ class ImagePreviewPanel(QWidget):
         self._zoom_settle_timer.setSingleShot(True)
         self._zoom_settle_timer.setInterval(120)
         self._zoom_settle_timer.timeout.connect(self._settle_zoom)
+        # 拖动期间的缩放应用按 ~80ms 节流：滑块每个像素都发 valueChanged，
+        # 逐个应用意味着每秒几十次全条重布局，肉眼即闪烁
+        self._zoom_pending = False
+        self._zoom_throttle = QTimer(self)
+        self._zoom_throttle.setSingleShot(True)
+        self._zoom_throttle.setInterval(80)
+        self._zoom_throttle.timeout.connect(self._flush_pending_zoom)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -276,14 +283,32 @@ class ImagePreviewPanel(QWidget):
     def _on_zoom_changed(self, value):
         self._zoom = value / 100.0
         self._zoom_label.setText(f"{value}%")
-        self._update_strip_height()
-        # 缩略图缓存按 2 倍尺寸保存，缩放只需重设现有单元的尺寸和 pixmap，
-        # 不清缓存、不重建胶片条（否则拖动期间全部变占位符，肉眼可见闪烁）。
-        dragging = self._zoom_slider.isSliderDown()
-        for cell in self._entries:
-            self._set_cell_pixmap(cell, smooth=not dragging)
-        if dragging:
+        if self._zoom_slider.isSliderDown():
+            # 拖动中：立即应用一次，随后 80ms 窗口内的变化合并到定时器统一应用
+            if self._zoom_throttle.isActive():
+                self._zoom_pending = True
+            else:
+                self._apply_zoom(smooth=False)
+                self._zoom_throttle.start()
             self._zoom_settle_timer.start()
+        else:
+            self._apply_zoom(smooth=True)
+
+    def _flush_pending_zoom(self):
+        if self._zoom_pending:
+            self._zoom_pending = False
+            self._apply_zoom(smooth=False)
+
+    def _apply_zoom(self, smooth):
+        # 缩略图缓存按 2 倍尺寸保存，缩放只需重设现有单元的尺寸和 pixmap，
+        # 不清缓存、不重建胶片条。批量更新期间冻结重绘，避免逐格闪烁。
+        self._strip_scroll.setUpdatesEnabled(False)
+        try:
+            self._update_strip_height()
+            for cell in self._entries:
+                self._set_cell_pixmap(cell, smooth=smooth)
+        finally:
+            self._strip_scroll.setUpdatesEnabled(True)
 
     # ---------- 路径 ----------
 
@@ -438,8 +463,8 @@ class ImagePreviewPanel(QWidget):
         self._scroll_anim.start()
 
     def _settle_zoom(self):
-        for cell in self._entries:
-            self._set_cell_pixmap(cell, smooth=True)
+        self._zoom_pending = False
+        self._apply_zoom(smooth=True)
 
     def _set_cell_pixmap(self, cell, smooth=True):
         size = self._thumb_size()
