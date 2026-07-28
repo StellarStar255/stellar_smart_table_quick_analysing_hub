@@ -34,8 +34,16 @@ STAGING=$(mktemp -d)
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 rm -f "$DMG"
-hdiutil create -volname "Smart Table Hub" -srcfolder "$STAGING" \
-    -ov -format UDZO "$DMG"
+# GitHub macOS runner 上 hdiutil 偶发 "Resource busy"（XProtect 扫描占用），重试即可
+for attempt in 1 2 3 4 5; do
+    if hdiutil create -volname "Smart Table Hub" -srcfolder "$STAGING" \
+        -ov -format UDZO "$DMG"; then
+        break
+    fi
+    [ "$attempt" -eq 5 ] && { echo "hdiutil 连续失败"; exit 1; }
+    echo "hdiutil 失败（第 $attempt 次），5 秒后重试..."
+    sleep 5
+done
 rm -rf "$STAGING"
 
 # 公证（需要 Developer ID 证书 + App 专用密码）:
