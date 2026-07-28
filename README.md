@@ -2,6 +2,23 @@
 
 一个功能强大的Excel替代品，使用Python和PyQt6构建，支持快速处理Excel、CSV文件和各种数据操作。
 
+## 下载安装
+
+从 [Releases](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/latest) 下载对应平台的安装包：
+
+| 平台 | 安装包 |
+|---|---|
+| macOS（Apple Silicon） | `SmartTableHub-<版本>-macos-arm64.dmg` |
+| macOS（Intel） | `SmartTableHub-<版本>-macos-x86_64.dmg` |
+| Ubuntu / Debian | `SmartTableHub-<版本>-linux-amd64.deb` |
+| Windows 10/11（64 位） | `SmartTableHub-<版本>-windows-x64-setup.exe` |
+
+安装后应用会自动检查新版本，也可通过菜单「帮助 → 检查更新...」
+一键升级（下载 → SHA256 校验 → 静默安装 → 自动重启）。
+
+> macOS 首次打开若提示"无法验证开发者"，请在
+> 系统设置 → 隐私与安全性 中点击"仍要打开"（安装包未经 Apple 公证时才会出现）。
+
 ## Quick Start
 
 ```bash
