@@ -65,12 +65,19 @@ class _MainImageView(QLabel):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._effect = QGraphicsOpacityEffect(self)
         self._effect.setOpacity(1.0)
+        self._effect.setEnabled(False)   # 常驻会让每次重绘走离屏缓冲，拖动缩放时闪烁
         self.setGraphicsEffect(self._effect)
         self._fade = QPropertyAnimation(self._effect, b"opacity", self)
         self._fade.setDuration(150)
         self._fade.setStartValue(0.4)
         self._fade.setEndValue(1.0)
         self._fade.setEasingCurve(QEasingCurve.Type.OutQuad)
+        self._fade.finished.connect(lambda: self._effect.setEnabled(False))
+        # 连续 resize（拖动分隔条/缩放条）期间用快速缩放，停顿后再平滑精缩一次
+        self._smooth_timer = QTimer(self)
+        self._smooth_timer.setSingleShot(True)
+        self._smooth_timer.setInterval(90)
+        self._smooth_timer.timeout.connect(lambda: self._rescale(smooth=True))
 
     def set_image(self, pixmap, path, fade=True):
         self._orig = pixmap
@@ -81,17 +88,20 @@ class _MainImageView(QLabel):
             self._rescale()
             if fade:
                 self._fade.stop()
+                self._effect.setEnabled(True)
                 self._fade.start()
 
-    def _rescale(self):
+    def _rescale(self, smooth=True):
         if self._orig is None:
             return
+        mode = (Qt.TransformationMode.SmoothTransformation if smooth
+                else Qt.TransformationMode.FastTransformation)
         self.setPixmap(self._orig.scaled(
-            self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio, mode))
 
     def resizeEvent(self, event):
-        self._rescale()
+        self._rescale(smooth=False)
+        self._smooth_timer.start()
         super().resizeEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -173,6 +183,11 @@ class ImagePreviewPanel(QWidget):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(60)
         self._refresh_timer.timeout.connect(self._rebuild_strip)
+        # 缩放滑块拖动结束后，对缩略图做一次平滑精缩
+        self._zoom_settle_timer = QTimer(self)
+        self._zoom_settle_timer.setSingleShot(True)
+        self._zoom_settle_timer.setInterval(120)
+        self._zoom_settle_timer.timeout.connect(self._settle_zoom)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -208,6 +223,7 @@ class ImagePreviewPanel(QWidget):
         self._zoom_slider.setRange(50, 200)
         self._zoom_slider.setValue(100)
         self._zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        self._zoom_slider.sliderReleased.connect(self._settle_zoom)
         zoom_row.addWidget(self._zoom_slider, 1)
         self._zoom_label = QLabel("100%")
         zoom_row.addWidget(self._zoom_label)
@@ -260,10 +276,14 @@ class ImagePreviewPanel(QWidget):
     def _on_zoom_changed(self, value):
         self._zoom = value / 100.0
         self._zoom_label.setText(f"{value}%")
-        self._thumb_cache.clear()
         self._update_strip_height()
-        if self._image_col is not None:
-            self._rebuild_strip()
+        # 缩略图缓存按 2 倍尺寸保存，缩放只需重设现有单元的尺寸和 pixmap，
+        # 不清缓存、不重建胶片条（否则拖动期间全部变占位符，肉眼可见闪烁）。
+        dragging = self._zoom_slider.isSliderDown()
+        for cell in self._entries:
+            self._set_cell_pixmap(cell, smooth=not dragging)
+        if dragging:
+            self._zoom_settle_timer.start()
 
     # ---------- 路径 ----------
 
@@ -417,7 +437,11 @@ class ImagePreviewPanel(QWidget):
         self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._scroll_anim.start()
 
-    def _set_cell_pixmap(self, cell):
+    def _settle_zoom(self):
+        for cell in self._entries:
+            self._set_cell_pixmap(cell, smooth=True)
+
+    def _set_cell_pixmap(self, cell, smooth=True):
         size = self._thumb_size()
         cell.img_label.setFixedSize(size)
         if cell.path is None:
@@ -426,9 +450,10 @@ class ImagePreviewPanel(QWidget):
         pix = self._thumb_cache.get(cell.path)
         if pix is not None:
             self._thumb_cache.move_to_end(cell.path)
+            mode = (Qt.TransformationMode.SmoothTransformation if smooth
+                    else Qt.TransformationMode.FastTransformation)
             cell.img_label.setPixmap(pix.scaled(
-                size, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+                size, Qt.AspectRatioMode.KeepAspectRatio, mode))
         else:
             cell.img_label.setText("…")
 
