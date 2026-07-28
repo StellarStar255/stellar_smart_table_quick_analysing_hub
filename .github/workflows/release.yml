@@ -29,6 +29,9 @@ jobs:
           - runner: macos-13   # Intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    env:
+      HAS_MAC_CERT: ${{ secrets.MACOS_CERT_P12 != '' }}
+      HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,7 +42,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt pyinstaller
       - name: Import signing certificate
-        if: ${{ secrets.MACOS_CERT_P12 != '' }}
+        if: ${{ env.HAS_MAC_CERT == 'true' }}
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -58,7 +61,7 @@ jobs:
             | sed 's/.*"\(.*\)"/\1/')
           echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
       - name: Setup notarization profile
-        if: ${{ secrets.APPLE_ID != '' }}
+        if: ${{ env.HAS_APPLE_ID == 'true' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -97,6 +100,8 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    env:
+      HAS_WIN_CERT: ${{ secrets.WIN_CERT_PFX != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -107,7 +112,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
       - name: Prepare signing certificate
-        if: ${{ secrets.WIN_CERT_PFX != '' }}
+        if: ${{ env.HAS_WIN_CERT == 'true' }}
         shell: pwsh
         env:
           WIN_CERT_PFX: ${{ secrets.WIN_CERT_PFX }}
