@@ -1,6 +1,263 @@
+# Smart Table Hub
+
+**English** | [中文](#smart-table-hub---智能表格处理工具)
+
+A powerful Excel alternative built with Python and PyQt6 for fast processing of Excel and CSV files, with a rich set of data manipulation features.
+
+> The app UI is available in English and Chinese — switch via "View → Language" menu, takes effect after restart.
+
+## Download & Install
+
+Download the installer for your platform from [Releases](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/latest):
+
+| Platform | Installer |
+|---|---|
+| macOS (Apple Silicon) | `SmartTableHub-<版本>-macos-arm64.dmg` |
+| macOS (Intel) | `SmartTableHub-<版本>-macos-x86_64.dmg` |
+| Ubuntu / Debian | `SmartTableHub-<版本>-linux-amd64.deb` |
+| Windows 10/11 (64-bit) | `SmartTableHub-<版本>-windows-x64-setup.exe` |
+
+Once installed, the app checks for new versions automatically. You can also update in one click via "Help → Check for Updates..." (download → SHA256 verification → silent install → automatic restart).
+
+> On macOS, if you see a "cannot verify the developer" warning on first launch, go to
+> System Settings → Privacy & Security and click "Open Anyway" (this only happens when the installer is not notarized by Apple).
+
+## Quick Start
+
+```bash
+# Pass a file path directly (positional argument)
+python smart_table_quick_analysing_hub_qt.py data.xlsx
+python smart_table_quick_analysing_hub_qt.py /path/to/file.csv
+
+# Specify a file with -f or --file
+python smart_table_quick_analysing_hub_qt.py -f report.xlsx
+python smart_table_quick_analysing_hub_qt.py --file /path/to/data.xlsx
+
+# Show help
+python smart_table_quick_analysing_hub_qt.py -h
+
+```
+
+## Features
+
+### 📊 File Operations
+- **Multi-format support**: Open and save .xlsx, .xls, and .csv files
+- **Smart encoding detection**: Automatically detects CSV file encodings (UTF-8, GBK, GB2312, and more)
+- **Quick import/export**: One-click CSV import and export
+- ✨ **Smart save**: The save dialog pre-selects the file name so you can rename it instantly
+- ✨ **Save vs. Save As**:
+  - **Save**: switches to the new file after saving
+  - **Save As**: saves a copy while you keep editing the original file
+
+### ✏️ Data Editing
+- **Intuitive editing**: Double-click any cell to edit
+- **Copy & paste**: Standard copy/paste operations
+- **Undo/redo**: Full undo/redo support (up to 50 steps)
+- **Batch operations**: Multi-row selection and bulk deletion
+
+### 🔧 Data Processing
+- **Sorting**: Sort any column in ascending or descending order
+- **Filtering**: Multiple conditions including equals, contains, greater than, and less than
+  - ✨ Pick filter values from a dropdown list
+  - ✨ All active filters shown as live tags
+  - ✨ Click a tag to edit the filter, click X to remove it
+  - ✨ Stack multiple filter conditions
+- **Find & replace**: Global find and replace
+- **Insert/delete**: Flexible row and column insertion and deletion
+
+### 📈 Statistics
+- **Descriptive statistics**: View complete statistics for your data in one click
+- **Common functions**: Sum, average, max, min, and count
+- **Instant calculation**: Select a column and get its statistics right away
+
+## Keyboard Shortcuts
+
+**File Operations**
+- `Ctrl+N`: New file
+- `Ctrl+O`: Open file
+- `Ctrl+S`: Save (switches to the new file after saving)
+- `Ctrl+Shift+S`: Save As a copy (keep editing the original file)
+
+**Editing**
+- `Ctrl+Z`: Undo
+- `Ctrl+Y`: Redo
+- `Ctrl+C`: Copy
+- `Ctrl+V`: Paste
+- `Delete`: Delete selected rows
+- `Enter`: Edit cell
+
+**Navigation** ✨New
+- `↑` / `↓`: Move up/down (auto page-turn at boundaries)
+- `Page Up` / `Page Down`: Previous/next page
+- `Home` / `End`: First/last row of the current page
+
+## Run from Source
+
+### 1. Clone or download the project
+
+```bash
+cd smart_table_quick_analysing_hub
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Run the app
+
+```bash
+python smart_table_quick_analysing_hub_qt.py
+```
+
+## System Requirements
+
+- Python 3.8 or later
+- OS: Windows, macOS, Linux
+
+## Dependencies
+
+- `pandas`: Core data processing
+- `numpy`: Numerical computation
+- `openpyxl`: Excel file I/O
+- `PyQt6`: GUI framework
+
+## User Guide
+
+### Basic Operations
+
+1. **Create a new spreadsheet**
+   - Click "File" > "New" or press `Ctrl+N`
+   - Creates an empty 100-row x 26-column spreadsheet by default
+
+2. **Open an existing file**
+   - Click "File" > "Open" or press `Ctrl+O`
+   - Select an .xlsx, .xls, or .csv file
+
+3. **Edit data**
+   - Double-click any cell to start editing
+   - Press `Enter` to confirm your input
+   - Press `Esc` to cancel editing
+
+4. **Save your file**
+
+   **Save (switch to the new file)**:
+   - Click "Save" on the toolbar or press `Ctrl+S`
+   - A dialog appears with the file name pre-selected
+   - Rename and save; the app switches to the new file automatically
+
+   **Save As (keep editing the original file)**:
+   - Click "Save As" on the toolbar or press `Ctrl+Shift+S`
+   - Saves a copy to a new file while you keep editing the original
+   - Great for backups or exporting filtered results
+
+### Advanced Features
+
+#### Sorting
+1. Click "Data" > "Sort"
+2. Choose the column to sort
+3. Choose ascending or descending order
+4. Click "Sort"
+
+Alternatively, click a column header for quick sorting.
+
+#### Filtering
+1. Click "Data" > "Filter"
+2. Choose a column and a condition
+3. Click the "Value" dropdown arrow and pick a value from the list (or type one)
+4. Click "Apply Filter"
+5. Filter tags appear below the toolbar
+6. Click a tag to edit the filter, click X to remove it
+7. Click "Clear All Filters" to restore the original data
+
+**Multiple filters**:
+- Apply as many filter conditions as you like, one after another
+- All conditions are combined (AND logic)
+- The filter bar shows every active filter condition
+
+#### Statistical Analysis
+1. Click "Statistics" > "Descriptive Statistics" for a full summary
+2. Or pick a specific function (sum, average, etc.)
+3. Choose the column to calculate
+4. View the result
+
+#### Find & Replace
+1. Click "Edit" > "Find & Replace"
+2. Enter the search text and the replacement text
+3. Click "Replace All"
+
+## Comparison with Excel
+
+| Feature | Smart Table Hub | Microsoft Excel |
+|------|-------------|-----------------|
+| Open Excel files | ✅ | ✅ |
+| Save Excel files | ✅ | ✅ |
+| CSV support | ✅ | ✅ |
+| Data editing | ✅ | ✅ |
+| Sorting & filtering | ✅ | ✅ |
+| Basic statistics | ✅ | ✅ |
+| Find & replace | ✅ | ✅ |
+| Undo/redo | ✅ (50 steps) | ✅ |
+| Completely free | ✅ | ❌ |
+| Open source | ✅ | ❌ |
+| Cross-platform | ✅ | ⚠️ |
+| Advanced formulas | ⚠️ Planned | ✅ |
+| Charts | ⚠️ Planned | ✅ |
+
+## Roadmap
+
+- [ ] Excel formula evaluation
+- [ ] Data visualization (charts)
+- [ ] Conditional formatting
+- [ ] Pivot tables
+- [ ] Multiple worksheets
+- [ ] More data processing functions
+- [ ] Themes and style customization
+
+## FAQ
+
+**Q: Some Excel files won't open?**
+A: Make sure the `openpyxl` library is installed. Legacy .xls files require the `xlrd` library.
+
+**Q: My CSV file shows garbled characters. What can I do?**
+A: The app automatically tries multiple encodings (UTF-8, GBK, GB2312, and more). If the problem persists, convert the encoding with a text editor first.
+
+**Q: Does it handle large files?**
+A: The app limits the display to the first 1,000 rows for performance. For files with over 100,000 rows, a dedicated database tool is recommended. This tool works best with small to medium datasets (<100k rows).
+
+**Q: Can I export to PDF?**
+A: Not in the current version; it is being considered for a future release.
+
+**Q: I see ghosting/double images on macOS. How do I fix it?**
+A: Fixed in v1.1.0. The app now detects macOS and adjusts its display settings automatically.
+
+**Q: Opening large files is slow or laggy?**
+A: Performance was optimized in v1.2.0. Turn off the "Image Preview" toggle on the toolbar for maximum performance. The app uses paginated display with 50 rows per page.
+
+**Q: Photos in the image preview look squashed?**
+A: Fixed in v1.2.0. Images now keep their original aspect ratio without stretching. Photos in 16:9, 4:3, square, and other ratios all display correctly.
+
+**Q: I set 50 rows per page but only 20 are shown?**
+A: Fixed in v1.2.0. Previously the row count was automatically reduced for files with many columns. The algorithm has been improved to guarantee at least 30-50 rows. A status hint is shown for files with an exceptionally large number of columns (>150).
+
+## License
+
+This project is licensed under the MIT License — free to use, modify, and distribute.
+
+## Contributing
+
+Issues and Pull Requests are welcome!
+
+---
+
 # Smart Table Hub - 智能表格处理工具
 
+[English](#smart-table-hub) | **中文**
+
 一个功能强大的Excel替代品，使用Python和PyQt6构建，支持快速处理Excel、CSV文件和各种数据操作。
+
+> 应用界面支持中英文切换，菜单「视图 → 语言 / Language」，切换后重启生效。
 
 ## 下载安装
 

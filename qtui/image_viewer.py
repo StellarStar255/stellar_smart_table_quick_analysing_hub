@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
     QLabel, QMainWindow, QMenu, QMessageBox,
 )
 
+from qtui.i18n import tr
+
 
 def copy_image_to_clipboard(image_path):
     """复制图片到剪贴板，成功返回 True"""
@@ -91,7 +93,7 @@ class ImageViewer(QMainWindow):
 
         if self._pixmap.isNull():
             # 图片缺失或损坏时显示提示，不崩溃
-            label = QLabel(f"无法加载图片:\n{image_path}")
+            label = QLabel(tr("无法加载图片:\n{}").format(image_path))
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setWordWrap(True)
             self.setCentralWidget(label)
@@ -136,14 +138,14 @@ class ImageViewer(QMainWindow):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        copy_action = QAction("复制图片", menu)
+        copy_action = QAction(tr("复制图片"), menu)
         copy_action.triggered.connect(self._copy_image)
         menu.addAction(copy_action)
-        reveal_action = QAction("在Finder中显示", menu)
+        reveal_action = QAction(tr("在Finder中显示"), menu)
         reveal_action.triggered.connect(self._reveal_in_finder)
         menu.addAction(reveal_action)
         menu.addSeparator()
-        close_action = QAction("关闭", menu)
+        close_action = QAction(tr("关闭"), menu)
         close_action.triggered.connect(self.close)
         menu.addAction(close_action)
         menu.exec(event.globalPos())
@@ -151,10 +153,10 @@ class ImageViewer(QMainWindow):
     def _copy_image(self):
         if copy_image_to_clipboard(self.image_path):
             name = os.path.basename(self.image_path)
-            self.setWindowTitle(f"{name} (已复制)")
+            self.setWindowTitle(tr("{} (已复制)").format(name))
             QTimer.singleShot(1500, lambda: self.setWindowTitle(name))
         else:
-            QMessageBox.warning(self, "错误", "复制图片失败")
+            QMessageBox.warning(self, tr("错误"), tr("复制图片失败"))
 
     def _reveal_in_finder(self):
         system = platform.system()
@@ -166,4 +168,4 @@ class ImageViewer(QMainWindow):
             else:
                 subprocess.run(['xdg-open', os.path.dirname(self.image_path)])
         except Exception as e:
-            QMessageBox.warning(self, "错误", f"无法打开文件位置: {e}")
+            QMessageBox.warning(self, tr("错误"), tr("无法打开文件位置: {}").format(e))

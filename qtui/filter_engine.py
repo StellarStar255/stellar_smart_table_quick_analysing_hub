@@ -8,6 +8,9 @@
 
 import pandas as pd
 
+from qtui.i18n import tr
+
+# 内部标识符（同时是中文界面文案）；界面显示处用 tr() 翻译，内部值保持不变
 CONDITIONS = [
     '等于', '包含', '大于', '小于', '不等于',
     '开头是', '结尾是', '为空', '不为空',
@@ -69,8 +72,8 @@ def describe_filter(filter_info) -> str:
         n = len(value)
         preview = ', '.join(str(v) for v in list(value)[:3])
         if n > 3:
-            preview += f'... ({n}项)'
+            preview += tr('... ({}项)').format(n)
         return f"{col}: {preview}"
     if condition in ('为空', '不为空'):
-        return f"{col} {condition}"
-    return f"{col} {condition} {value}"
+        return f"{col} {tr(condition)}"
+    return f"{col} {tr(condition)} {value}"

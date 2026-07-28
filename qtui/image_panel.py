@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect, QSizePolicy,
 )
 
+from qtui.i18n import tr
+
 STRIP_BEFORE, STRIP_AFTER = 10, 12      # 胶片条向前/向后渲染的行数
 THUMB_CACHE_LIMIT = 300
 MAIN_CACHE_LIMIT = 24
@@ -74,7 +76,7 @@ class _MainImageView(QLabel):
         self._orig = pixmap
         self.path = path
         if pixmap is None:
-            self.setText("(无图片)")
+            self.setText(tr("(无图片)"))
         else:
             self._rescale()
             if fade:
@@ -201,7 +203,7 @@ class ImagePreviewPanel(QWidget):
 
         # ---- 缩放（控制胶片条缩略图大小） ----
         zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel("缩放:"))
+        zoom_row.addWidget(QLabel(tr("缩放:")))
         self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_slider.setRange(50, 200)
         self._zoom_slider.setValue(100)
@@ -211,7 +213,7 @@ class ImagePreviewPanel(QWidget):
         zoom_row.addWidget(self._zoom_label)
         layout.addLayout(zoom_row)
 
-        self._hint = QLabel("右键列头选择「设为图片列」")
+        self._hint = QLabel(tr("右键列头选择「设为图片列」"))
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._hint)
 
@@ -290,8 +292,8 @@ class ImagePreviewPanel(QWidget):
     def _update_main_image(self, fade=True):
         path = self._current_path()
         if self._current_row >= 0:
-            name = os.path.basename(path) if path else "无图片"
-            self._main_caption.setText(f"行 {self._current_row + 1} · {name}")
+            name = os.path.basename(path) if path else tr("无图片")
+            self._main_caption.setText(tr("行 {} · {}").format(self._current_row + 1, name))
         else:
             self._main_caption.setText("")
         if path is None:
@@ -306,7 +308,7 @@ class ImagePreviewPanel(QWidget):
         thumb = self._thumb_cache.get(path)
         self.main_view.set_image(thumb, path, fade=False)
         if thumb is None:
-            self.main_view.setText("加载中...")
+            self.main_view.setText(tr("加载中..."))
         if path not in self._main_inflight:
             self._main_inflight.add(path)
             self._pool.start(_ImageLoader(path, MAIN_LOAD_CAP, self._main_signals))
@@ -316,7 +318,7 @@ class ImagePreviewPanel(QWidget):
         if img.isNull():
             if path == self._current_path():
                 self.main_view.set_image(None, path, fade=False)
-                self.main_view.setText("(无法加载图片)")
+                self.main_view.setText(tr("(无法加载图片)"))
             return
         pix = QPixmap.fromImage(img)
         self._main_cache[path] = pix
@@ -419,7 +421,7 @@ class ImagePreviewPanel(QWidget):
         size = self._thumb_size()
         cell.img_label.setFixedSize(size)
         if cell.path is None:
-            cell.img_label.setText("无图")
+            cell.img_label.setText(tr("无图"))
             return
         pix = self._thumb_cache.get(cell.path)
         if pix is not None:
@@ -443,7 +445,7 @@ class ImagePreviewPanel(QWidget):
         if img.isNull():
             for cell in self._entries:
                 if cell.path == path:
-                    cell.img_label.setText("加载失败")
+                    cell.img_label.setText(tr("加载失败"))
             return
         pix = QPixmap.fromImage(img)
         self._thumb_cache[path] = pix

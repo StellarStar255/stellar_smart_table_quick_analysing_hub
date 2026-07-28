@@ -26,6 +26,7 @@ if not getattr(sys, "frozen", False):
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
+from qtui.i18n import tr
 from qtui.main_window import MainWindow
 from version import __version__, APP_NAME
 
@@ -37,9 +38,10 @@ ICON_PATH = os.path.join(_BASE_DIR, "assets",
 
 def main():
     parser = argparse.ArgumentParser(description="Smart Table Hub (PyQt6)")
-    parser.add_argument("file", nargs="?", default=None, help="启动时打开的文件")
+    parser.add_argument("file", nargs="?", default=None,
+                        help=tr("启动时打开的文件"))
     parser.add_argument("-f", "--file", dest="file_opt", default=None,
-                        help="启动时打开的文件（与位置参数等效，兼容旧版入口）")
+                        help=tr("启动时打开的文件（与位置参数等效，兼容旧版入口）"))
     args = parser.parse_args()
     initial_file = args.file_opt or args.file
 

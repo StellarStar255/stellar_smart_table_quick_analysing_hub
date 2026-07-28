@@ -10,35 +10,37 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 
+from qtui.i18n import tr
+
 
 class FindReplaceDialog(QDialog):
     """在表格中查找/替换。依赖宿主窗口提供 model 和 jump_to_cell。"""
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("查找替换")
+        self.setWindowTitle(tr("查找替换"))
         self._host = parent
         self._matches = []
         self._pos = -1
 
         layout = QGridLayout(self)
-        layout.addWidget(QLabel("查找:"), 0, 0)
+        layout.addWidget(QLabel(tr("查找:")), 0, 0)
         self.find_edit = QLineEdit()
         layout.addWidget(self.find_edit, 0, 1, 1, 3)
-        layout.addWidget(QLabel("替换为:"), 1, 0)
+        layout.addWidget(QLabel(tr("替换为:")), 1, 0)
         self.replace_edit = QLineEdit()
         layout.addWidget(self.replace_edit, 1, 1, 1, 3)
 
-        self.case_cb = QCheckBox("区分大小写")
+        self.case_cb = QCheckBox(tr("区分大小写"))
         layout.addWidget(self.case_cb, 2, 1)
 
-        find_btn = QPushButton("查找下一个")
+        find_btn = QPushButton(tr("查找下一个"))
         find_btn.clicked.connect(self.find_next)
         layout.addWidget(find_btn, 3, 1)
-        replace_btn = QPushButton("替换")
+        replace_btn = QPushButton(tr("替换"))
         replace_btn.clicked.connect(self.replace_current)
         layout.addWidget(replace_btn, 3, 2)
-        replace_all_btn = QPushButton("全部替换")
+        replace_all_btn = QPushButton(tr("全部替换"))
         replace_all_btn.clicked.connect(self.replace_all)
         layout.addWidget(replace_all_btn, 3, 3)
 
@@ -74,12 +76,13 @@ class FindReplaceDialog(QDialog):
             self._matches = self._search()
             self._pos = -1
         if not self._matches:
-            self.status.setText("未找到匹配项")
+            self.status.setText(tr("未找到匹配项"))
             return
         self._pos = (self._pos + 1) % len(self._matches)
         row, col = self._matches[self._pos]
         self._host.jump_to_cell(row, col)
-        self.status.setText(f"第 {self._pos + 1} / {len(self._matches)} 个匹配")
+        self.status.setText(
+            tr("第 {} / {} 个匹配").format(self._pos + 1, len(self._matches)))
 
     def replace_current(self):
         if self._pos < 0 or not self._matches:
@@ -102,7 +105,7 @@ class FindReplaceDialog(QDialog):
     def replace_all(self):
         matches = self._search()
         if not matches:
-            self.status.setText("未找到匹配项")
+            self.status.setText(tr("未找到匹配项"))
             return
         model = self._host.model
         find_text = self.find_edit.text()
@@ -119,5 +122,5 @@ class FindReplaceDialog(QDialog):
             if model.setData(model.index(row, col), new):
                 count += 1
         self._invalidate()
-        self.status.setText(f"已替换 {count} 处")
-        QMessageBox.information(self, "替换", f"已替换 {count} 处")
+        self.status.setText(tr("已替换 {} 处").format(count))
+        QMessageBox.information(self, tr("替换"), tr("已替换 {} 处").format(count))

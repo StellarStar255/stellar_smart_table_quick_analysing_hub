@@ -25,6 +25,7 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
 from version import __version__, APP_NAME, GITHUB_REPO
+from qtui.i18n import tr
 
 API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 _HEADERS = {"User-Agent": f"{APP_NAME.replace(' ', '')}/{__version__}",
@@ -225,11 +226,12 @@ class UpdateManager:
         if not silent:
             self._checker.finished_none.connect(
                 lambda: QMessageBox.information(
-                    self.window, "检查更新",
-                    f"当前已是最新版本（v{__version__}）。"))
+                    self.window, tr("检查更新"),
+                    tr("当前已是最新版本（v{}）。").format(__version__)))
             self._checker.failed.connect(
                 lambda msg: QMessageBox.warning(
-                    self.window, "检查更新", f"检查更新失败：\n{msg}"))
+                    self.window, tr("检查更新"),
+                    tr("检查更新失败：\n{}").format(msg)))
         self._checker.start()
 
     def _on_update_found(self, release):
@@ -244,11 +246,11 @@ class UpdateManager:
         if not getattr(sys, "frozen", False) or asset is None:
             # 源码运行 / 未找到本平台安装包：引导到 Release 页面
             box = QMessageBox(self.window)
-            box.setWindowTitle("发现新版本")
-            box.setText(f"发现新版本 {tag}（当前 v{__version__}）。")
+            box.setWindowTitle(tr("发现新版本"))
+            box.setText(tr("发现新版本 {}（当前 v{}）。").format(tag, __version__))
             box.setInformativeText(notes or "")
-            go = box.addButton("前往下载页面", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+            go = box.addButton(tr("前往下载页面"), QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(tr("以后再说"), QMessageBox.ButtonRole.RejectRole)
             box.exec()
             if box.clickedButton() is go:
                 QDesktopServices.openUrl(QUrl(release.get(
@@ -256,12 +258,12 @@ class UpdateManager:
             return
 
         box = QMessageBox(self.window)
-        box.setWindowTitle("发现新版本")
-        box.setText(f"发现新版本 {tag}（当前 v{__version__}），是否立即升级？\n"
-                    "升级包下载完成后将自动安装并重启应用。")
+        box.setWindowTitle(tr("发现新版本"))
+        box.setText(tr("发现新版本 {}（当前 v{}），是否立即升级？\n"
+                       "升级包下载完成后将自动安装并重启应用。").format(tag, __version__))
         box.setInformativeText(notes or "")
-        yes = box.addButton("一键升级", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+        yes = box.addButton(tr("一键升级"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(tr("以后再说"), QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is yes:
             self._download_and_install(release, asset)
@@ -271,8 +273,8 @@ class UpdateManager:
     def _download_and_install(self, release, asset):
         dest = os.path.join(tempfile.gettempdir(), asset["name"])
         dialog = QProgressDialog(
-            f"正在下载 {asset['name']} …", "取消", 0, 100, self.window)
-        dialog.setWindowTitle("下载升级包")
+            tr("正在下载 {} …").format(asset['name']), tr("取消"), 0, 100, self.window)
+        dialog.setWindowTitle(tr("下载升级包"))
         dialog.setAutoClose(False)
         dialog.setMinimumDuration(0)
 
@@ -286,7 +288,8 @@ class UpdateManager:
                           self._verify_and_install(release, asset, path)))
         self._downloader.failed.connect(
             lambda msg: (dialog.close(), QMessageBox.warning(
-                self.window, "下载失败", f"升级包下载失败：\n{msg}")))
+                self.window, tr("下载失败"),
+                tr("升级包下载失败：\n{}").format(msg))))
         self._downloader.start()
         dialog.exec()
 
@@ -296,19 +299,19 @@ class UpdateManager:
             actual = _sha256(path)
             if actual != expected:
                 QMessageBox.critical(
-                    self.window, "校验失败",
-                    "升级包 SHA256 校验失败，已取消安装。\n"
-                    "请前往官方 Release 页面手动下载。")
+                    self.window, tr("校验失败"),
+                    tr("升级包 SHA256 校验失败，已取消安装。\n"
+                       "请前往官方 Release 页面手动下载。"))
                 os.unlink(path)
                 return
         else:
             box = QMessageBox(self.window)
             box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle("无法校验")
-            box.setText("该版本缺少 SHA256SUMS.txt，无法校验升级包完整性。\n"
-                        "是否仍然继续安装？")
-            cont = box.addButton("继续安装", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.setWindowTitle(tr("无法校验"))
+            box.setText(tr("该版本缺少 SHA256SUMS.txt，无法校验升级包完整性。\n"
+                           "是否仍然继续安装？"))
+            cont = box.addButton(tr("继续安装"), QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(tr("取消"), QMessageBox.ButtonRole.RejectRole)
             box.exec()
             if box.clickedButton() is not cont:
                 os.unlink(path)

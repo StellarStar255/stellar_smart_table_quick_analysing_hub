@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .filter_engine import CONDITIONS
+from qtui.i18n import tr
 
 MAX_UNIQUE_VALUES = 500
 
@@ -22,7 +23,7 @@ class FilterDialog(QDialog):
 
     def __init__(self, parent, df: pd.DataFrame, preset_col=None, edit_filter=None):
         super().__init__(parent)
-        self.setWindowTitle("筛选")
+        self.setWindowTitle(tr("筛选"))
         self.resize(420, 520)
         self._df = df
         self.result = None
@@ -31,7 +32,7 @@ class FilterDialog(QDialog):
 
         # 列选择
         col_row = QHBoxLayout()
-        col_row.addWidget(QLabel("列:"))
+        col_row.addWidget(QLabel(tr("列:")))
         self.col_combo = QComboBox()
         self.col_combo.addItems([str(c) for c in df.columns])
         if preset_col and str(preset_col) in [str(c) for c in df.columns]:
@@ -46,33 +47,35 @@ class FilterDialog(QDialog):
         value_tab = QWidget()
         v_layout = QVBoxLayout(value_tab)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索值...")
+        self.search_edit.setPlaceholderText(tr("搜索值..."))
         v_layout.addWidget(self.search_edit)
-        self.select_all_cb = QCheckBox("全选")
+        self.select_all_cb = QCheckBox(tr("全选"))
         self.select_all_cb.setChecked(True)
         v_layout.addWidget(self.select_all_cb)
         self.value_list = QListWidget()
         v_layout.addWidget(self.value_list, 1)
         self.value_hint = QLabel("")
         v_layout.addWidget(self.value_hint)
-        self.tabs.addTab(value_tab, "按值筛选")
+        self.tabs.addTab(value_tab, tr("按值筛选"))
 
         # --- 按条件筛选 ---
         cond_tab = QWidget()
         c_layout = QVBoxLayout(cond_tab)
         cond_row = QHBoxLayout()
-        cond_row.addWidget(QLabel("条件:"))
+        cond_row.addWidget(QLabel(tr("条件:")))
         self.cond_combo = QComboBox()
-        self.cond_combo.addItems(CONDITIONS)
+        # 显示译文，内部值（userData）保持中文标识符不变
+        for cond in CONDITIONS:
+            self.cond_combo.addItem(tr(cond), cond)
         cond_row.addWidget(self.cond_combo, 1)
         c_layout.addLayout(cond_row)
         val_row = QHBoxLayout()
-        val_row.addWidget(QLabel("值:"))
+        val_row.addWidget(QLabel(tr("值:")))
         self.value_edit = QLineEdit()
         val_row.addWidget(self.value_edit, 1)
         c_layout.addLayout(val_row)
         c_layout.addStretch(1)
-        self.tabs.addTab(cond_tab, "按条件筛选")
+        self.tabs.addTab(cond_tab, tr("按条件筛选"))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -84,7 +87,7 @@ class FilterDialog(QDialog):
         self.col_combo.currentTextChanged.connect(self._reload_values)
         self.search_edit.textChanged.connect(self._apply_search)
         self.select_all_cb.toggled.connect(self._toggle_all)
-        self.cond_combo.currentTextChanged.connect(self._on_condition_change)
+        self.cond_combo.currentIndexChanged.connect(self._on_condition_change)
 
         self._reload_values()
 
@@ -108,7 +111,8 @@ class FilterDialog(QDialog):
             item.setCheckState(Qt.CheckState.Checked)
             self.value_list.addItem(item)
         self.value_hint.setText(
-            f"共 {len(uniques)} 个唯一值" + ("（仅显示前 500 个）" if truncated else ""))
+            tr("共 {} 个唯一值").format(len(uniques))
+            + (tr("（仅显示前 500 个）") if truncated else ""))
 
     def _apply_search(self, text):
         text = text.lower()
@@ -123,7 +127,8 @@ class FilterDialog(QDialog):
             if not item.isHidden():
                 item.setCheckState(state)
 
-    def _on_condition_change(self, cond):
+    def _on_condition_change(self, _index=None):
+        cond = self.cond_combo.currentData()
         self.value_edit.setEnabled(cond not in ("为空", "不为空"))
 
     def _prefill(self, f):
@@ -137,7 +142,9 @@ class FilterDialog(QDialog):
                     else Qt.CheckState.Unchecked)
         else:
             self.tabs.setCurrentIndex(1)
-            self.cond_combo.setCurrentText(f["condition"])
+            idx = self.cond_combo.findData(f["condition"])
+            if idx >= 0:
+                self.cond_combo.setCurrentIndex(idx)
             if f["condition"] not in ("为空", "不为空"):
                 self.value_edit.setText(str(f["value"]))
 
@@ -150,7 +157,7 @@ class FilterDialog(QDialog):
                        for i in range(self.value_list.count())
                        if self.value_list.item(i).checkState() == Qt.CheckState.Checked]
             if not checked:
-                QMessageBox.warning(self, "筛选", "请至少勾选一个值")
+                QMessageBox.warning(self, tr("筛选"), tr("请至少勾选一个值"))
                 return
             if len(checked) == self.value_list.count():
                 # 全选等于没筛选
@@ -158,16 +165,16 @@ class FilterDialog(QDialog):
                 return
             self.result = {"col": col, "condition": "值在列表中", "value": checked}
         else:
-            cond = self.cond_combo.currentText()
+            cond = self.cond_combo.currentData()
             value = self.value_edit.text()
             if cond not in ("为空", "不为空") and value == "":
-                QMessageBox.warning(self, "筛选", "请输入筛选值")
+                QMessageBox.warning(self, tr("筛选"), tr("请输入筛选值"))
                 return
             if cond in ("大于", "小于"):
                 try:
                     float(value)
                 except ValueError:
-                    QMessageBox.warning(self, "筛选", "大于/小于 条件需要数值")
+                    QMessageBox.warning(self, tr("筛选"), tr("大于/小于 条件需要数值"))
                     return
             self.result = {"col": col, "condition": cond, "value": value}
         self.accept()

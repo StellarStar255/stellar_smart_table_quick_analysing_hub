@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .pandas_model import PandasTableModel
+from qtui.i18n import tr
 
 PRESETS_FILE = os.path.join(os.path.expanduser("~"), ".smart_table_hub", "qt_python_presets.json")
 
@@ -179,15 +180,15 @@ class CodeRunWorker(QThread):
 
         def save_as_sheet(result_df, sheet_name=None):
             if not isinstance(result_df, pd.DataFrame):
-                raise TypeError("结果必须是 pandas DataFrame")
+                raise TypeError(tr("结果必须是 pandas DataFrame"))
             if sheet_name is None:
-                sheet_name = f"分析结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                sheet_name = tr("分析结果_{}").format(datetime.now().strftime('%Y%m%d_%H%M%S'))
             sheet_requests.append((result_df.copy(), str(sheet_name)))
-            print(f"✓ 已加入保存队列: {sheet_name}")
+            print(tr("✓ 已加入保存队列: {}").format(sheet_name))
 
         def save_figure(fig, filename=None):
             if filename is None:
-                filename = f"分析图表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                filename = tr("分析图表_{}.png").format(datetime.now().strftime('%Y%m%d_%H%M%S'))
             if not os.path.dirname(filename):
                 if self._current_file:
                     base_dir = os.path.dirname(self._current_file)
@@ -196,7 +197,7 @@ class CodeRunWorker(QThread):
                 filename = os.path.join(base_dir, filename)
             fig.savefig(filename, dpi=150, bbox_inches="tight")
             figure_files.append(filename)
-            print(f"✓ 图表已保存: {filename}")
+            print(tr("✓ 图表已保存: {}").format(filename))
 
         namespace = {
             "df": self._df,
@@ -211,7 +212,7 @@ class CodeRunWorker(QThread):
             try:
                 exec(self._code, namespace)
             except Exception:
-                buf.write("\n[执行错误]\n")
+                buf.write("\n" + tr("[执行错误]") + "\n")
                 buf.write(traceback.format_exc())
 
         # 扫描命名空间中的 DataFrame 变量
@@ -237,7 +238,7 @@ class PythonAnalysisWindow(QMainWindow):
         self._worker = None
         self._result_dfs = {}
 
-        self.setWindowTitle("Python 数据分析")
+        self.setWindowTitle(tr("Python 数据分析"))
         self.resize(1000, 700)
 
         self.presets = self._load_presets()
@@ -248,39 +249,39 @@ class PythonAnalysisWindow(QMainWindow):
     # ---------------- UI ----------------
 
     def _build_ui(self):
-        toolbar = QToolBar("工具栏")
+        toolbar = QToolBar(tr("工具栏"))
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        toolbar.addWidget(QLabel(" 预设: "))
+        toolbar.addWidget(QLabel(tr(" 预设: ")))
         self.preset_combo = QComboBox()
         self.preset_combo.setMinimumWidth(180)
         toolbar.addWidget(self.preset_combo)
 
-        apply_btn = QPushButton("应用预设")
+        apply_btn = QPushButton(tr("应用预设"))
         apply_btn.clicked.connect(lambda: self._apply_preset(append=False))
         toolbar.addWidget(apply_btn)
 
-        append_btn = QPushButton("追加")
+        append_btn = QPushButton(tr("追加"))
         append_btn.clicked.connect(lambda: self._apply_preset(append=True))
         toolbar.addWidget(append_btn)
 
-        save_preset_btn = QPushButton("保存为预设")
+        save_preset_btn = QPushButton(tr("保存为预设"))
         save_preset_btn.clicked.connect(self._save_current_as_preset)
         toolbar.addWidget(save_preset_btn)
 
-        del_preset_btn = QPushButton("删除预设")
+        del_preset_btn = QPushButton(tr("删除预设"))
         del_preset_btn.clicked.connect(self._delete_preset)
         toolbar.addWidget(del_preset_btn)
 
         toolbar.addSeparator()
 
-        self.run_action = QAction("▶ 运行", self)
+        self.run_action = QAction(tr("▶ 运行"), self)
         self.run_action.setShortcut(QKeySequence(Qt.Key.Key_F5))
         self.run_action.triggered.connect(self.run_code)
         toolbar.addAction(self.run_action)
 
-        clear_action = QAction("清空输出", self)
+        clear_action = QAction(tr("清空输出"), self)
         clear_action.triggered.connect(lambda: self.output_edit.clear())
         toolbar.addAction(clear_action)
 
@@ -298,10 +299,10 @@ class PythonAnalysisWindow(QMainWindow):
 
         self.code_edit = CodeEditor()
         self.code_edit.setFont(mono)
-        self.code_edit.setPlaceholderText(
+        self.code_edit.setPlaceholderText(tr(
             "# 可用变量: df (当前数据副本), pd, np\n"
             "# 可用函数: save_as_sheet(df, '名称'), save_figure(fig, '文件名.png')"
-        )
+        ))
         self._highlighter = PythonHighlighter(self.code_edit.document())
         splitter.addWidget(self.code_edit)
 
@@ -314,16 +315,16 @@ class PythonAnalysisWindow(QMainWindow):
 
         # 结果 DataFrame 行
         result_row = QHBoxLayout()
-        result_row.addWidget(QLabel("结果 DataFrame:"))
+        result_row.addWidget(QLabel(tr("结果 DataFrame:")))
         self.result_combo = QComboBox()
         self.result_combo.setMinimumWidth(160)
         result_row.addWidget(self.result_combo)
 
-        preview_btn = QPushButton("预览")
+        preview_btn = QPushButton(tr("预览"))
         preview_btn.clicked.connect(self._preview_result)
         result_row.addWidget(preview_btn)
 
-        save_sheet_btn = QPushButton("保存为Sheet")
+        save_sheet_btn = QPushButton(tr("保存为Sheet"))
         save_sheet_btn.clicked.connect(self._save_result_as_sheet)
         result_row.addWidget(save_sheet_btn)
 
@@ -349,7 +350,7 @@ class PythonAnalysisWindow(QMainWindow):
             with open(PRESETS_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.presets, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存预设失败:\n{e}")
+            QMessageBox.critical(self, tr("错误"), tr("保存预设失败:\n{}").format(e))
 
     def _update_preset_combo(self, select_name=None):
         self.preset_combo.blockSignals(True)
@@ -373,15 +374,15 @@ class PythonAnalysisWindow(QMainWindow):
     def _save_current_as_preset(self):
         code = self.code_edit.toPlainText().strip()
         if not code:
-            QMessageBox.warning(self, "提示", "编辑器内容为空，无法保存为预设")
+            QMessageBox.warning(self, tr("提示"), tr("编辑器内容为空，无法保存为预设"))
             return
-        name, ok = QInputDialog.getText(self, "保存为预设", "预设名称:",
+        name, ok = QInputDialog.getText(self, tr("保存为预设"), tr("预设名称:"),
                                         text=self.preset_combo.currentText())
         if not ok or not name.strip():
             return
         name = name.strip()
         if name in self.presets:
-            ans = QMessageBox.question(self, "确认", f"预设 “{name}” 已存在，是否覆盖?")
+            ans = QMessageBox.question(self, tr("确认"), tr("预设 “{}” 已存在，是否覆盖?").format(name))
             if ans != QMessageBox.StandardButton.Yes:
                 return
         self.presets[name] = code
@@ -392,7 +393,7 @@ class PythonAnalysisWindow(QMainWindow):
         name = self.preset_combo.currentText()
         if not name or name not in self.presets:
             return
-        ans = QMessageBox.question(self, "确认", f"确定删除预设 “{name}”?")
+        ans = QMessageBox.question(self, tr("确认"), tr("确定删除预设 “{}”?").format(name))
         if ans != QMessageBox.StandardButton.Yes:
             return
         del self.presets[name]
@@ -406,14 +407,14 @@ class PythonAnalysisWindow(QMainWindow):
             return
         code = self.code_edit.toPlainText().strip()
         if not code:
-            QMessageBox.warning(self, "提示", "请输入要运行的代码")
+            QMessageBox.warning(self, tr("提示"), tr("请输入要运行的代码"))
             return
 
         df = getattr(self.host.model, "df", None)
         df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
         self.output_edit.clear()
-        self.output_edit.setPlainText("正在运行...\n")
+        self.output_edit.setPlainText(tr("正在运行...\n"))
         self.run_action.setEnabled(False)
 
         self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None), self)
@@ -422,7 +423,7 @@ class PythonAnalysisWindow(QMainWindow):
 
     def _on_run_done(self, output, result_dfs, sheet_requests, figure_files):
         self.run_action.setEnabled(True)
-        self.output_edit.setPlainText(output if output else "✓ 代码执行完成（无输出）\n")
+        self.output_edit.setPlainText(output if output else tr("✓ 代码执行完成（无输出）\n"))
         sb = self.output_edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -430,20 +431,22 @@ class PythonAnalysisWindow(QMainWindow):
         self._result_dfs = result_dfs
         self.result_combo.clear()
         for name, rdf in result_dfs.items():
-            self.result_combo.addItem(f"{name} ({len(rdf)}行×{len(rdf.columns)}列)", name)
+            self.result_combo.addItem(
+                tr("{} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)), name)
 
         # save_as_sheet 队列在主线程统一执行（线程安全）
         for rdf, sheet_name in sheet_requests:
             try:
                 self.host.add_sheet_from_df(rdf, sheet_name)
             except Exception as e:
-                self.output_edit.appendPlainText(f"[保存Sheet失败] {sheet_name}: {e}")
+                self.output_edit.appendPlainText(
+                    tr("[保存Sheet失败] {}: {}").format(sheet_name, e))
 
         if sheet_requests:
             names = ", ".join(n for _, n in sheet_requests)
-            self._status(f"已保存 {len(sheet_requests)} 个Sheet: {names}")
+            self._status(tr("已保存 {} 个Sheet: {}").format(len(sheet_requests), names))
         else:
-            self._status("代码执行完成")
+            self._status(tr("代码执行完成"))
 
         worker = self._worker
         self._worker = None
@@ -460,7 +463,7 @@ class PythonAnalysisWindow(QMainWindow):
     def _current_result_df(self):
         name = self.result_combo.currentData()
         if not name or name not in self._result_dfs:
-            QMessageBox.information(self, "提示", "没有可用的结果 DataFrame，请先运行代码")
+            QMessageBox.information(self, tr("提示"), tr("没有可用的结果 DataFrame，请先运行代码"))
             return None, None
         return name, self._result_dfs[name]
 
@@ -469,7 +472,7 @@ class PythonAnalysisWindow(QMainWindow):
         if rdf is None:
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"预览 - {name} ({len(rdf)}行×{len(rdf.columns)}列)")
+        dlg.setWindowTitle(tr("预览 - {} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)))
         dlg.resize(800, 500)
         layout = QVBoxLayout(dlg)
         view = QTableView()
@@ -488,14 +491,14 @@ class PythonAnalysisWindow(QMainWindow):
         if rdf is None:
             return
         default = f"{name}_{datetime.now().strftime('%H%M%S')}" if name == "df" else name
-        sheet_name, ok = QInputDialog.getText(self, "保存为Sheet", "Sheet 名称:", text=default)
+        sheet_name, ok = QInputDialog.getText(self, tr("保存为Sheet"), tr("Sheet 名称:"), text=default)
         if not ok or not sheet_name.strip():
             return
         try:
             self.host.add_sheet_from_df(rdf.copy(), sheet_name.strip())
-            self._status(f"已保存Sheet: {sheet_name.strip()}")
+            self._status(tr("已保存Sheet: {}").format(sheet_name.strip()))
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存Sheet失败:\n{e}")
+            QMessageBox.critical(self, tr("错误"), tr("保存Sheet失败:\n{}").format(e))
 
     # ---------------- 关闭 ----------------
 

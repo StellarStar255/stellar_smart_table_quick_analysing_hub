@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QDialog, QLabel, QProgressBar, QVBoxLayout, QApplication,
 )
 
+from qtui.i18n import tr
+
 
 class _Worker(QThread):
     finished_ok = pyqtSignal(object)
@@ -41,7 +43,9 @@ class LoadingProgressDialog(QDialog):
         close()
     """
 
-    def __init__(self, parent=None, title="加载中", message="请稍候..."):
+    def __init__(self, parent=None, title=None, message=None):
+        title = title if title is not None else tr("加载中")
+        message = message if message is not None else tr("请稍候...")
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)

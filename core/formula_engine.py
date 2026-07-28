@@ -6,6 +6,8 @@ import re
 from typing import Any, Tuple, List, Set, Optional
 import pandas as pd
 
+from qtui.i18n import tr
+
 
 class FormulaEngine:
     """Excel 公式解析和计算引擎（解耦版本）"""
@@ -56,7 +58,7 @@ class FormulaEngine:
         df = df if df is not None else self._df
         match = self.CELL_REF_PATTERN.match(ref)
         if not match:
-            raise ValueError(f"无效的单元格引用: {ref}")
+            raise ValueError(tr("无效的单元格引用: {}").format(ref))
 
         col_letter = match.group(1).upper()
         row_num = int(match.group(2))
@@ -76,7 +78,7 @@ class FormulaEngine:
         df = df if df is not None else self._df
         match = self.RANGE_REF_PATTERN.match(range_ref)
         if not match:
-            raise ValueError(f"无效的区域引用: {range_ref}")
+            raise ValueError(tr("无效的区域引用: {}").format(range_ref))
 
         start_col = self.col_letter_to_index(match.group(1).upper())
         start_row = int(match.group(2)) - 1
@@ -275,7 +277,7 @@ class FormulaEngine:
 
         for name in code.co_names:
             if name not in allowed_names:
-                raise ValueError(f"不支持的函数: {name}")
+                raise ValueError(tr("不支持的函数: {}").format(name))
 
         return eval(code, {"__builtins__": {}}, allowed_names)
 

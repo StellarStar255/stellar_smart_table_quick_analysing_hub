@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.image_viewer import ImageViewer, copy_image_to_clipboard
+from qtui.i18n import tr
 
 # macOS 全局按键监控（自动模式）：Quartz CGEventTap 在后台线程运行
 try:
@@ -71,7 +72,7 @@ class FloatingImageQueue(QWidget):
 
         self.setWindowFlags(Qt.WindowType.Window
                             | Qt.WindowType.WindowStaysOnTopHint)
-        self.setWindowTitle("图片队列复制")
+        self.setWindowTitle(tr("图片队列复制"))
 
         self._build_ui()
 
@@ -97,7 +98,7 @@ class FloatingImageQueue(QWidget):
         # 进度（可编辑跳转）
         progress_row = QHBoxLayout()
         progress_row.addStretch()
-        progress_row.addWidget(QLabel("进度:"))
+        progress_row.addWidget(QLabel(tr("进度:")))
         self.progress_edit = QLineEdit()
         self.progress_edit.setFixedWidth(48)
         self.progress_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -122,16 +123,16 @@ class FloatingImageQueue(QWidget):
 
         # 按钮区域
         btn_row = QHBoxLayout()
-        self.prev_btn = QPushButton("◀ 上一张")
+        self.prev_btn = QPushButton(tr("◀ 上一张"))
         self.prev_btn.clicked.connect(self._go_prev)
         btn_row.addWidget(self.prev_btn)
-        self.copy_btn = QPushButton("复制当前")
+        self.copy_btn = QPushButton(tr("复制当前"))
         self.copy_btn.clicked.connect(self._copy_current)
         btn_row.addWidget(self.copy_btn)
-        self.next_btn = QPushButton("下一张 ▶")
+        self.next_btn = QPushButton(tr("下一张 ▶"))
         self.next_btn.clicked.connect(self._go_next)
         btn_row.addWidget(self.next_btn)
-        self.close_btn = QPushButton("关闭")
+        self.close_btn = QPushButton(tr("关闭"))
         self.close_btn.clicked.connect(self.close)
         btn_row.addWidget(self.close_btn)
         layout.addLayout(btn_row)
@@ -141,7 +142,7 @@ class FloatingImageQueue(QWidget):
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # 自动模式（仅 macOS + Quartz 可用时显示）
-        self.auto_check = QCheckBox("粘贴后自动下一张")
+        self.auto_check = QCheckBox(tr("粘贴后自动下一张"))
         self.auto_check.toggled.connect(self._on_auto_toggle)
         layout.addWidget(self.auto_check, alignment=Qt.AlignmentFlag.AlignHCenter)
         if not QUARTZ_AVAILABLE:
@@ -226,10 +227,10 @@ class FloatingImageQueue(QWidget):
     def _on_no_permission(self):
         self.auto_check.setChecked(False)
         QMessageBox.information(
-            self, "需要权限",
-            "自动模式需要「辅助功能」权限\n"
-            "请在 系统设置 → 隐私与安全性 → 辅助功能 中\n"
-            "添加运行此程序的终端或 Python"
+            self, tr("需要权限"),
+            tr("自动模式需要「辅助功能」权限\n"
+               "请在 系统设置 → 隐私与安全性 → 辅助功能 中\n"
+               "添加运行此程序的终端或 Python")
         )
 
     def _auto_advance(self):
@@ -273,7 +274,7 @@ class FloatingImageQueue(QWidget):
         pixmap = QPixmap(path)
         if pixmap.isNull():
             self.preview_label.setPixmap(QPixmap())
-            self.preview_label.setText("(无法预览)")
+            self.preview_label.setText(tr("(无法预览)"))
             return
         scaled = pixmap.scaled(
             _PREVIEW_MAX_W, _PREVIEW_MAX_H,
@@ -291,9 +292,10 @@ class FloatingImageQueue(QWidget):
         path = self.image_paths[self.current_index]
         total = len(self.image_paths)
         if copy_image_to_clipboard(path):
-            self.status_label.setText(f"已复制 {self.current_index + 1}/{total}")
+            self.status_label.setText(
+                tr("已复制 {}/{}").format(self.current_index + 1, total))
         else:
-            self.status_label.setText("复制失败")
+            self.status_label.setText(tr("复制失败"))
         QTimer.singleShot(1500, lambda: self.status_label.setText(""))
 
     def _jump_to_index(self):

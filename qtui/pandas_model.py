@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 
 from core.formula_engine import FormulaEngine
+from qtui.i18n import tr
 
 FORMULA_TEXT_COLOR = "#4a9edb"  # 公式单元格文字颜色（Excel 风格的蓝）
 
@@ -390,7 +391,7 @@ class PandasTableModel(QAbstractTableModel):
 
     def insert_column(self, position: int, name: str = None):
         if name is None:
-            name = self._unique_col_name("新列")
+            name = self._unique_col_name(tr("新列"))
         self._invalidate_values()
         self.beginInsertColumns(QModelIndex(), position, position)
         self._df.insert(position, name, np.nan)
