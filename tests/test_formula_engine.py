@@ -170,24 +170,116 @@ class TestStringLiteralProtection:
 # ---------- 错误处理 ----------
 
 class TestErrors:
-    def test_sqrt_negative_is_error_not_complex(self, engine):
-        assert engine.evaluate('=SQRT(0-A1)') == '#ERROR'
+    def test_sqrt_negative_is_num_error(self, engine):
+        assert engine.evaluate('=SQRT(0-A1)') == '#NUM!'
 
-    def test_power_producing_complex_is_error(self, engine):
-        assert engine.evaluate('=POWER(0-A1, 0.5)') == '#ERROR'
+    def test_power_producing_complex_is_num_error(self, engine):
+        assert engine.evaluate('=POWER(0-A1, 0.5)') == '#NUM!'
 
     def test_division_by_zero(self, engine):
-        assert engine.evaluate('=A1/A9') == '#ERROR'
+        assert engine.evaluate('=A1/A9') == '#DIV/0!'
 
-    def test_unsupported_function(self, engine):
-        assert engine.evaluate('=VLOOKUP(A1, B1:B3, 1)') == '#ERROR'
+    def test_unsupported_function_is_name_error(self, engine):
+        assert engine.evaluate('=VLOOKUP(A1, B1:B3, 1)') == '#NAME?'
 
     def test_malformed_formula(self, engine):
         assert engine.evaluate('=SUM(A1:A3') == '#ERROR'
 
+    def test_type_mismatch_is_value_error(self, engine):
+        assert engine.evaluate('=C1+A1') == '#VALUE!'
+
     def test_builtins_not_reachable(self, engine):
-        assert engine.evaluate('=__import__("os")') == '#ERROR'
-        assert engine.evaluate('=open("/etc/passwd")') == '#ERROR'
+        assert engine.evaluate('=__import__("os")') == '#NAME?'
+        assert engine.evaluate('=open("/etc/passwd")') == '#NAME?'
+
+    def test_is_error_helper(self):
+        assert FormulaEngine.is_error('#DIV/0!')
+        assert FormulaEngine.is_error('#ERROR')
+        assert not FormulaEngine.is_error('ok')
+        assert not FormulaEngine.is_error(12)
+
+
+# ---------- 逻辑函数 ----------
+
+class TestLogicFunctions:
+    def test_and(self, engine):
+        assert engine.evaluate('=AND(A1>4, B1=1)') is True
+        assert engine.evaluate('=AND(A1>4, B1=2)') is False
+
+    def test_or(self, engine):
+        assert engine.evaluate('=OR(A1>10, B3=3)') is True
+        assert engine.evaluate('=OR(A1>10, B3=99)') is False
+
+    def test_not(self, engine):
+        assert engine.evaluate('=NOT(A1>10)') is True
+
+    def test_nested_in_if(self, engine):
+        assert engine.evaluate('=IF(AND(A1>4, A2>3), "y", "n")') == 'y'
+
+    def test_true_false_literals(self, engine):
+        assert engine.evaluate('=AND(TRUE, A1>4)') is True
+        assert engine.evaluate('=IF(FALSE, 1, 2)') == 2
+        assert engine.evaluate('=if(false, 1, 2)') == 2
+
+    def test_true_inside_string_untouched(self, engine):
+        assert engine.evaluate('=CONCAT("TRUE", "!")') == 'TRUE!'
+
+
+# ---------- 条件聚合 ----------
+
+@pytest.fixture
+def sales():
+    df = pd.DataFrame({
+        'Cat': ['a', 'b', 'a', 'c'],
+        'Amt': [10, 20, 30, 40],
+    })
+    return FormulaEngine(df)
+
+
+class TestConditionalAggregates:
+    def test_countif_text(self, sales):
+        assert sales.evaluate('=COUNTIF(A1:A4, "a")') == 2
+
+    def test_countif_numeric_criteria(self, sales):
+        assert sales.evaluate('=COUNTIF(B1:B4, ">15")') == 3
+        assert sales.evaluate('=COUNTIF(B1:B4, "<=20")') == 2
+        assert sales.evaluate('=COUNTIF(B1:B4, 20)') == 1
+
+    def test_countif_not_equal(self, sales):
+        assert sales.evaluate('=COUNTIF(A1:A4, "<>a")') == 2
+
+    def test_countif_wildcard(self, sales):
+        assert sales.evaluate('=COUNTIF(A1:A4, "a*")') == 2
+        assert sales.evaluate('=COUNTIF(A1:A4, "?")') == 4
+
+    def test_countif_case_insensitive(self, sales):
+        assert sales.evaluate('=COUNTIF(A1:A4, "A")') == 2
+
+    def test_sumif_with_sum_range(self, sales):
+        assert sales.evaluate('=SUMIF(A1:A4, "a", B1:B4)') == 40
+
+    def test_sumif_without_sum_range(self, sales):
+        assert sales.evaluate('=SUMIF(B1:B4, ">15")') == 90
+
+    def test_averageif(self, sales):
+        assert sales.evaluate('=AVERAGEIF(A1:A4, "a", B1:B4)') == 20
+
+    def test_averageif_no_match_is_div0(self, sales):
+        assert sales.evaluate('=AVERAGEIF(A1:A4, "zzz", B1:B4)') == '#DIV/0!'
+
+    def test_nested_with_countif(self, sales):
+        assert sales.evaluate('=IF(COUNTIF(A1:A4, "a")=2, "ok", "no")') == 'ok'
+
+
+# ---------- COUNT / COUNTA ----------
+
+class TestCountSemantics:
+    def test_count_only_numbers(self, engine):
+        # A1=5, B1=1 是数值，C1='ab' 是文本
+        assert engine.evaluate('=COUNT(A1:C1)') == 2
+
+    def test_counta_includes_text(self, engine):
+        assert engine.evaluate('=COUNTA(A1:C1)') == 3
 
 
 # ---------- 排序行号重映射 ----------

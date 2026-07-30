@@ -219,12 +219,12 @@ class PandasTableModel(QAbstractTableModel):
     def evaluate_all_formulas(self):
         """重算全部公式并写入 df（载入公式后调用）。
 
-        引擎不支持的公式（如 VLOOKUP）返回 #ERROR，此时保留 df 中
-        来自 Excel 的缓存计算值，不覆盖。
+        引擎不支持的公式（如 VLOOKUP）返回错误值（#NAME? 等），
+        此时保留 df 中来自 Excel 的缓存计算值，不覆盖。
         """
         for key, formula in self.formulas.items():
             result = self._evaluate(formula)
-            if result != "#ERROR":
+            if not FormulaEngine.is_error(result):
                 self._set_cell(key[0], key[1], result)
         self._rebuild_all_deps()
 

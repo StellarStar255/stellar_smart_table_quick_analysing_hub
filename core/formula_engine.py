@@ -2,11 +2,20 @@
 公式引擎模块 - Excel 公式解析和计算
 解耦版本：通过参数传入DataFrame而不是依赖GUI对象
 """
+import fnmatch
 import re
 from typing import Any, Tuple, List, Set, Optional
 import pandas as pd
 
 from qtui.i18n import tr
+
+
+class FormulaNameError(ValueError):
+    """公式使用了不支持的函数名 -> #NAME?"""
+
+
+class FormulaNumError(ValueError):
+    """数值域错误（如负数开方）-> #NUM!"""
 
 
 class FormulaEngine:
@@ -21,6 +30,14 @@ class FormulaEngine:
     # 字符串占位符：\x00 不会出现在用户输入中，也不会被引用/函数正则误匹配
     _STRING_PLACEHOLDER = '\x00{}\x00'
     _STRING_PLACEHOLDER_PATTERN = re.compile('\x00(\\d+)\x00')
+
+    # 所有可能的错误返回值（对齐 Excel 错误码；#ERROR 为未分类兜底）
+    ERROR_VALUES = frozenset({"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!"})
+
+    @classmethod
+    def is_error(cls, value: Any) -> bool:
+        """判断求值结果是否为错误值"""
+        return isinstance(value, str) and value in cls.ERROR_VALUES
 
     def __init__(self, df: Optional[pd.DataFrame] = None):
         """
@@ -176,12 +193,18 @@ class FormulaEngine:
             # Excel 风格比较符转 Python 风格：= -> ==, <> -> !=
             expr = self._normalize_operators(expr)
 
-            # 替换区域引用为值列表
+            # 替换区域引用为值列表（保留文本值，聚合函数自行过滤数值；
+            # 文本占位保护，避免其中的 "A1" 等被后续替换误伤）
             def replace_range(match):
                 cells = self.parse_range_ref(match.group(), df)
-                values = [self.get_cell_value(r, c, df) for r, c in cells]
-                numeric_values = [v for v in values if isinstance(v, (int, float))]
-                return str(numeric_values)
+                parts = []
+                for r, c in cells:
+                    v = self.get_cell_value(r, c, df)
+                    if isinstance(v, str):
+                        parts.append(stash(repr(v)))
+                    else:
+                        parts.append(str(v))
+                return '[' + ', '.join(parts) + ']'
 
             expr = self.RANGE_REF_PATTERN.sub(replace_range, expr)
 
@@ -209,7 +232,7 @@ class FormulaEngine:
 
             # 复数（如对负数开偶次方）视为错误，与 Excel 的 #NUM! 一致
             if isinstance(result, complex):
-                return "#ERROR"
+                return "#NUM!"
 
             # 格式化结果
             if isinstance(result, float):
@@ -218,23 +241,35 @@ class FormulaEngine:
                 return round(result, 10)
             return result
 
+        except ZeroDivisionError:
+            return "#DIV/0!"
+        except FormulaNameError:
+            return "#NAME?"
+        except FormulaNumError:
+            return "#NUM!"
+        except TypeError:
+            return "#VALUE!"
         except Exception:
             return "#ERROR"
 
     # Excel 函数名 -> 求值环境中的实现名（长名在前，避免 CONCAT 抢先匹配 CONCATENATE）
     FUNC_MAP = {
         'CONCATENATE': '_concat', 'CONCAT': '_concat',
-        'AVERAGE': '_avg', 'COUNT': '_count',
+        'AVERAGEIF': '_averageif', 'AVERAGE': '_avg',
+        'COUNTIF': '_countif', 'COUNTA': '_counta', 'COUNT': '_count',
+        'SUMIF': '_sumif', 'SUM': '_sum',
         'LEFT': '_left', 'RIGHT': '_right', 'MID': '_mid',
         'LEN': '_len', 'UPPER': '_upper', 'LOWER': '_lower', 'TRIM': '_trim',
-        'SUM': '_sum', 'MAX': '_max', 'MIN': '_min',
-        'IF': '_if', 'ABS': 'abs', 'ROUND': '_round',
+        'MAX': '_max', 'MIN': '_min',
+        'IF': '_if', 'AND': '_and', 'OR': '_or', 'NOT': '_not',
+        'ABS': 'abs', 'ROUND': '_round',
         'POWER': 'pow', 'SQRT': '_sqrt', 'MOD': '_mod',
     }
 
     _FUNC_NAME_PATTERN = re.compile(
         r'\b(' + '|'.join(FUNC_MAP) + r')\s*\(', re.IGNORECASE
     )
+    _BOOL_LITERAL_PATTERN = re.compile(r'\b(TRUE|FALSE)\b', re.IGNORECASE)
 
     # 重映射用：单独捕获行号前的 $（绝对行引用不随排序移动）
     _REMAP_CELL_PATTERN = re.compile(r'(\$?[A-Z]+)(\$?)(\d+)', re.IGNORECASE)
@@ -322,22 +357,87 @@ class FormulaEngine:
         只改写函数名本身、不用正则切分参数，参数结构交给表达式
         编译器处理，因此嵌套调用（如 IF(SUM(A1:A3)>10, ...)）可以正常工作。
         """
-        return self._FUNC_NAME_PATTERN.sub(
+        expr = self._FUNC_NAME_PATTERN.sub(
             lambda m: self.FUNC_MAP[m.group(1).upper()] + '(', expr
         )
+        # Excel 布尔字面量 TRUE/FALSE -> Python True/False
+        return self._BOOL_LITERAL_PATTERN.sub(
+            lambda m: 'True' if m.group(1).upper() == 'TRUE' else 'False', expr
+        )
+
+    @staticmethod
+    def _criteria_predicate(criteria):
+        """把 COUNTIF/SUMIF/AVERAGEIF 的条件转成谓词函数。
+
+        支持：">10"、">=10"、"<5"、"<=5"、"<>x"、"=x"、纯值相等，
+        以及文本通配符 * 和 ?（文本比较不区分大小写，与 Excel 一致）。
+        """
+        def is_num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        if not isinstance(criteria, str):
+            return lambda v: is_num(v) and v == criteria
+
+        m = re.match(r'^(>=|<=|<>|>|<|=)(.*)$', criteria)
+        if m:
+            op, rest = m.group(1), m.group(2).strip()
+            try:
+                target = float(rest)
+                numeric = True
+            except ValueError:
+                target = rest.lower()
+                numeric = False
+
+            def pred(v):
+                if numeric:
+                    if not is_num(v):
+                        return False
+                    a, b = v, target
+                else:
+                    a, b = str(v).lower(), target
+                if op == '=':
+                    return a == b
+                if op == '<>':
+                    return a != b
+                if op == '>':
+                    return a > b
+                if op == '>=':
+                    return a >= b
+                if op == '<':
+                    return a < b
+                return a <= b
+
+            return pred
+
+        if '*' in criteria or '?' in criteria:
+            pattern = criteria.lower()
+            return lambda v: fnmatch.fnmatchcase(str(v).lower(), pattern)
+
+        try:
+            num_target = float(criteria)
+            return lambda v: ((is_num(v) and v == num_target)
+                              or str(v).lower() == criteria.lower())
+        except ValueError:
+            return lambda v: str(v).lower() == criteria.lower()
 
     def _safe_eval(self, expr: str) -> Any:
         """安全求值，限制可用函数"""
-        def _flat_numeric(args):
-            # 展平区域产生的列表并只保留数值，供聚合函数使用
+        def _flatten(args):
+            # 展平区域产生的列表
             values = []
             for a in args:
-                items = a if isinstance(a, (list, tuple)) else [a]
-                values.extend(
-                    v for v in items
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                )
+                if isinstance(a, (list, tuple)):
+                    values.extend(a)
+                else:
+                    values.append(a)
             return values
+
+        def _is_num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        def _flat_numeric(args):
+            # 展平并只保留数值，供聚合函数使用
+            return [v for v in _flatten(args) if _is_num(v)]
 
         def _sum(*args):
             return sum(_flat_numeric(args))
@@ -367,14 +467,43 @@ class FormulaEngine:
             return ''.join(parts)
 
         def _count(*args):
-            # 处理列表或多个参数
-            total = 0
-            for a in args:
-                if isinstance(a, (list, tuple)):
-                    total += len(a)
-                else:
-                    total += 1
-            return total
+            # 与 Excel 一致：只数数值
+            return len(_flat_numeric(args))
+
+        def _counta(*args):
+            # 数全部（含文本）
+            return len(_flatten(args))
+
+        def _countif(rng, criteria):
+            pred = self._criteria_predicate(criteria)
+            return sum(1 for v in _flatten([rng]) if pred(v))
+
+        def _sumif(rng, criteria, sum_rng=None):
+            pred = self._criteria_predicate(criteria)
+            cond_values = _flatten([rng])
+            sum_values = cond_values if sum_rng is None else _flatten([sum_rng])
+            return sum(v for cond, v in zip(cond_values, sum_values)
+                       if pred(cond) and _is_num(v))
+
+        def _averageif(rng, criteria, avg_rng=None):
+            pred = self._criteria_predicate(criteria)
+            cond_values = _flatten([rng])
+            avg_values = cond_values if avg_rng is None else _flatten([avg_rng])
+            matched = [v for cond, v in zip(cond_values, avg_values)
+                       if pred(cond) and _is_num(v)]
+            if not matched:
+                # 与 Excel 一致：无匹配时报 #DIV/0!
+                raise ZeroDivisionError("AVERAGEIF: no matching values")
+            return sum(matched) / len(matched)
+
+        def _and(*args):
+            return all(bool(v) for v in _flatten(args))
+
+        def _or(*args):
+            return any(bool(v) for v in _flatten(args))
+
+        def _not(value):
+            return not value
 
         def _if(condition, true_val, false_val):
             return true_val if condition else false_val
@@ -396,7 +525,7 @@ class FormulaEngine:
         def _sqrt(value):
             if value < 0:
                 # 与 Excel 的 #NUM! 一致，不返回复数
-                raise ValueError("SQRT of negative number")
+                raise FormulaNumError("SQRT of negative number")
             return value ** 0.5
 
         allowed_names = {
@@ -405,6 +534,9 @@ class FormulaEngine:
             'str': str, 'pow': pow,
             'True': True, 'False': False,
             '_avg': _avg, '_concat': _concat, '_count': _count,
+            '_counta': _counta, '_countif': _countif,
+            '_sumif': _sumif, '_averageif': _averageif,
+            '_and': _and, '_or': _or, '_not': _not,
             '_sum': _sum, '_max': _max, '_min': _min, '_if': _if,
             '_left': _left, '_right': _right, '_mid': _mid,
             '_len': lambda text: len(str(text)),
@@ -420,7 +552,7 @@ class FormulaEngine:
 
         for name in code.co_names:
             if name not in allowed_names:
-                raise ValueError(tr("不支持的函数: {}").format(name))
+                raise FormulaNameError(tr("不支持的函数: {}").format(name))
 
         return eval(code, {"__builtins__": {}}, allowed_names)
 
