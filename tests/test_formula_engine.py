@@ -180,7 +180,7 @@ class TestErrors:
         assert engine.evaluate('=A1/A9') == '#DIV/0!'
 
     def test_unsupported_function_is_name_error(self, engine):
-        assert engine.evaluate('=VLOOKUP(A1, B1:B3, 1)') == '#NAME?'
+        assert engine.evaluate('=SUMPRODUCT(A1:A3, B1:B3)') == '#NAME?'
 
     def test_malformed_formula(self, engine):
         assert engine.evaluate('=SUM(A1:A3') == '#ERROR'
@@ -269,6 +269,106 @@ class TestConditionalAggregates:
 
     def test_nested_with_countif(self, sales):
         assert sales.evaluate('=IF(COUNTIF(A1:A4, "a")=2, "ok", "no")') == 'ok'
+
+
+# ---------- 查找函数 ----------
+
+@pytest.fixture
+def lookup():
+    df = pd.DataFrame({
+        'ID': ['a', 'b', 'c', 'd'],
+        'Name': ['Ann', 'Bob', 'Cid', 'Dan'],
+        'Score': [10, 20, 30, 40],
+    })
+    return FormulaEngine(df)
+
+
+class TestVlookup:
+    def test_exact_match(self, lookup):
+        assert lookup.evaluate('=VLOOKUP("b", A1:C4, 2, FALSE)') == 'Bob'
+        assert lookup.evaluate('=VLOOKUP("b", A1:C4, 3, FALSE)') == 20
+
+    def test_case_insensitive(self, lookup):
+        assert lookup.evaluate('=VLOOKUP("B", A1:C4, 2, FALSE)') == 'Bob'
+
+    def test_wildcard(self, lookup):
+        assert lookup.evaluate('=VLOOKUP("b*", A1:C4, 2, FALSE)') == 'Bob'
+
+    def test_approximate_default(self, lookup):
+        # 默认近似匹配：<= 25 的最大值是 20
+        assert lookup.evaluate('=VLOOKUP(25, C1:C4, 1)') == 20
+
+    def test_not_found_is_na(self, lookup):
+        assert lookup.evaluate('=VLOOKUP("z", A1:C4, 2, FALSE)') == '#N/A'
+
+    def test_col_index_out_of_range_is_ref(self, lookup):
+        assert lookup.evaluate('=VLOOKUP("a", A1:C4, 9, FALSE)') == '#REF!'
+
+    def test_cell_ref_as_lookup_value(self, lookup):
+        assert lookup.evaluate('=VLOOKUP(A2, A1:C4, 3, FALSE)') == 20
+
+
+class TestMatch:
+    def test_exact(self, lookup):
+        assert lookup.evaluate('=MATCH("c", A1:A4, 0)') == 3
+        assert lookup.evaluate('=MATCH("C", A1:A4, 0)') == 3
+
+    def test_approximate_ascending(self, lookup):
+        assert lookup.evaluate('=MATCH(25, C1:C4, 1)') == 2
+        assert lookup.evaluate('=MATCH(25, C1:C4)') == 2  # 默认 1
+
+    def test_approximate_descending(self, lookup):
+        # -1：>= value 的最小值 -> 30，位置 3
+        assert lookup.evaluate('=MATCH(25, C1:C4, 0-1)') == 3
+
+    def test_not_found_is_na(self, lookup):
+        assert lookup.evaluate('=MATCH("z", A1:A4, 0)') == '#N/A'
+
+    def test_row_vector(self, lookup):
+        assert lookup.evaluate('=MATCH("Name", A1:C1, 0)') == '#N/A'  # 无表头行数据
+
+
+class TestIndex:
+    def test_2d(self, lookup):
+        assert lookup.evaluate('=INDEX(A1:C4, 2, 2)') == 'Bob'
+
+    def test_column_vector(self, lookup):
+        assert lookup.evaluate('=INDEX(B1:B4, 3)') == 'Cid'
+
+    def test_row_vector(self, lookup):
+        assert lookup.evaluate('=INDEX(A2:C2, 1, 3)') == 20
+
+    def test_out_of_range_is_ref(self, lookup):
+        assert lookup.evaluate('=INDEX(A1:C4, 9, 1)') == '#REF!'
+        assert lookup.evaluate('=INDEX(B1:B4, 0)') == '#REF!'
+
+    def test_index_match_combo(self, lookup):
+        assert lookup.evaluate('=INDEX(C1:C4, MATCH("c", A1:A4, 0))') == 30
+        assert lookup.evaluate('=INDEX(B1:B4, MATCH(35, C1:C4, 1))') == 'Cid'
+
+
+class TestXlookup:
+    def test_exact(self, lookup):
+        assert lookup.evaluate('=XLOOKUP("b", A1:A4, C1:C4)') == 20
+
+    def test_not_found_default_na(self, lookup):
+        assert lookup.evaluate('=XLOOKUP("z", A1:A4, C1:C4)') == '#N/A'
+
+    def test_if_not_found(self, lookup):
+        assert lookup.evaluate('=XLOOKUP("z", A1:A4, C1:C4, "无")') == '无'
+
+    def test_match_mode_next_smaller(self, lookup):
+        assert lookup.evaluate('=XLOOKUP(25, C1:C4, B1:B4, "x", 0-1)') == 'Bob'
+
+    def test_match_mode_next_larger(self, lookup):
+        assert lookup.evaluate('=XLOOKUP(25, C1:C4, B1:B4, "x", 1)') == 'Cid'
+
+    def test_wildcard_mode(self, lookup):
+        assert lookup.evaluate('=XLOOKUP("c*", A1:A4, B1:B4, "x", 2)') == 'Cid'
+
+    def test_nested_in_if(self, lookup):
+        assert lookup.evaluate(
+            '=IF(XLOOKUP("b", A1:A4, C1:C4)>15, "高", "低")') == '高'
 
 
 # ---------- COUNT / COUNTA ----------

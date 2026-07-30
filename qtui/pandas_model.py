@@ -223,7 +223,7 @@ class PandasTableModel(QAbstractTableModel):
     def evaluate_all_formulas(self):
         """重算全部公式并写入 df（载入公式后调用）。
 
-        引擎不支持的公式（如 VLOOKUP）返回错误值（#NAME? 等），
+        引擎不支持的公式（如 SUMPRODUCT）返回错误值（#NAME? 等），
         此时保留 df 中来自 Excel 的缓存计算值，不覆盖。
         例外：#REF! 表示引用的行/列已被删除，必须写入以显示错误。
         """

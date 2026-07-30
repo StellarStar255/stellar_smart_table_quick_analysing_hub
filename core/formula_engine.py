@@ -18,6 +18,14 @@ class FormulaNumError(ValueError):
     """数值域错误（如负数开方）-> #NUM!"""
 
 
+class FormulaNAError(ValueError):
+    """查找无匹配（VLOOKUP/MATCH 等）-> #N/A"""
+
+
+class FormulaRefError(ValueError):
+    """引用越界（如 VLOOKUP 列号超出表格）-> #REF!"""
+
+
 class FormulaEngine:
     """Excel 公式解析和计算引擎（解耦版本）"""
 
@@ -33,7 +41,7 @@ class FormulaEngine:
 
     # 所有可能的错误返回值（对齐 Excel 错误码；#ERROR 为未分类兜底）
     ERROR_VALUES = frozenset(
-        {"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!", "#REF!"}
+        {"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!", "#REF!", "#N/A"}
     )
 
     @classmethod
@@ -199,18 +207,29 @@ class FormulaEngine:
             # Excel 风格比较符转 Python 风格：= -> ==, <> -> !=
             expr = self._normalize_operators(expr)
 
-            # 替换区域引用为值列表（保留文本值，聚合函数自行过滤数值；
-            # 文本占位保护，避免其中的 "A1" 等被后续替换误伤）
+            # 替换区域引用为嵌套行列表 [[行1...], [行2...]]——查找函数
+            # （VLOOKUP/INDEX 等）需要二维结构，聚合函数会递归展平。
+            # 文本值占位保护，避免其中的 "A1" 等被后续替换误伤
             def replace_range(match):
-                cells = self.parse_range_ref(match.group(), df)
-                parts = []
-                for r, c in cells:
-                    v = self.get_cell_value(r, c, df)
-                    if isinstance(v, str):
-                        parts.append(stash(repr(v)))
-                    else:
-                        parts.append(str(v))
-                return '[' + ', '.join(parts) + ']'
+                start_col = self.col_letter_to_index(match.group(1).upper())
+                start_row = int(match.group(2)) - 1
+                end_col = self.col_letter_to_index(match.group(3).upper())
+                end_row = int(match.group(4)) - 1
+                row_parts = []
+                for r in range(start_row, end_row + 1):
+                    parts = []
+                    for ci in range(start_col, end_col + 1):
+                        if df is not None and ci < len(df.columns):
+                            col_name = df.columns[ci]
+                        else:
+                            col_name = self.col_index_to_letter(ci)
+                        v = self.get_cell_value(r, col_name, df)
+                        if isinstance(v, str):
+                            parts.append(stash(repr(v)))
+                        else:
+                            parts.append(str(v))
+                    row_parts.append('[' + ', '.join(parts) + ']')
+                return '[' + ', '.join(row_parts) + ']'
 
             expr = self.RANGE_REF_PATTERN.sub(replace_range, expr)
 
@@ -253,6 +272,10 @@ class FormulaEngine:
             return "#NAME?"
         except FormulaNumError:
             return "#NUM!"
+        except FormulaNAError:
+            return "#N/A"
+        except FormulaRefError:
+            return "#REF!"
         except TypeError:
             return "#VALUE!"
         except Exception:
@@ -270,6 +293,8 @@ class FormulaEngine:
         'IF': '_if', 'AND': '_and', 'OR': '_or', 'NOT': '_not',
         'ABS': 'abs', 'ROUND': '_round',
         'POWER': 'pow', 'SQRT': '_sqrt', 'MOD': '_mod',
+        'VLOOKUP': '_vlookup', 'XLOOKUP': '_xlookup',
+        'INDEX': '_index', 'MATCH': '_match',
     }
 
     _FUNC_NAME_PATTERN = re.compile(
@@ -541,11 +566,11 @@ class FormulaEngine:
     def _safe_eval(self, expr: str) -> Any:
         """安全求值，限制可用函数"""
         def _flatten(args):
-            # 展平区域产生的列表
+            # 递归展平（区域现在是嵌套行列表）
             values = []
             for a in args:
                 if isinstance(a, (list, tuple)):
-                    values.extend(a)
+                    values.extend(_flatten(a))
                 else:
                     values.append(a)
             return values
@@ -614,6 +639,128 @@ class FormulaEngine:
                 raise ZeroDivisionError("AVERAGEIF: no matching values")
             return sum(matched) / len(matched)
 
+        # ---------- 查找函数 ----------
+
+        def _as_grid(a):
+            """统一成行的列表（二维）；标量与一维列表按单行处理。"""
+            if not isinstance(a, (list, tuple)):
+                return [[a]]
+            if not a:
+                return [[]]
+            if all(isinstance(r, (list, tuple)) for r in a):
+                return [list(r) for r in a]
+            return [list(a)]
+
+        def _as_vector(a):
+            """单行或单列区域转一维向量；二维区域报 #VALUE!。"""
+            grid = _as_grid(a)
+            if len(grid) == 1:
+                return list(grid[0])
+            if all(len(r) == 1 for r in grid):
+                return [r[0] for r in grid]
+            raise TypeError("lookup array must be one row or one column")
+
+        def _norm(v):
+            # 文本比较不区分大小写（与 Excel 一致）
+            return v.lower() if isinstance(v, str) else v
+
+        def _lookup_eq(target):
+            """精确匹配谓词；文本目标含 * ? 时按通配符匹配（同 Excel）。"""
+            if isinstance(target, str) and ('*' in target or '?' in target):
+                pattern = target.lower()
+                return lambda v: fnmatch.fnmatchcase(str(v).lower(), pattern)
+            t = _norm(target)
+            return lambda v: _norm(v) == t
+
+        def _approx_pick(vec, value, next_smaller):
+            """近似匹配：next_smaller 取 <= value 的最大项，否则 >= value 的最小项。
+
+            返回 0 基位置，无候选返回 None。跳过不可比较的类型。
+            """
+            best_pos, best_val = None, None
+            target = _norm(value)
+            for i, v in enumerate(vec):
+                nv = _norm(v)
+                try:
+                    if next_smaller:
+                        ok = nv <= target
+                        better = best_val is None or nv > best_val
+                    else:
+                        ok = nv >= target
+                        better = best_val is None or nv < best_val
+                except TypeError:
+                    continue
+                if ok and better:
+                    best_pos, best_val = i, nv
+            return best_pos
+
+        def _vlookup(value, table, col_index, range_lookup=True):
+            grid = _as_grid(table)
+            ci = int(col_index) - 1
+            if ci < 0 or any(ci >= len(row) for row in grid):
+                raise FormulaRefError("VLOOKUP col_index out of range")
+            first_col = [row[0] for row in grid if row]
+            if range_lookup:
+                pos = _approx_pick(first_col, value, next_smaller=True)
+            else:
+                eq = _lookup_eq(value)
+                pos = next((i for i, v in enumerate(first_col) if eq(v)), None)
+            if pos is None:
+                raise FormulaNAError("VLOOKUP: no match")
+            return grid[pos][ci]
+
+        def _match(value, lookup_array, match_type=1):
+            vec = _as_vector(lookup_array)
+            match_type = int(match_type)
+            if match_type == 0:
+                eq = _lookup_eq(value)
+                pos = next((i for i, v in enumerate(vec) if eq(v)), None)
+            else:
+                pos = _approx_pick(vec, value, next_smaller=(match_type > 0))
+            if pos is None:
+                raise FormulaNAError("MATCH: no match")
+            return pos + 1
+
+        def _index(array, row_num, col_num=None):
+            grid = _as_grid(array)
+            r = int(row_num)
+            if col_num is None:
+                # 向量式：单行按列取，单列按行取
+                if len(grid) == 1:
+                    vec = grid[0]
+                elif all(len(row) == 1 for row in grid):
+                    vec = [row[0] for row in grid]
+                else:
+                    raise TypeError("INDEX on 2D array needs col_num")
+                if not 1 <= r <= len(vec):
+                    raise FormulaRefError("INDEX out of range")
+                return vec[r - 1]
+            c = int(col_num)
+            if not (1 <= r <= len(grid) and 1 <= c <= len(grid[r - 1])):
+                raise FormulaRefError("INDEX out of range")
+            return grid[r - 1][c - 1]
+
+        def _xlookup(value, lookup_array, return_array,
+                     if_not_found=None, match_mode=0):
+            vec = _as_vector(lookup_array)
+            ret = _as_vector(return_array)
+            match_mode = int(match_mode)
+            if match_mode == 0:
+                t = _norm(value)
+                pos = next((i for i, v in enumerate(vec) if _norm(v) == t), None)
+            elif match_mode == 2:
+                eq = _lookup_eq(value)
+                pos = next((i for i, v in enumerate(vec) if eq(v)), None)
+            else:
+                pos = _approx_pick(vec, value, next_smaller=(match_mode < 0))
+            if pos is None:
+                if if_not_found is not None:
+                    return if_not_found
+                raise FormulaNAError("XLOOKUP: no match")
+            if pos >= len(ret):
+                raise FormulaRefError("XLOOKUP: return array too short")
+            return ret[pos]
+
         def _and(*args):
             return all(bool(v) for v in _flatten(args))
 
@@ -655,6 +802,8 @@ class FormulaEngine:
             '_counta': _counta, '_countif': _countif,
             '_sumif': _sumif, '_averageif': _averageif,
             '_and': _and, '_or': _or, '_not': _not,
+            '_vlookup': _vlookup, '_xlookup': _xlookup,
+            '_index': _index, '_match': _match,
             '_sum': _sum, '_max': _max, '_min': _min, '_if': _if,
             '_left': _left, '_right': _right, '_mid': _mid,
             '_len': lambda text: len(str(text)),
