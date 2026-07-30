@@ -2,6 +2,7 @@
 公式引擎模块 - Excel 公式解析和计算
 解耦版本：通过参数传入DataFrame而不是依赖GUI对象
 """
+import datetime
 import fnmatch
 import re
 from typing import Any, Tuple, List, Set, Optional
@@ -170,6 +171,14 @@ class FormulaEngine:
         try:
             return float(value)
         except (ValueError, TypeError):
+            # 日期时间统一转 ISO 字符串：显示干净、可比较（字典序即时间序）、
+            # 可直接进 CONCAT/日期函数；否则 Timestamp 拼进表达式是非法语法
+            if isinstance(value, datetime.datetime):  # 含 pd.Timestamp
+                if (value.hour, value.minute, value.second) == (0, 0, 0):
+                    return value.date().isoformat()
+                return value.strftime('%Y-%m-%d %H:%M:%S')
+            if isinstance(value, datetime.date):
+                return value.isoformat()
             return value
 
     def evaluate(self, formula: str, df: Optional[pd.DataFrame] = None) -> Any:
@@ -295,6 +304,10 @@ class FormulaEngine:
         'POWER': 'pow', 'SQRT': '_sqrt', 'MOD': '_mod',
         'VLOOKUP': '_vlookup', 'XLOOKUP': '_xlookup',
         'INDEX': '_index', 'MATCH': '_match',
+        'TODAY': '_today', 'NOW': '_now',
+        'DATEDIF': '_datedif', 'DATE': '_date',
+        'YEAR': '_year', 'MONTH': '_month',
+        'DAYS': '_days', 'DAY': '_day', 'WEEKDAY': '_weekday',
     }
 
     _FUNC_NAME_PATTERN = re.compile(
@@ -761,6 +774,88 @@ class FormulaEngine:
                 raise FormulaRefError("XLOOKUP: return array too short")
             return ret[pos]
 
+        # ---------- 日期函数 ----------
+
+        def _to_date(value):
+            """把单元格值转成 datetime.date。
+
+            支持 ISO/常见格式字符串、datetime/date、Excel 序列号（数值，
+            1899-12-30 起算）。无法解释 -> #VALUE!。
+            """
+            if isinstance(value, datetime.datetime):  # 含 pd.Timestamp
+                return value.date()
+            if isinstance(value, datetime.date):
+                return value
+            if _is_num(value):
+                try:
+                    ts = pd.Timestamp('1899-12-30') + pd.Timedelta(days=float(value))
+                    return ts.date()
+                except (ValueError, OverflowError):
+                    raise FormulaNumError("invalid date serial")
+            if isinstance(value, str):
+                try:
+                    return pd.to_datetime(value).date()
+                except (ValueError, TypeError):
+                    raise TypeError("cannot parse date: {}".format(value))
+            raise TypeError("cannot parse date")
+
+        def _today():
+            return datetime.date.today().isoformat()
+
+        def _now():
+            return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        def _date(year, month, day):
+            # 与 Excel 一致：月/日越界自动进位（13 月 -> 次年 1 月，2 月 30 日 -> 3 月）
+            y, m, d = int(year), int(month), int(day)
+            y += (m - 1) // 12
+            m = (m - 1) % 12 + 1
+            try:
+                base = datetime.date(y, m, 1)
+            except ValueError:
+                raise FormulaNumError("invalid date")
+            return (base + datetime.timedelta(days=d - 1)).isoformat()
+
+        def _year(value):
+            return _to_date(value).year
+
+        def _month(value):
+            return _to_date(value).month
+
+        def _day(value):
+            return _to_date(value).day
+
+        def _weekday(value, return_type=1):
+            wd = _to_date(value).weekday()  # 周一=0
+            return_type = int(return_type)
+            if return_type == 2:
+                return wd + 1        # 周一=1 .. 周日=7
+            if return_type == 3:
+                return wd            # 周一=0 .. 周日=6
+            return (wd + 1) % 7 + 1  # 默认：周日=1 .. 周六=7
+
+        def _days(end, start):
+            return (_to_date(end) - _to_date(start)).days
+
+        def _datedif(start, end, unit):
+            s, e = _to_date(start), _to_date(end)
+            if e < s:
+                raise FormulaNumError("DATEDIF: end before start")
+            u = str(unit).upper()
+            if u == 'D':
+                return (e - s).days
+            if u == 'M':
+                months = (e.year - s.year) * 12 + (e.month - s.month)
+                if e.day < s.day:
+                    months -= 1
+                return months
+            if u == 'Y':
+                years = e.year - s.year
+                if (e.month, e.day) < (s.month, s.day):
+                    years -= 1
+                return years
+            raise TypeError("DATEDIF: unsupported unit {}".format(unit))
+
         def _and(*args):
             return all(bool(v) for v in _flatten(args))
 
@@ -804,6 +899,9 @@ class FormulaEngine:
             '_and': _and, '_or': _or, '_not': _not,
             '_vlookup': _vlookup, '_xlookup': _xlookup,
             '_index': _index, '_match': _match,
+            '_today': _today, '_now': _now, '_date': _date,
+            '_year': _year, '_month': _month, '_day': _day,
+            '_weekday': _weekday, '_days': _days, '_datedif': _datedif,
             '_sum': _sum, '_max': _max, '_min': _min, '_if': _if,
             '_left': _left, '_right': _right, '_mid': _mid,
             '_len': lambda text: len(str(text)),

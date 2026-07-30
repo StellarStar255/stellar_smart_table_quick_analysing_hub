@@ -57,7 +57,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 
 ### 🧮 Cell Formulas
 - **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A1:A10)`, `=IF(A1>10, "high", "low")`
-- **30 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
+- **39 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
 - **Auto recalculation**: Dependent formulas update when referenced cells change
 - **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill; filtering suspends formulas and restores them when filters are cleared
@@ -211,7 +211,7 @@ Alternatively, click a column header for quick sorting.
 | Completely free | ✅ | ❌ |
 | Open source | ✅ | ❌ |
 | Cross-platform | ✅ | ⚠️ |
-| Cell formulas | ✅ (30 functions) | ✅ |
+| Cell formulas | ✅ (39 functions) | ✅ |
 | Charts | ⚠️ Planned | ✅ |
 
 ## Roadmap
@@ -324,7 +324,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 
 ### 🧮 单元格公式
 - **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A1:A10)`、`=IF(A1>10, "高", "低")`
-- **30 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
+- **39 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
 - **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）；筛选期间公式挂起，清除筛选后恢复重算
@@ -478,7 +478,7 @@ python smart_table_quick_analysing_hub_qt.py
 | 完全免费 | ✅ | ❌ |
 | 开源 | ✅ | ❌ |
 | 跨平台 | ✅ | ⚠️ |
-| 单元格公式 | ✅（30 函数） | ✅ |
+| 单元格公式 | ✅（39 函数） | ✅ |
 | 图表 | ⚠️ 待开发 | ✅ |
 
 ## 未来规划

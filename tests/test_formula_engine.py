@@ -371,6 +371,79 @@ class TestXlookup:
             '=IF(XLOOKUP("b", A1:A4, C1:C4)>15, "高", "低")') == '高'
 
 
+# ---------- 日期函数 ----------
+
+@pytest.fixture
+def dates():
+    df = pd.DataFrame({
+        'D': pd.to_datetime(['2026-01-15', '2026-07-30', '2024-02-29']),
+        'T': pd.to_datetime(['2026-01-15 08:30:00'] * 3),
+        'N': [1, 2, 3],
+    })
+    return FormulaEngine(df)
+
+
+class TestDateFunctions:
+    def test_datetime_cell_reads_as_iso_string(self, dates):
+        # datetime 单元格进公式不再是非法语法；0 点只保留日期
+        assert dates.evaluate('=CONCAT(A1, "!")') == '2026-01-15!'
+        assert dates.evaluate('=CONCAT(B1, "!")') == '2026-01-15 08:30:00!'
+
+    def test_datetime_cells_compare_chronologically(self, dates):
+        assert dates.evaluate('=IF(A1<A2, 1, 0)') == 1
+        assert dates.evaluate('=IF(A3<A1, 1, 0)') == 1
+
+    def test_year_month_day_on_datetime_cell(self, dates):
+        assert dates.evaluate('=YEAR(A1)') == 2026
+        assert dates.evaluate('=MONTH(A2)') == 7
+        assert dates.evaluate('=DAY(A3)') == 29
+
+    def test_year_on_string_and_serial(self, dates):
+        assert dates.evaluate('=YEAR("2026-07-30")') == 2026
+        assert dates.evaluate('=YEAR(45000)') == 2023  # Excel 序列号
+
+    def test_date_builds_iso_string(self, dates):
+        assert dates.evaluate('=DATE(2026, 7, 30)') == '2026-07-30'
+
+    def test_date_overflow_normalizes(self, dates):
+        assert dates.evaluate('=DATE(2025, 13, 1)') == '2026-01-01'
+        assert dates.evaluate('=DATE(2026, 2, 30)') == '2026-03-02'
+
+    def test_today_and_now(self, dates):
+        import datetime as dt
+        assert dates.evaluate('=TODAY()') == dt.date.today().isoformat()
+        now = dates.evaluate('=NOW()')
+        assert now.startswith(dt.date.today().isoformat()) and len(now) == 19
+
+    def test_today_composes(self, dates):
+        assert dates.evaluate('=YEAR(TODAY())') >= 2026
+
+    def test_weekday(self, dates):
+        # 2026-07-30 是周四
+        assert dates.evaluate('=WEEKDAY("2026-07-30")') == 5      # 周日=1
+        assert dates.evaluate('=WEEKDAY("2026-07-30", 2)') == 4   # 周一=1
+        assert dates.evaluate('=WEEKDAY("2026-07-30", 3)') == 3   # 周一=0
+
+    def test_days(self, dates):
+        assert dates.evaluate('=DAYS("2026-07-30", "2026-07-01")') == 29
+        assert dates.evaluate('=DAYS(A2, A1)') == 196
+
+    def test_datedif(self, dates):
+        assert dates.evaluate('=DATEDIF("2024-02-29", "2026-07-30", "Y")') == 2
+        assert dates.evaluate('=DATEDIF("2024-02-29", "2026-07-30", "M")') == 29
+        assert dates.evaluate('=DATEDIF(A1, A2, "D")') == 196
+
+    def test_datedif_errors(self, dates):
+        assert dates.evaluate('=DATEDIF("2026-01-01", "2025-01-01", "Y")') == '#NUM!'
+        assert dates.evaluate('=DATEDIF("2025-01-01", "2026-01-01", "X")') == '#VALUE!'
+
+    def test_unparseable_date_is_value_error(self, dates):
+        assert dates.evaluate('=YEAR("abc")') == '#VALUE!'
+
+    def test_nested_with_if(self, dates):
+        assert dates.evaluate('=IF(YEAR(A1)=2026, "今年", "往年")') == '今年'
+
+
 # ---------- COUNT / COUNTA ----------
 
 class TestCountSemantics:
