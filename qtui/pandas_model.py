@@ -225,10 +225,11 @@ class PandasTableModel(QAbstractTableModel):
 
         引擎不支持的公式（如 VLOOKUP）返回错误值（#NAME? 等），
         此时保留 df 中来自 Excel 的缓存计算值，不覆盖。
+        例外：#REF! 表示引用的行/列已被删除，必须写入以显示错误。
         """
         for key, formula in self.formulas.items():
             result = self._evaluate(formula)
-            if not FormulaEngine.is_error(result):
+            if not FormulaEngine.is_error(result) or result == "#REF!":
                 self._set_cell(key[0], key[1], result)
         self._rebuild_all_deps()
 
@@ -415,7 +416,7 @@ class PandasTableModel(QAbstractTableModel):
         self.modified = True
 
     def _shift_keys(self, row_start=None, row_delta=0, col_start=None, col_delta=0):
-        """插入行/列后平移公式和背景色的键（公式内的引用不平移，与旧版一致）。"""
+        """插入行/列后平移公式/背景色的键，并同步平移公式内的引用。"""
         def shift(d):
             out = {}
             for (r, c), v in d.items():
@@ -427,10 +428,24 @@ class PandasTableModel(QAbstractTableModel):
             return out
         self.formulas = shift(self.formulas)
         self.cell_colors = shift(self.cell_colors)
-        self._rebuild_all_deps()
+        row_map = None
+        if row_start is not None and row_delta:
+            row_map = lambda i: i + row_delta if i >= row_start else i
+        col_map = None
+        if col_start is not None and col_delta:
+            col_map = lambda i: i + col_delta if i >= col_start else i
+        if self.formulas and (row_map or col_map):
+            self.formulas = {
+                key: self._engine.adjust_formula_refs(f, row_map, col_map)
+                for key, f in self.formulas.items()
+            }
+        self.evaluate_all_formulas()
 
     def _remove_keys(self, rows=None, cols=None):
-        """删除行/列后丢弃对应键并压缩其余键的位置。"""
+        """删除行/列后丢弃对应键、压缩其余键位置，并重写公式引用。
+
+        引用了被删行/列的公式会变成 #REF!（区域端点被删则收缩）。
+        """
         rows = rows or set()
         cols = cols or set()
         sorted_rows = sorted(rows)
@@ -447,7 +462,22 @@ class PandasTableModel(QAbstractTableModel):
             return out
         self.formulas = remap(self.formulas)
         self.cell_colors = remap(self.cell_colors)
-        self._rebuild_all_deps()
+
+        def make_map(deleted, sorted_del):
+            def mapper(i):
+                if i in deleted:
+                    return None
+                return i - sum(1 for x in sorted_del if x < i)
+            return mapper
+
+        row_map = make_map(rows, sorted_rows) if rows else None
+        col_map = make_map(cols, sorted_cols) if cols else None
+        if self.formulas and (row_map or col_map):
+            self.formulas = {
+                key: self._engine.adjust_formula_refs(f, row_map, col_map)
+                for key, f in self.formulas.items()
+            }
+        self.evaluate_all_formulas()
 
     def rename_column(self, position: int, new_name: str):
         if not new_name or new_name in self._df.columns:

@@ -316,6 +316,63 @@ class TestShiftFormula:
         assert engine.shift_formula('text', 1, 1) == 'text'
 
 
+# ---------- 插入/删除行列的引用调整 ----------
+
+def _insert_map(pos, delta=1):
+    return lambda i: i + delta if i >= pos else i
+
+
+def _delete_map(deleted):
+    dels = sorted(deleted)
+    return lambda i: None if i in deleted else i - sum(1 for x in dels if x < i)
+
+
+class TestAdjustFormulaRefs:
+    def test_insert_row_shifts_refs_below(self, engine):
+        assert engine.adjust_formula_refs('=A1+A3', row_map=_insert_map(1)) == '=A1+A4'
+
+    def test_insert_row_grows_range(self, engine):
+        assert engine.adjust_formula_refs('=SUM(A1:A3)', row_map=_insert_map(1)) == '=SUM(A1:A4)'
+
+    def test_insert_row_below_range_no_change(self, engine):
+        assert engine.adjust_formula_refs('=SUM(A1:A3)', row_map=_insert_map(3)) == '=SUM(A1:A3)'
+
+    def test_insert_column_shifts_letters(self, engine):
+        assert engine.adjust_formula_refs('=A1+B1', col_map=_insert_map(0)) == '=B1+C1'
+
+    def test_delete_referenced_row_is_ref_error(self, engine):
+        assert engine.adjust_formula_refs('=A2*2', row_map=_delete_map({1})) == '=#REF!*2'
+
+    def test_delete_shifts_refs_after(self, engine):
+        assert engine.adjust_formula_refs('=A3', row_map=_delete_map({0})) == '=A2'
+
+    def test_delete_inside_range_shrinks(self, engine):
+        assert engine.adjust_formula_refs('=SUM(A1:A3)', row_map=_delete_map({1})) == '=SUM(A1:A2)'
+
+    def test_delete_range_endpoint_shrinks(self, engine):
+        assert engine.adjust_formula_refs('=SUM(A1:A3)', row_map=_delete_map({2})) == '=SUM(A1:A2)'
+
+    def test_delete_whole_range_is_ref_error(self, engine):
+        # 与 Excel 一致：区域整体被删时保留函数外壳，区域位置显示 #REF!
+        adjusted = engine.adjust_formula_refs('=SUM(A1:A2)+1', row_map=_delete_map({0, 1}))
+        assert adjusted == '=SUM(#REF!)+1'
+        assert engine.evaluate(adjusted) == '#REF!'
+
+    def test_delete_column_in_range(self, engine):
+        assert engine.adjust_formula_refs('=SUM(A1:C1)', col_map=_delete_map({1})) == '=SUM(A1:B1)'
+
+    def test_absolute_refs_also_adjusted(self, engine):
+        # $ 只固定复制填充，结构变化时同样调整
+        assert engine.adjust_formula_refs('=$A$2', row_map=_insert_map(0)) == '=$A$3'
+
+    def test_string_literal_untouched(self, engine):
+        assert engine.adjust_formula_refs(
+            '=CONCAT("A1", A1)', row_map=_insert_map(0)) == '=CONCAT("A1", A2)'
+
+    def test_no_maps_returns_same(self, engine):
+        assert engine.adjust_formula_refs('=A1') == '=A1'
+
+
 # ---------- 排序行号重映射 ----------
 
 class TestRemapFormulaRows:

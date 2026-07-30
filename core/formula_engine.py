@@ -318,6 +318,79 @@ class FormulaEngine:
 
     # 平移用：分别捕获列前 $、列字母、行前 $、行号
     _SHIFT_CELL_PATTERN = re.compile(r'(\$?)([A-Z]+)(\$?)(\d+)', re.IGNORECASE)
+    # 区域引用（带 $ 捕获）
+    _RANGE_PARTS_PATTERN = re.compile(
+        r'(\$?)([A-Z]+)(\$?)(\d+)\s*:\s*(\$?)([A-Z]+)(\$?)(\d+)', re.IGNORECASE
+    )
+
+    def adjust_formula_refs(self, formula: str, row_map=None, col_map=None) -> str:
+        """插入/删除行列后重写公式引用。
+
+        row_map/col_map: 旧 0 基索引 -> 新索引的函数，返回 None 表示该
+        行/列已删除。与 Excel 一致：
+        - 单元格引用被删除 -> #REF!
+        - 区域端点被删除时区域向内收缩，整个区域被删除 -> #REF!
+        - 绝对引用（$）同样调整——$ 只固定复制填充，不固定结构变化
+        - 字符串字面量跳过
+        """
+        if not formula.startswith('=') or (row_map is None and col_map is None):
+            return formula
+
+        strings: List[str] = []
+
+        def stash(text: str) -> str:
+            strings.append(text)
+            return self._STRING_PLACEHOLDER.format(len(strings) - 1)
+
+        expr = self.STRING_PATTERN.sub(lambda m: stash(m.group()), formula)
+
+        def survive(lo, hi, mapper, from_low):
+            # 从区域一端向内找第一个未被删除的索引
+            indices = range(lo, hi + 1) if from_low else range(hi, lo - 1, -1)
+            for i in indices:
+                new = mapper(i)
+                if new is not None:
+                    return new
+            return None
+
+        def adjust_range(m):
+            c1a, c1, r1a, r1, c2a, c2, r2a, r2 = m.groups()
+            row1, row2 = int(r1) - 1, int(r2) - 1
+            col1 = self.col_letter_to_index(c1.upper())
+            col2 = self.col_letter_to_index(c2.upper())
+            if row_map is not None:
+                row1, row2 = (survive(row1, row2, row_map, True),
+                              survive(row1, row2, row_map, False))
+                if row1 is None:
+                    return stash('#REF!')
+            if col_map is not None:
+                col1, col2 = (survive(col1, col2, col_map, True),
+                              survive(col1, col2, col_map, False))
+                if col1 is None:
+                    return stash('#REF!')
+            # 占位保护调整结果，避免下面的单元格替换再动它
+            return stash(
+                f'{c1a}{self.col_index_to_letter(col1)}{r1a}{row1 + 1}:'
+                f'{c2a}{self.col_index_to_letter(col2)}{r2a}{row2 + 1}'
+            )
+
+        expr = self._RANGE_PARTS_PATTERN.sub(adjust_range, expr)
+
+        def adjust_cell(m):
+            col_abs, col_letter, row_abs, row_num = m.groups()
+            row = int(row_num) - 1
+            col = self.col_letter_to_index(col_letter.upper())
+            new_row = row_map(row) if row_map is not None else row
+            new_col = col_map(col) if col_map is not None else col
+            if new_row is None or new_col is None:
+                return '#REF!'
+            return (f'{col_abs}{self.col_index_to_letter(new_col)}'
+                    f'{row_abs}{new_row + 1}')
+
+        expr = self._SHIFT_CELL_PATTERN.sub(adjust_cell, expr)
+        return self._STRING_PLACEHOLDER_PATTERN.sub(
+            lambda m: strings[int(m.group(1))], expr
+        )
 
     def shift_formula(self, formula: str, row_delta: int, col_delta: int) -> str:
         """按偏移量平移公式中的相对引用（复制/填充公式时用）。

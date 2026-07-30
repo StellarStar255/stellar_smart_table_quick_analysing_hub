@@ -80,3 +80,61 @@ class TestSortFollowsFormulas:
         m = make_model()
         m.sort(0, Qt.SortOrder.AscendingOrder)
         assert list(m._df['X']) == [10.0, 20.0, 30.0]
+
+
+class TestInsertDeleteFollowsFormulas:
+    def test_insert_row_shifts_formula_and_refs(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A2')  # 引用 X=10
+        m.insert_row(0)
+        # 公式随行下移，引用也指向下移后的数据
+        assert m.formulas == {(1, 1): '=A3'}
+        assert m._df.iat[1, 1] == 10
+
+    def test_insert_row_below_does_not_touch_refs(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A1*2')
+        m.insert_row(2)
+        assert m.formulas == {(0, 1): '=A1*2'}
+        assert m._df.iat[0, 1] == 60
+
+    def test_insert_row_grows_range(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        m.insert_row(1)
+        assert m.formulas == {(0, 1): '=SUM(A1:A4)'}
+        assert m._df.iat[0, 1] == 60  # 插入的空行按 0 计
+
+    def test_insert_column_shifts_refs(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A1*2')
+        m.insert_column(0)
+        assert m.formulas == {(0, 2): '=B1*2'}
+        assert m._df.iat[0, 2] == 60
+
+    def test_delete_referenced_row_becomes_ref_error(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A2')
+        m.remove_rows([1])
+        assert m.formulas == {(0, 1): '=#REF!'}
+        assert m._df.iat[0, 1] == '#REF!'
+
+    def test_delete_row_inside_range_shrinks_and_recalcs(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        m.remove_rows([1])  # 删掉 X=10
+        assert m.formulas == {(0, 1): '=SUM(A1:A2)'}
+        assert m._df.iat[0, 1] == 50
+
+    def test_delete_referenced_column_becomes_ref_error(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A1*2')
+        m.remove_columns([0])
+        assert m.formulas == {(0, 0): '=#REF!*2'}
+        assert m._df.iat[0, 0] == '#REF!'
+
+    def test_delete_formula_cell_row_drops_formula(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=A1')
+        m.remove_rows([1])
+        assert m.formulas == {}
