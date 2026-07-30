@@ -55,6 +55,15 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **Undo/redo**: Full undo/redo support (up to 50 steps)
 - **Batch operations**: Multi-row selection and bulk deletion
 
+### 🧮 Cell Formulas
+- **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A1:A10)`, `=IF(A1>10, "high", "low")`
+- **25+ functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
+- **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
+- **Auto recalculation**: Dependent formulas update when referenced cells change
+- **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill
+- **Error codes**: `#DIV/0!`, `#NAME?`, `#NUM!`, `#VALUE!`, `#REF!`
+- **Round-trip with Excel**: Formulas are read from and written back to .xlsx as real formulas
+
 ### 🔧 Data Processing
 - **Sorting**: Sort any column in ascending or descending order
 - **Filtering**: Multiple conditions including equals, contains, greater than, and less than
@@ -202,12 +211,12 @@ Alternatively, click a column header for quick sorting.
 | Completely free | ✅ | ❌ |
 | Open source | ✅ | ❌ |
 | Cross-platform | ✅ | ⚠️ |
-| Advanced formulas | ⚠️ Planned | ✅ |
+| Cell formulas | ✅ (25+ functions) | ✅ |
 | Charts | ⚠️ Planned | ✅ |
 
 ## Roadmap
 
-- [ ] Excel formula evaluation
+- [x] Excel formula evaluation (25+ functions, nesting, auto-recalc, `#REF!` tracking)
 - [ ] Data visualization (charts)
 - [ ] Conditional formatting
 - [ ] Pivot tables
@@ -311,6 +320,15 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **复制粘贴**: 支持标准的复制粘贴操作
 - **撤销重做**: 完整的撤销/重做功能（最多50步）
 - **批量操作**: 支持多行选择和批量删除
+
+### 🧮 单元格公式
+- **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A1:A10)`、`=IF(A1>10, "高", "低")`
+- **25+ 函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
+- **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
+- **自动重算**: 被引用单元格变化时依赖公式自动更新
+- **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）
+- **错误码**: `#DIV/0!`、`#NAME?`、`#NUM!`、`#VALUE!`、`#REF!`
+- **与 Excel 互通**: 公式从 .xlsx 读入，保存时也以真公式写回
 
 ### 🔧 数据处理
 - **排序**: 按任意列升序或降序排序
@@ -459,12 +477,12 @@ python smart_table_quick_analysing_hub_qt.py
 | 完全免费 | ✅ | ❌ |
 | 开源 | ✅ | ❌ |
 | 跨平台 | ✅ | ⚠️ |
-| 复杂公式 | ⚠️ 待开发 | ✅ |
+| 单元格公式 | ✅（25+ 函数） | ✅ |
 | 图表 | ⚠️ 待开发 | ✅ |
 
 ## 未来规划
 
-- [ ] 支持Excel公式计算
+- [x] 支持Excel公式计算（25+ 常用函数、嵌套、自动重算、`#REF!` 追踪）
 - [ ] 数据可视化（图表）
 - [ ] 条件格式化
 - [ ] 数据透视表
