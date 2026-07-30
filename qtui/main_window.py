@@ -1379,9 +1379,12 @@ class MainWindow(QMainWindow):
         self.filter_bar_layout.addWidget(QLabel(tr("筛选:")))
         for i, f in enumerate(self.active_filters):
             chip = QPushButton(f"{filter_engine.describe_filter(f)}  ✕")
+            # 浅底必须配深字：不显式指定 color 时深色主题继承白色文字，
+            # 白字浅蓝底完全看不清
             chip.setStyleSheet(
-                "QPushButton{background:#e3f2fd;border:1px solid #90caf9;"
-                "border-radius:9px;padding:2px 8px;}")
+                "QPushButton{background:#e3f2fd;color:#0d47a1;"
+                "border:1px solid #90caf9;border-radius:9px;padding:2px 8px;}"
+                "QPushButton:hover{background:#bbdefb;}")
             chip.clicked.connect(lambda checked=False, idx=i: self.remove_filter(idx))
             chip.setToolTip(tr("点击移除该筛选条件"))
             self.filter_bar_layout.addWidget(chip)
