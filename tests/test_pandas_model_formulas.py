@@ -78,6 +78,69 @@ class TestXlsxRoundTrip:
         assert m._df.iat[1, 0] == 20  # 10*2
 
 
+class TestHeaderRenameIntegrity:
+    """坐标系迁移审查回归：重命名的撤销/依赖重算/失败反馈"""
+
+    def test_rename_is_undoable(self):
+        m = make_model()
+        m.setData(m.index(0, 0), '销售额')
+        assert list(m._df.columns) == ['销售额', 'Y']
+        assert m.undo()
+        assert list(m._df.columns) == ['X', 'Y']
+        assert m.redo()
+        assert list(m._df.columns) == ['销售额', 'Y']
+
+    def test_rename_undo_does_not_touch_cell_edits(self):
+        m = make_model()
+        m.setData(m.index(1, 0), '99')       # 单元格编辑
+        m.setData(m.index(0, 1), '新列')      # 重命名
+        m.undo()                              # 只撤销重命名
+        assert list(m._df.columns) == ['X', 'Y']
+        assert m._df.iat[0, 0] == 99
+        m.undo()                              # 再撤销单元格编辑
+        assert m._df.iat[0, 0] == 30
+
+    def test_invalid_rename_emits_feedback(self):
+        m = make_model()
+        messages = []
+        m.renameFailed.connect(messages.append)
+        assert not m.setData(m.index(0, 0), 'Y')  # 重名
+        assert messages
+
+    def test_header_referencing_formula_recalcs_on_rename(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=CONCAT(A1, "!")')
+        assert m._df.iat[0, 1] == 'X!'
+        m.setData(m.index(0, 0), '销售额')
+        assert m._df.iat[0, 1] == '销售额!'
+
+    def test_header_only_range_not_frozen_on_sort(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=COUNTA(A1:B1)')  # 纯表头区域
+        frozen = m.sort(0, Qt.SortOrder.AscendingOrder)
+        assert frozen == 0
+        assert m.formulas  # 公式保留
+
+
+class TestLoadKeepsCachedOnError:
+    """审查 finding 1：文件加载路径任何错误都不覆盖 Excel 缓存值"""
+
+    def test_from_file_keeps_cached_on_value_error(self):
+        m = make_model()
+        df = m._df.copy()
+        df.iat[0, 1] = 42.0  # Excel 缓存的正确值
+        # 旧版坐标的公式：A1/B1 现在是表头文本相除 -> #VALUE!
+        m.set_dataframe(df, formulas={(0, 1): '=A1/B1'}, from_file=True)
+        assert m._df.iat[0, 1] == 42.0
+
+    def test_structural_path_still_writes_errors(self):
+        m = make_model()
+        df = m._df.copy()
+        df.iat[0, 1] = 42.0
+        m.set_dataframe(df, formulas={(0, 1): '=A1/B1'})  # 非文件路径
+        assert m._df.iat[0, 1] == '#VALUE!'
+
+
 class TestFormulaEditing:
     def test_formula_stores_text_and_result(self):
         m = make_model()

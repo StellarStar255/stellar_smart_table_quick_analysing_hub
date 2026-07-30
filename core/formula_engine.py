@@ -377,6 +377,8 @@ class FormulaEngine:
         for m in self.RANGE_REF_PATTERN.finditer(expr):
             r1 = int(m.group(2)) - 2
             r2 = int(m.group(4)) - 2
+            if max(r1, r2) < 0:
+                continue  # 纯表头行区域（如 A1:C1）：排序不动表头，安全
             # min <= 0 表示从表头行或首个数据行开始，覆盖顶部
             if min(r1, r2) > 0 or max(r1, r2) < nrows - 1:
                 return True

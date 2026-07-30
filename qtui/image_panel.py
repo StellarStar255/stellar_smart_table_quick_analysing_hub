@@ -127,7 +127,7 @@ class _StripCell(QFrame):
         self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_label.setFixedSize(thumb_size)
         layout.addWidget(self.img_label)
-        self.caption = QLabel(str(row + 1))
+        self.caption = QLabel(str(row + 2))  # 网格第 1 行是表头，数据行号从 2 起
         self.caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.caption.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.caption)
@@ -338,7 +338,7 @@ class ImagePreviewPanel(QWidget):
         path = self._current_path()
         if self._current_row >= 0:
             name = os.path.basename(path) if path else tr("无图片")
-            self._main_caption.setText(tr("行 {} · {}").format(self._current_row + 1, name))
+            self._main_caption.setText(tr("行 {} · {}").format(self._current_row + 2, name))  # 与网格行号一致（表头占第 1 行）
         else:
             self._main_caption.setText("")
         if path is None:

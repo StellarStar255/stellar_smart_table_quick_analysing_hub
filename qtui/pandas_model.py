@@ -6,7 +6,7 @@ PandasTableModel - 基于 QAbstractTableModel 的 pandas DataFrame 模型
 视图只请求可见单元格的数据，因此无论多少行都不需要分批渲染或列分页。
 """
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant
+from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 import pandas as pd
 import numpy as np
@@ -28,6 +28,11 @@ _HEADER_ROW_FONT.setBold(True)
 
 class PandasTableModel(QAbstractTableModel):
     """把 pandas DataFrame 直接暴露给 QTableView 的可编辑模型。"""
+
+    # 列重命名成功（col, 旧名, 新名）——宿主窗口据此同步筛选条件/original_df 等
+    columnRenamed = pyqtSignal(int, str, str)
+    # 列重命名失败（提示文本）——表头行内联编辑没有对话框，宿主用状态栏反馈
+    renameFailed = pyqtSignal(str)
 
     def __init__(self, df: pd.DataFrame = None, parent=None):
         super().__init__(parent)
@@ -250,17 +255,24 @@ class PandasTableModel(QAbstractTableModel):
             self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
             self._recalc_dependents(fcell, visited)
 
-    def evaluate_all_formulas(self):
+    def evaluate_all_formulas(self, keep_cached_on_error=False):
         """重算全部公式并写入 df（载入公式后调用）。
 
         #NAME?/#ERROR 表示引擎无法求值（不支持的函数/语法），保留 df 中
         来自 Excel 的缓存计算值不覆盖；其余错误（#DIV/0!、#N/A、#REF! 等）
         是真实的计算结果，必须写入——否则结构变更后单元格会显示并保存
         过期的旧值。
+
+        keep_cached_on_error: 文件加载路径置 True——文件里的缓存值是
+        Excel 的计算结果，任何错误都不覆盖它（旧版应用保存的公式坐标
+        偏一行，会算出 #VALUE! 等假错误，覆盖等于损坏用户数据）。
         """
         for key, formula in self.formulas.items():
             result = self._evaluate(formula)
-            if result not in ("#NAME?", "#ERROR"):
+            if keep_cached_on_error:
+                if not FormulaEngine.is_error(result):
+                    self._set_cell(key[0], key[1], result)
+            elif result not in ("#NAME?", "#ERROR"):
                 self._set_cell(key[0], key[1], result)
         self._rebuild_all_deps()
 
@@ -308,6 +320,11 @@ class PandasTableModel(QAbstractTableModel):
         if not self._undo_stack:
             return False
         record = self._undo_stack.pop()
+        if record[0] == "__rename__":
+            _, col, old_name, new_name = record
+            self._rename_column_impl(col, old_name)
+            self._redo_stack.append(record)
+            return True
         row, col, old, new, old_formula, new_formula = record
         self._apply_formula_state(row, col, old_formula)
         self._set_cell(row, col, old)
@@ -322,6 +339,11 @@ class PandasTableModel(QAbstractTableModel):
         if not self._redo_stack:
             return False
         record = self._redo_stack.pop()
+        if record[0] == "__rename__":
+            _, col, old_name, new_name = record
+            self._rename_column_impl(col, new_name)
+            self._undo_stack.append(record)
+            return True
         row, col, old, new, old_formula, new_formula = record
         self._apply_formula_state(row, col, new_formula)
         self._set_cell(row, col, new)
@@ -347,7 +369,8 @@ class PandasTableModel(QAbstractTableModel):
     def df(self) -> pd.DataFrame:
         return self._df
 
-    def set_dataframe(self, df: pd.DataFrame, mark_modified=False, formulas=None):
+    def set_dataframe(self, df: pd.DataFrame, mark_modified=False, formulas=None,
+                      from_file=False):
         self.beginResetModel()
         self._invalidate_values()
         self._df = df
@@ -370,7 +393,7 @@ class PandasTableModel(QAbstractTableModel):
                 pad = pd.DataFrame(np.full((need_rows, len(self._df.columns)), np.nan),
                                    columns=self._df.columns)
                 self._df = pd.concat([self._df, pad]).reset_index(drop=True)
-            self.evaluate_all_formulas()
+            self.evaluate_all_formulas(keep_cached_on_error=from_file)
         self.endResetModel()
         if mark_modified:
             self.modified = True
@@ -523,16 +546,30 @@ class PandasTableModel(QAbstractTableModel):
         self.evaluate_all_formulas()
 
     def rename_column(self, position: int, new_name: str):
-        if not new_name or new_name in self._df.columns:
+        old_name = str(self._df.columns[position])
+        if new_name == old_name:
             return False
+        if not new_name or new_name in self._df.columns:
+            self.renameFailed.emit(tr("列名无效或已存在"))
+            return False
+        self._rename_column_impl(position, new_name)
+        # 记入撤销栈（带标记的记录，undo/redo 分别按旧名/新名重放）
+        self._push_undo(("__rename__", position, old_name, new_name))
+        return True
+
+    def _rename_column_impl(self, position: int, new_name: str):
+        """执行重命名并发出联动信号（不入撤销栈，undo/redo 复用）。"""
+        old_name = str(self._df.columns[position])
         cols = list(self._df.columns)
         cols[position] = new_name
         self._df.columns = cols
         # 列名显示在视图第 0 行（水平表头是固定字母，无需刷新）
         idx = self.index(0, position)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
+        # 引用表头的公式（如 =A1）依赖键为 (-1, col)，重命名后重算
+        self._recalc_dependents((-1, position))
         self.modified = True
-        return True
+        self.columnRenamed.emit(position, old_name, new_name)
 
     def _unique_col_name(self, base):
         if base not in self._df.columns:

@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from PyQt6.QtCore import Qt, QTimer, QSettings
-from PyQt6.QtGui import QAction, QKeySequence, QFont
+from PyQt6.QtGui import QAction, QKeySequence, QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QMainWindow, QTableView, QVBoxLayout, QHBoxLayout, QWidget, QLabel,
     QComboBox, QToolBar, QPushButton, QMessageBox, QFileDialog,
@@ -30,6 +30,9 @@ from PyQt6.QtWidgets import (
 
 from . import file_io, filter_engine
 from .pandas_model import PandasTableModel
+
+# 视图第 0 行是虚拟表头行；所有视图行 <-> 数据行换算共用此常量
+HEADER_ROWS = PandasTableModel.HEADER_ROWS
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
 from .find_dialog import FindReplaceDialog
@@ -107,18 +110,22 @@ class _FastCellDelegate(QStyledItemDelegate):
                       if model.formulas else None)
                 pen_color = fg if fg is not None else option.palette.text().color()
             painter.setPen(pen_color)
-            if index.row() == 0:
+            is_header = index.row() == 0
+            if is_header:
                 # 表头行加粗（自绘委托不走模型的 FontRole）
                 bold = QFont(option.font)
                 bold.setBold(True)
                 painter.setFont(bold)
+                metrics = QFontMetrics(bold)
             else:
                 painter.setFont(option.font)
+                metrics = option.fontMetrics
             avail = rect.width() - 2 * self._PAD
-            key = (text, avail)
+            # 粗体宽度不同，缓存键必须区分表头行，且按对应字体度量省略
+            key = (text, avail, is_header)
             elided = self._elide_cache.get(key)
             if elided is None:
-                elided = option.fontMetrics.elidedText(
+                elided = metrics.elidedText(
                     text, Qt.TextElideMode.ElideRight, avail)
                 if len(self._elide_cache) > 100_000:
                     self._elide_cache.clear()
@@ -275,6 +282,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._apply_zoom()
         self.table.selectionModel().currentChanged.connect(self._on_current_cell_changed)
+        # 列重命名联动：同步筛选条件/original_df；失败时状态栏提示
+        self.model.columnRenamed.connect(self._after_column_rename)
+        self.model.renameFailed.connect(self.update_statusbar)
 
         # 数据结构变化（排序/筛选/粘贴/插删行列都会替换 df 对象）时，
         # 图片面板必须换成新 df，否则行号和图片对不上
@@ -729,7 +739,7 @@ class MainWindow(QMainWindow):
             if self.current_sheet:
                 self._cache_sheet(self.current_sheet, df)
             self.model.cell_colors.clear()
-            self.model.set_dataframe(df, formulas=formulas)
+            self.model.set_dataframe(df, formulas=formulas, from_file=True)
             self.model.modified = False
             self._load_file_config()
             self._update_image_context()
@@ -983,7 +993,7 @@ class MainWindow(QMainWindow):
             self._filtered_idx_map = idx_map
             self.model.set_dataframe(filtered)
         else:
-            self.model.set_dataframe(df, formulas=formulas)
+            self.model.set_dataframe(df, formulas=formulas, from_file=True)
         self.model.cell_colors.clear()
         self._refresh_sheet_combo()
         self._rebuild_filter_bar()
@@ -1111,19 +1121,13 @@ class MainWindow(QMainWindow):
         if roles and Qt.ItemDataRole.DisplayRole not in roles \
                 and Qt.ItemDataRole.EditRole not in roles:
             return
-        # 筛选状态下把编辑同步回 original_df（视图行 0 是表头行，数据行 -1）
+        # 筛选状态下把编辑同步回 original_df（视图行 0 是表头行，
+        # 重命名联动由 columnRenamed 信号统一处理，这里跳过）
         if self.original_df is not None and self._filtered_idx_map:
             for view_row in range(top_left.row(), bottom_right.row() + 1):
                 if view_row == 0:
-                    # 表头行编辑 = 重命名列，同步 original_df 的列名
-                    for col in range(top_left.column(), bottom_right.column() + 1):
-                        if col < len(self.model.df.columns) \
-                                and col < len(self.original_df.columns):
-                            cols = list(self.original_df.columns)
-                            cols[col] = self.model.df.columns[col]
-                            self.original_df.columns = cols
                     continue
-                row = view_row - 1
+                row = view_row - HEADER_ROWS
                 if row >= len(self._filtered_idx_map):
                     continue
                 orig_label = self._filtered_idx_map[row]
@@ -1158,7 +1162,7 @@ class MainWindow(QMainWindow):
         idx = self.table.currentIndex()
         if not idx.isValid():
             return len(self.model.df)
-        return max(0, idx.row() - 1)
+        return max(0, idx.row() - HEADER_ROWS)
 
     def _current_col(self):
         idx = self.table.currentIndex()
@@ -1185,7 +1189,7 @@ class MainWindow(QMainWindow):
         if not self._require_no_filter():
             return
         # 视图行 0 是表头行，不可删除；转换为数据行坐标
-        rows = sorted({i.row() - 1 for i in self.table.selectionModel().selectedIndexes()
+        rows = sorted({i.row() - HEADER_ROWS for i in self.table.selectionModel().selectedIndexes()
                        if i.row() > 0})
         if not rows:
             return
@@ -1235,20 +1239,27 @@ class MainWindow(QMainWindow):
         edit.setFocus()
 
     def _apply_column_rename(self, col_idx, name):
-        old = str(self.model.df.columns[col_idx])
         name = name.strip()
-        if not name or name == old:
+        if not name or name == str(self.model.df.columns[col_idx]):
             return
-        if self.model.rename_column(col_idx, name):
-            # 筛选状态下 model.df 是副本，需同步 original_df 的列名
-            if self.original_df is not None and old in self.original_df.columns:
-                self.original_df.rename(columns={old: name.strip()}, inplace=True)
-                for f in self.active_filters:
-                    if f["col"] == old:
-                        f["col"] = name.strip()
-            self._mark_modified()
-        else:
+        # 联动簿记（original_df/筛选条件）由 columnRenamed 信号统一处理
+        if not self.model.rename_column(col_idx, name):
             QMessageBox.warning(self, tr("重命名列"), tr("列名无效或已存在"))
+
+    def _after_column_rename(self, col_idx, old, new):
+        """列重命名后的联动（所有路径共用：表头行编辑/列头双击/撤销重做）。"""
+        # 筛选状态下 model.df 是副本，需同步 original_df 的列名和筛选条件
+        if self.original_df is not None and old in self.original_df.columns:
+            self.original_df.rename(columns={old: new}, inplace=True)
+            for f in self.active_filters:
+                if f["col"] == old:
+                    f["col"] = new
+            self._rebuild_filter_bar()
+        if old in self.image_columns:
+            self.image_columns.discard(old)
+            self.image_columns.add(new)
+            self._update_image_context()
+        self._mark_modified()
 
     # ================= 排序 =================
 
@@ -1452,19 +1463,25 @@ class MainWindow(QMainWindow):
         matrix = []
         if with_headers is None:
             with_headers = self.copy_headers_cb.isChecked()
+        # 选区含视图表头行（行 0）时它本身就是列名行：与"复制列名"选项
+        # 合并，保证列名在剪贴板里最多出现一次
+        header_selected = 0 in rows
+        if header_selected:
+            rows = [r for r in rows if r != 0]
+        with_headers = with_headers or header_selected
         if with_headers:
             matrix.append([str(df.columns[c]) for c in cols])
-        def cell_text(view_row, c):
-            if view_row == 0:
-                # 视图行 0 是表头行
-                return str(df.columns[c]) if c < len(df.columns) else ""
-            v = df.iat[view_row - 1, c]
-            return "" if pd.isna(v) else str(v)
 
         selected = {(i.row(), i.column()) for i in indexes}
         for r in rows:
-            matrix.append([cell_text(r, c) if (r, c) in selected else ""
-                           for c in cols])
+            row_vals = []
+            for c in cols:
+                if (r, c) in selected:
+                    v = df.iat[r - 1, c]
+                    row_vals.append("" if pd.isna(v) else str(v))
+                else:
+                    row_vals.append("")
+            matrix.append(row_vals)
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter="\t", quotechar='"',
                             quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
@@ -1549,13 +1566,22 @@ class MainWindow(QMainWindow):
                 mark_modified=True, formulas=self.model.formulas)
         for r_off, row_vals in enumerate(rows):
             for c_off, val in enumerate(row_vals):
-                index = self.model.index(start_row + r_off, start_col + c_off)
+                target_row = start_row + r_off
+                index = self.model.index(target_row, start_col + c_off)
                 formula = clip["cells"].get((r_off, c_off)) if use_formulas else None
                 if formula:
                     val = self.model.shift_formula(
                         formula,
                         start_row - clip["origin"][0],
                         start_col - clip["origin"][1])
+                elif target_row == 0:
+                    # 粘贴到表头行 = 批量重命名；重名自动唯一化，避免静默丢弃
+                    name = str(val).strip()
+                    col_pos = start_col + c_off
+                    if (name and col_pos < len(self.model.df.columns)
+                            and name != str(self.model.df.columns[col_pos])
+                            and name in self.model.df.columns):
+                        val = self.model._unique_col_name(name)
                 self.model.setData(index, val)
         self._mark_modified()
         self.update_statusbar(tr("已粘贴 {} 行").format(len(rows)))
@@ -1636,7 +1662,7 @@ class MainWindow(QMainWindow):
         df = self.model.df
         if indexes:
             values = pd.to_numeric(
-                pd.Series([df.iat[i.row() - 1, i.column()]
+                pd.Series([df.iat[i.row() - HEADER_ROWS, i.column()]
                            for i in indexes if i.row() > 0]),  # 跳过表头行
                 errors="coerce")
         else:
@@ -1663,7 +1689,7 @@ class MainWindow(QMainWindow):
 
     def jump_to_cell(self, row, col):
         """跳转到数据行 row（0 基）；视图中偏移一行表头。"""
-        index = self.model.index(row + 1, col)
+        index = self.model.index(row + HEADER_ROWS, col)
         self.table.setCurrentIndex(index)
         self.table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
@@ -1679,7 +1705,7 @@ class MainWindow(QMainWindow):
             self._preview_cell = (current.row(), current.column())
             self.model.set_highlight_row(current.row())
             # 图片面板按数据行工作（视图行 0 是表头行）
-            self.image_panel.set_current_row(current.row() - 1)
+            self.image_panel.set_current_row(current.row() - HEADER_ROWS)
         else:
             self._preview_cell = None
             self.model.set_highlight_row(-1)
@@ -1760,7 +1786,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("图片队列"), tr("请先把某一列设为图片列"))
             return
         # 从选中行（或全部行）收集图片路径（视图行 -> 数据行，跳过表头行）
-        rows = sorted({i.row() - 1 for i in self.table.selectionModel().selectedIndexes()
+        rows = sorted({i.row() - HEADER_ROWS for i in self.table.selectionModel().selectedIndexes()
                        if i.row() > 0})
         if len(rows) <= 1:
             rows = range(len(self.model.df))
@@ -1812,7 +1838,7 @@ class MainWindow(QMainWindow):
         indexes = [i for i in self.table.selectionModel().selectedIndexes()
                    if i.row() > 0]  # 视图行 0 是表头行，不设背景色
         for i in indexes:
-            row = i.row() - 1   # 数据行
+            row = i.row() - HEADER_ROWS   # 数据行
             self.model.set_cell_color(row, i.column(), color_hex)
             # 筛选状态下同步到原始行坐标底账，清除筛选后颜色仍在正确的行上
             if self._filtered_idx_map is not None and self._orig_cell_colors is not None \
@@ -1832,7 +1858,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if index.isValid():
             # 视图行 -> 数据行（-1）；表头行上"向上插入"落到数据行 0
-            data_row = max(0, index.row() - 1)
+            data_row = max(0, index.row() - HEADER_ROWS)
             menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
             menu.addAction(tr("向下插入一行"), lambda: self.insert_row(
                 data_row + (1 if index.row() > 0 else 0)))
@@ -1884,7 +1910,7 @@ class MainWindow(QMainWindow):
     def _view_cell_image(self, index):
         if index.row() == 0:
             return  # 表头行没有图片
-        raw = str(self.model.df.iat[index.row() - 1, index.column()]).strip()
+        raw = str(self.model.df.iat[index.row() - HEADER_ROWS, index.column()]).strip()
         if not raw or raw.lower() in ("nan", "none"):
             return
         path = raw if os.path.isabs(raw) else os.path.normpath(
@@ -1899,7 +1925,7 @@ class MainWindow(QMainWindow):
         if not indexes:
             return
         # 视图行 -> 数据行；表头行由列名行独立提供，选中它不再重复
-        rows = sorted({i.row() - 1 for i in indexes if i.row() > 0})
+        rows = sorted({i.row() - HEADER_ROWS for i in indexes if i.row() > 0})
         cols = sorted({i.column() for i in indexes})
         df = self.model.df
         matrix = [[str(df.columns[c]) for c in cols]]

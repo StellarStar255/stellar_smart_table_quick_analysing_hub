@@ -132,3 +132,41 @@ class TestReviewFindings:
         assert len(rows) == 3
         rows = win._parse_clipboard_text('a\t1\n\t\nb\t2')
         assert len(rows) == 2  # 按值粘贴维持旧行为
+
+
+class TestCoordinateMigrationFindings:
+    """坐标系迁移审查回归（finding 2/5/6）"""
+
+    def test_rename_updates_active_filters(self, win):
+        # finding 2: 表头行改名后筛选条件的 col 必须跟着改
+        apply_filter(win, FILTER_X_GT_15)
+        assert len(win.model.df) == 2
+        win.model.setData(win.model.index(0, 0), '销售额')
+        assert win.active_filters[0]['col'] == '销售额'
+        assert '销售额' in win.original_df.columns
+        win._reapply_filters()          # 筛选仍然生效
+        assert len(win.model.df) == 2
+
+    def test_copy_with_header_row_selected_dedups_header(self, win):
+        # finding 5: 选中表头行 + 勾选复制列名，列名只出现一次
+        from PyQt6.QtWidgets import QApplication
+        sel = win.table.selectionModel()
+        sel.clearSelection()
+        for r in (0, 1):
+            sel.select(win.model.index(r, 0),
+                       QItemSelectionModel.SelectionFlag.Select)
+        win.copy_selection(with_headers=True)
+        lines = QApplication.clipboard().text().splitlines()
+        assert lines[0] == 'X'
+        assert lines.count('X') == 1  # 表头不重复
+        assert lines[1] == '30.0'     # 数据行跟在后面
+
+    def test_paste_duplicate_name_onto_header_gets_unique(self, win):
+        # finding 6: 粘贴到表头行遇重名自动唯一化，不静默丢弃
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText('Y')
+        win._formula_clipboard = None
+        win.table.setCurrentIndex(win.model.index(0, 0))
+        win.paste_selection()
+        assert list(win.model.df.columns)[0] not in ('X', 'Y')
+        assert list(win.model.df.columns)[0].startswith('Y')
