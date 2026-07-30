@@ -574,10 +574,13 @@ class PandasTableModel(QAbstractTableModel):
         # 列名显示在视图第 0 行（水平表头是固定字母，无需刷新）
         idx = self.index(0, position)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
+        self.modified = True
+        # 先发联动信号（宿主同步 original_df/筛选条件的列名），
+        # 再重算表头依赖——重算会触发 dataChanged，筛选同步按新列名
+        # 写回 original_df，顺序反了会在旧名表上创建幻影重复列
+        self.columnRenamed.emit(position, old_name, new_name)
         # 引用表头的公式（如 =A1）依赖键为 (-1, col)，重命名后重算
         self._recalc_dependents((-1, position))
-        self.modified = True
-        self.columnRenamed.emit(position, old_name, new_name)
 
     def _unique_col_name(self, base):
         if base not in self._df.columns:

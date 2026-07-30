@@ -126,6 +126,24 @@ def _dedupe_headers(headers):
 
 # ---------- 保存 ----------
 
+# 坐标版本标记（写入 xlsx 文档属性 keywords）：带标记 = 本应用新坐标系
+# （第 1 行表头、公式坐标与 Excel 一致）保存，加载时公式结果可放心写入；
+# 无标记 = Excel/旧版应用来源，加载时错误结果不覆盖文件缓存值
+COORD_MARKER = "SmartTableHub-coord-v2"
+
+
+def xlsx_has_coord_marker(file_path) -> bool:
+    """检查 xlsx 是否带本应用的坐标版本标记（直接扫 docProps/core.xml）。"""
+    import zipfile
+    try:
+        with zipfile.ZipFile(file_path) as z:
+            with z.open("docProps/core.xml") as f:
+                return COORD_MARKER.encode() in f.read()
+    except (OSError, KeyError, zipfile.BadZipFile,
+            TypeError, ValueError, AttributeError):
+        return False
+
+
 def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                   progress_cb=None):
     """把 {sheet名: DataFrame} 全量写入 xlsx。
@@ -151,6 +169,8 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                     # +2: 跳过表头行且 openpyxl 从 1 开始计数
                     writer.sheets[safe_name].cell(row=row + 2, column=col + 1,
                                                   value=formula)
+            # 坐标版本标记：本应用保存的文件加载时公式结果可放心写入
+            writer.book.properties.keywords = COORD_MARKER
         shutil.move(tmp_path, file_path)
     except Exception:
         if os.path.exists(tmp_path):

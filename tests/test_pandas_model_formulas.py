@@ -139,6 +139,39 @@ class TestHeaderRenameIntegrity:
         assert m.formulas  # 公式保留
 
 
+class TestCoordMarker:
+    """二轮审查 finding 2/3：坐标版本标记区分本应用文件与外来文件"""
+
+    def test_app_saved_file_has_marker(self, tmp_path):
+        from qtui import file_io
+        df = pd.DataFrame({'X': [1.0]})
+        path = str(tmp_path / 'a.xlsx')
+        file_io.save_workbook(path, {'S': df}, ['S'])
+        assert file_io.xlsx_has_coord_marker(path)
+
+    def test_foreign_file_has_no_marker(self, tmp_path):
+        from qtui import file_io
+        path = str(tmp_path / 'b.xlsx')
+        pd.DataFrame({'X': [1.0]}).to_excel(path, index=False)
+        assert not file_io.xlsx_has_coord_marker(path)
+        assert not file_io.xlsx_has_coord_marker(None)  # 无文件时安全返回
+
+    def test_error_formula_survives_app_save_reload(self, tmp_path):
+        # finding 2 的完整闭环：本应用保存的错误公式重开后仍显示错误
+        from qtui import file_io
+        df = pd.DataFrame({'X': [10.0, 0.0]})
+        path = str(tmp_path / 'c.xlsx')
+        file_io.save_workbook(path, {'S': df}, ['S'],
+                              {'S': {(0, 0): '=A2/A3'}})  # 10/0 -> #DIV/0!
+        assert file_io.xlsx_has_coord_marker(path)
+        loaded = file_io.read_sheet_formulas(path, 'S')
+        m = PandasTableModel(pd.DataFrame())
+        # 带标记 -> from_file=False -> 错误结果正常写入
+        m.set_dataframe(df.copy(), formulas=loaded,
+                        from_file=not file_io.xlsx_has_coord_marker(path))
+        assert m._df.iat[0, 0] == '#DIV/0!'
+
+
 class TestLoadKeepsCachedOnError:
     """审查 finding 1：文件加载路径任何错误都不覆盖 Excel 缓存值"""
 

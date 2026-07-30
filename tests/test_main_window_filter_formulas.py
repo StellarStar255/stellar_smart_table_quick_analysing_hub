@@ -161,6 +161,81 @@ class TestCoordinateMigrationFindings:
         assert lines.count('X') == 1  # 表头不重复
         assert lines[1] == '30.0'     # 数据行跟在后面
 
+    def test_rename_with_header_formula_under_filter_no_phantom_column(self, win):
+        # 二轮审查 finding 1: 重命名信号先于依赖重算，否则筛选同步
+        # 会按新列名写入仍是旧名的 original_df，产生幻影重复列
+        apply_filter(win, FILTER_X_GT_15)
+        win.model.setData(win.model.index(1, 0), '=A1')  # 表头引用公式
+        win.model.setData(win.model.index(0, 0), '新名')  # 表头行重命名
+        cols = list(win.original_df.columns)
+        assert cols.count('新名') == 1
+        assert len(cols) == 2
+
+    def test_paste_swapped_header_names(self, win):
+        # 二轮审查 finding 4: 粘贴互换的列名不应产生 Y1 之类的后缀
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText('Y\tX')
+        win._formula_clipboard = None
+        win.table.setCurrentIndex(win.model.index(0, 0))
+        win.paste_selection()
+        assert list(win.model.df.columns) == ['Y', 'X']
+
+    def _copy_cell(self, win, row, col):
+        idx = win.model.index(row, col)
+        win.table.setCurrentIndex(idx)
+        win.table.selectionModel().select(
+            idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        win.copy_selection(with_headers=False)
+
+    def test_paste_formula_cell_onto_header_uses_value(self, win):
+        # 二轮审查 finding 5: 公式格粘贴到表头行按计算结果处理，不套用公式平移
+        from PyQt6.QtWidgets import QApplication
+        win.model.setData(win.model.index(1, 1), '=A2*2')  # 60
+        self._copy_cell(win, 1, 1)
+        win.table.setCurrentIndex(win.model.index(0, 0))
+        win.paste_selection()
+        assert list(win.model.df.columns)[0] == '60.0'
+        assert '#REF' not in list(win.model.df.columns)[0]
+
+    def test_disjoint_selection_formula_pastes_correctly(self, win):
+        # 二轮审查 finding 6: 不连续选区的公式按矩阵秩对齐、逐格平移
+        win.model.setData(win.model.index(3, 1), '=A4*2')  # 数据行2, 40
+        sel = win.table.selectionModel()
+        sel.clearSelection()
+        for r in (1, 3):  # 跳过视图行 2
+            sel.select(win.model.index(r, 1),
+                       QItemSelectionModel.SelectionFlag.Select)
+        win.copy_selection(with_headers=False)
+        win.table.setCurrentIndex(win.model.index(1, 1))
+        win.paste_selection()
+        # 矩阵压缩后公式在第 2 行：目标 (视图2,1)，源 (视图3,1)，平移 -1 行
+        assert win.model.formulas.get((1, 1)) == '=A3*2'
+        assert win.model.df.iat[1, 1] == 20  # A3(数据行1)=10 * 2
+
+    def test_partial_header_selection_copies_only_selected_names(self, win):
+        # 二轮审查 finding 7: 只选中部分表头单元格时未选中的列留空
+        from PyQt6.QtWidgets import QApplication
+        sel = win.table.selectionModel()
+        sel.clearSelection()
+        sel.select(win.model.index(0, 0),
+                   QItemSelectionModel.SelectionFlag.Select)
+        sel.select(win.model.index(1, 1),
+                   QItemSelectionModel.SelectionFlag.Select)
+        win.copy_selection(with_headers=False)
+        lines = QApplication.clipboard().text().splitlines()
+        assert lines[0].split('\t') == ['X', '']
+
+    def test_copy_count_includes_header_line(self, win):
+        # 二轮审查 finding 10: 状态栏行数包含表头行
+        sel = win.table.selectionModel()
+        sel.clearSelection()
+        for r in (0, 1):
+            sel.select(win.model.index(r, 0),
+                       QItemSelectionModel.SelectionFlag.Select)
+        win.copy_selection(with_headers=False)
+        # 行数含表头行（UI 语言可能是中文或英文，只断言数字）
+        assert '2' in win.statusBar().currentMessage().split('×')[0]
+
     def test_paste_duplicate_name_onto_header_gets_unique(self, win):
         # finding 6: 粘贴到表头行遇重名自动唯一化，不静默丢弃
         from PyQt6.QtWidgets import QApplication

@@ -695,7 +695,11 @@ class MainWindow(QMainWindow):
             if self.current_sheet:
                 self._cache_sheet(self.current_sheet, df)
             self.model.cell_colors.clear()
-            self.model.set_dataframe(df, formulas=formulas, from_file=True)
+            # 本应用（新坐标系）保存的文件带标记，公式结果可放心写入；
+            # 无标记（Excel/旧版来源）保守处理：错误不覆盖文件缓存值
+            self.model.set_dataframe(
+                df, formulas=formulas,
+                from_file=not file_io.xlsx_has_coord_marker(path))
             self.model.modified = False
             self._load_file_config()
             self._update_image_context()
@@ -949,7 +953,10 @@ class MainWindow(QMainWindow):
             self._filtered_idx_map = idx_map
             self.model.set_dataframe(filtered)
         else:
-            self.model.set_dataframe(df, formulas=formulas, from_file=True)
+            self.model.set_dataframe(
+                df, formulas=formulas,
+                from_file=bool(self.current_file)
+                and not file_io.xlsx_has_coord_marker(self.current_file))
         self.model.cell_colors.clear()
         self._refresh_sheet_combo()
         self._rebuild_filter_bar()
@@ -1196,6 +1203,7 @@ class MainWindow(QMainWindow):
             self.image_columns.discard(old)
             self.image_columns.add(new)
             self._update_image_context()
+            self._save_file_config()   # 图片列名持久化在配置里，改名同步落盘
         self._mark_modified()
 
     # ================= 排序 =================
@@ -1400,16 +1408,19 @@ class MainWindow(QMainWindow):
         matrix = []
         if with_headers is None:
             with_headers = self.copy_headers_cb.isChecked()
+        selected = {(i.row(), i.column()) for i in indexes}
         # 选区含视图表头行（行 0）时它本身就是列名行：与"复制列名"选项
-        # 合并，保证列名在剪贴板里最多出现一次
+        # 合并，保证列名在剪贴板里最多出现一次。勾选选项输出全部列名；
+        # 只选中部分表头单元格时，未选中的列留空占位
         header_selected = 0 in rows
         if header_selected:
             rows = [r for r in rows if r != 0]
-        with_headers = with_headers or header_selected
-        if with_headers:
-            matrix.append([str(df.columns[c]) for c in cols])
+        if with_headers or header_selected:
+            matrix.append([
+                str(df.columns[c]) if (with_headers or (0, c) in selected) else ""
+                for c in cols])
+        header_line = 1 if (with_headers or header_selected) else 0
 
-        selected = {(i.row(), i.column()) for i in indexes}
         for r in rows:
             row_vals = []
             for c in cols:
@@ -1425,25 +1436,27 @@ class MainWindow(QMainWindow):
         writer.writerows(matrix)
         clip_text = buf.getvalue().rstrip("\n")
         QApplication.clipboard().setText(clip_text)
-        # 记录选区内的公式及来源位置（视图坐标；公式键是数据行，需 -1）：
-        # 同应用内粘贴时公式按相对引用平移，外部应用粘到的仍是计算结果文本
-        header_rows = 1 if with_headers else 0
+        # 记录选区内的公式：键为剪贴板矩阵位置（不连续选区按秩压缩，
+        # 与矩阵行列一一对应），并带上源单元格视图坐标供逐格计算平移量
+        row_rank = {r: i for i, r in enumerate(rows)}
+        col_rank = {c: i for i, c in enumerate(cols)}
         formula_cells = {}
         for r, c in selected:
             if r == 0:
                 continue
-            f = self.model.formulas.get((r - 1, c))
+            f = self.model.formulas.get((r - HEADER_ROWS, c))
             if f:
-                formula_cells[(r - rows[0] + header_rows, c - cols[0])] = f
+                formula_cells[(row_rank[r] + header_line, col_rank[c])] = {
+                    "text": f, "src": (r, c)}
         self._formula_clipboard = {
             "text": clip_text,
-            "origin": (rows[0] - header_rows, cols[0]),
             "cells": formula_cells,
             # 复制后行列结构一旦变化（插删/排序/换表），公式引用已被
             # 重写，剪贴板里的旧公式文本作废，粘贴退回按值处理
             "version": self.model.structure_version,
         } if formula_cells else None
-        self.update_statusbar(tr("已复制 {} 行 × {} 列").format(len(rows), len(cols)))
+        self.update_statusbar(
+            tr("已复制 {} 行 × {} 列").format(len(matrix), len(cols)))
 
     def paste_selection(self):
         if self._text_editor_focused():
@@ -1501,18 +1514,37 @@ class MainWindow(QMainWindow):
             self.model.set_dataframe(
                 pd.concat([self.model.df, empty]).reset_index(drop=True),
                 mark_modified=True, formulas=self.model.formulas)
+        if start_row == 0 and rows:
+            # 表头行粘贴预处理：目标名被"本次同样会被改名的列"占用时
+            # （如互换/轮换列名），先把占名列挪到临时名，避免误判重名加后缀
+            desired = {}
+            for c_off, val in enumerate(rows[0]):
+                col_pos = start_col + c_off
+                name = str(val).strip()
+                if name and col_pos < len(self.model.df.columns):
+                    desired[col_pos] = name
+            targets = set(desired.values())
+            for col_pos in desired:
+                cur = str(self.model.df.columns[col_pos])
+                if cur in targets and desired[col_pos] != cur:
+                    self.model.rename_column(
+                        col_pos, self.model._unique_col_name("__重命名中转"))
+
         for r_off, row_vals in enumerate(rows):
             for c_off, val in enumerate(row_vals):
                 target_row = start_row + r_off
                 index = self.model.index(target_row, start_col + c_off)
                 formula = clip["cells"].get((r_off, c_off)) if use_formulas else None
-                if formula:
+                if formula and target_row > 0:
+                    # 逐格计算平移量（不连续选区各格偏移不同）
+                    src_r, src_c = formula["src"]
                     val = self.model.shift_formula(
-                        formula,
-                        start_row - clip["origin"][0],
-                        start_col - clip["origin"][1])
+                        formula["text"],
+                        target_row - src_r,
+                        start_col + c_off - src_c)
                 elif target_row == 0:
-                    # 粘贴到表头行 = 批量重命名；重名自动唯一化，避免静默丢弃
+                    # 粘贴到表头行 = 批量重命名（公式也按其计算结果文本处理）；
+                    # 与既有列真重名时自动唯一化，避免静默丢弃
                     name = str(val).strip()
                     col_pos = start_col + c_off
                     if (name and col_pos < len(self.model.df.columns)
