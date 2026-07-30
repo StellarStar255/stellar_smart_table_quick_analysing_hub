@@ -98,7 +98,7 @@ class FindReplaceDialog(QDialog):
             import re
             new = re.sub(re.escape(find_text), self.replace_edit.text().replace("\\", "\\\\"),
                          old, flags=re.IGNORECASE)
-        model.setData(model.index(row, col), new)
+        model.setData(model.index(row + 1, col), new)  # 视图行偏移一行表头
         self._invalidate()
         self.find_next()
 
@@ -119,7 +119,7 @@ class FindReplaceDialog(QDialog):
                 import re
                 new = re.sub(re.escape(find_text), replace_text.replace("\\", "\\\\"),
                              old, flags=re.IGNORECASE)
-            if model.setData(model.index(row, col), new):
+            if model.setData(model.index(row + 1, col), new):  # 视图行偏移一行表头
                 count += 1
         self._invalidate()
         self.status.setText(tr("已替换 {} 处").format(count))

@@ -107,6 +107,13 @@ class _FastCellDelegate(QStyledItemDelegate):
                       if model.formulas else None)
                 pen_color = fg if fg is not None else option.palette.text().color()
             painter.setPen(pen_color)
+            if index.row() == 0:
+                # 表头行加粗（自绘委托不走模型的 FontRole）
+                bold = QFont(option.font)
+                bold.setBold(True)
+                painter.setFont(bold)
+            else:
+                painter.setFont(option.font)
             avail = rect.width() - 2 * self._PAD
             key = (text, avail)
             elided = self._elide_cache.get(key)
@@ -1104,9 +1111,19 @@ class MainWindow(QMainWindow):
         if roles and Qt.ItemDataRole.DisplayRole not in roles \
                 and Qt.ItemDataRole.EditRole not in roles:
             return
-        # 筛选状态下把编辑同步回 original_df
+        # 筛选状态下把编辑同步回 original_df（视图行 0 是表头行，数据行 -1）
         if self.original_df is not None and self._filtered_idx_map:
-            for row in range(top_left.row(), bottom_right.row() + 1):
+            for view_row in range(top_left.row(), bottom_right.row() + 1):
+                if view_row == 0:
+                    # 表头行编辑 = 重命名列，同步 original_df 的列名
+                    for col in range(top_left.column(), bottom_right.column() + 1):
+                        if col < len(self.model.df.columns) \
+                                and col < len(self.original_df.columns):
+                            cols = list(self.original_df.columns)
+                            cols[col] = self.model.df.columns[col]
+                            self.original_df.columns = cols
+                    continue
+                row = view_row - 1
                 if row >= len(self._filtered_idx_map):
                     continue
                 orig_label = self._filtered_idx_map[row]
@@ -1137,8 +1154,11 @@ class MainWindow(QMainWindow):
         return True
 
     def _current_row(self):
+        """当前数据行（0 基）；视图第 0 行是表头行。"""
         idx = self.table.currentIndex()
-        return idx.row() if idx.isValid() else len(self.model.df)
+        if not idx.isValid():
+            return len(self.model.df)
+        return max(0, idx.row() - 1)
 
     def _current_col(self):
         idx = self.table.currentIndex()
@@ -1164,7 +1184,9 @@ class MainWindow(QMainWindow):
     def delete_selected_rows(self):
         if not self._require_no_filter():
             return
-        rows = sorted({i.row() for i in self.table.selectionModel().selectedIndexes()})
+        # 视图行 0 是表头行，不可删除；转换为数据行坐标
+        rows = sorted({i.row() - 1 for i in self.table.selectionModel().selectedIndexes()
+                       if i.row() > 0})
         if not rows:
             return
         ret = QMessageBox.question(self, tr("删除行"), tr("确定删除选中的 {} 行？").format(len(rows)))
@@ -1432,28 +1454,31 @@ class MainWindow(QMainWindow):
             with_headers = self.copy_headers_cb.isChecked()
         if with_headers:
             matrix.append([str(df.columns[c]) for c in cols])
+        def cell_text(view_row, c):
+            if view_row == 0:
+                # 视图行 0 是表头行
+                return str(df.columns[c]) if c < len(df.columns) else ""
+            v = df.iat[view_row - 1, c]
+            return "" if pd.isna(v) else str(v)
+
         selected = {(i.row(), i.column()) for i in indexes}
         for r in rows:
-            row_vals = []
-            for c in cols:
-                if (r, c) in selected:
-                    v = df.iat[r, c]
-                    row_vals.append("" if pd.isna(v) else str(v))
-                else:
-                    row_vals.append("")
-            matrix.append(row_vals)
+            matrix.append([cell_text(r, c) if (r, c) in selected else ""
+                           for c in cols])
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter="\t", quotechar='"',
                             quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
         writer.writerows(matrix)
         clip_text = buf.getvalue().rstrip("\n")
         QApplication.clipboard().setText(clip_text)
-        # 记录选区内的公式及来源位置：同应用内粘贴时（剪贴板未被改写）
-        # 公式按相对引用平移后粘贴，外部应用粘到的仍是计算结果文本
+        # 记录选区内的公式及来源位置（视图坐标；公式键是数据行，需 -1）：
+        # 同应用内粘贴时公式按相对引用平移，外部应用粘到的仍是计算结果文本
         header_rows = 1 if with_headers else 0
         formula_cells = {}
         for r, c in selected:
-            f = self.model.formulas.get((r, c))
+            if r == 0:
+                continue
+            f = self.model.formulas.get((r - 1, c))
             if f:
                 formula_cells[(r - rows[0] + header_rows, c - cols[0])] = f
         self._formula_clipboard = {
@@ -1502,9 +1527,10 @@ class MainWindow(QMainWindow):
             return
 
         idx = self.table.currentIndex()
-        start_row = idx.row() if idx.isValid() else 0
+        start_row = idx.row() if idx.isValid() else 1
         start_col = idx.column() if idx.isValid() else 0
-        need_rows = start_row + len(rows) - len(self.model.df)
+        # 视图容量 = 数据行数 + 1 行表头
+        need_rows = start_row + len(rows) - (len(self.model.df) + 1)
         need_cols = start_col + max(len(r) for r in rows) - len(self.model.df.columns)
         if (need_rows > 0 or need_cols > 0) and self.active_filters:
             QMessageBox.information(self, tr("粘贴"), tr("筛选状态下粘贴内容不能超出表格范围"))
@@ -1610,7 +1636,9 @@ class MainWindow(QMainWindow):
         df = self.model.df
         if indexes:
             values = pd.to_numeric(
-                pd.Series([df.iat[i.row(), i.column()] for i in indexes]), errors="coerce")
+                pd.Series([df.iat[i.row() - 1, i.column()]
+                           for i in indexes if i.row() > 0]),  # 跳过表头行
+                errors="coerce")
         else:
             values = pd.Series(dtype=float)
         if values.notna().sum() == 0:
@@ -1634,7 +1662,8 @@ class MainWindow(QMainWindow):
         self._find_dialog.find_edit.setFocus()
 
     def jump_to_cell(self, row, col):
-        index = self.model.index(row, col)
+        """跳转到数据行 row（0 基）；视图中偏移一行表头。"""
+        index = self.model.index(row + 1, col)
         self.table.setCurrentIndex(index)
         self.table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
@@ -1649,7 +1678,8 @@ class MainWindow(QMainWindow):
             self._preview_loading = False
             self._preview_cell = (current.row(), current.column())
             self.model.set_highlight_row(current.row())
-            self.image_panel.set_current_row(current.row())
+            # 图片面板按数据行工作（视图行 0 是表头行）
+            self.image_panel.set_current_row(current.row() - 1)
         else:
             self._preview_cell = None
             self.model.set_highlight_row(-1)
@@ -1661,8 +1691,8 @@ class MainWindow(QMainWindow):
     def _save_cell_preview(self):
         if not getattr(self, "_preview_cell", None):
             return
-        row, col = self._preview_cell
-        if row >= len(self.model.df) or col >= len(self.model.df.columns):
+        row, col = self._preview_cell   # 视图坐标；行 0 = 表头（编辑即重命名）
+        if row > len(self.model.df) or col >= len(self.model.df.columns):
             return
         self.model.setData(self.model.index(row, col),
                            self.cell_preview_text.toPlainText())
@@ -1729,8 +1759,9 @@ class MainWindow(QMainWindow):
         if colname is None or colname not in self.model.df.columns:
             QMessageBox.information(self, tr("图片队列"), tr("请先把某一列设为图片列"))
             return
-        # 从选中行（或全部行）收集图片路径
-        rows = sorted({i.row() for i in self.table.selectionModel().selectedIndexes()})
+        # 从选中行（或全部行）收集图片路径（视图行 -> 数据行，跳过表头行）
+        rows = sorted({i.row() - 1 for i in self.table.selectionModel().selectedIndexes()
+                       if i.row() > 0})
         if len(rows) <= 1:
             rows = range(len(self.model.df))
         col_idx = list(self.model.df.columns).index(colname)
@@ -1778,13 +1809,15 @@ class MainWindow(QMainWindow):
     # ================= 背景颜色 =================
 
     def _set_selection_color(self, color_hex):
-        indexes = self.table.selectionModel().selectedIndexes()
+        indexes = [i for i in self.table.selectionModel().selectedIndexes()
+                   if i.row() > 0]  # 视图行 0 是表头行，不设背景色
         for i in indexes:
-            self.model.set_cell_color(i.row(), i.column(), color_hex)
+            row = i.row() - 1   # 数据行
+            self.model.set_cell_color(row, i.column(), color_hex)
             # 筛选状态下同步到原始行坐标底账，清除筛选后颜色仍在正确的行上
             if self._filtered_idx_map is not None and self._orig_cell_colors is not None \
-                    and i.row() < len(self._filtered_idx_map):
-                key = (self._filtered_idx_map[i.row()], i.column())
+                    and row < len(self._filtered_idx_map):
+                key = (self._filtered_idx_map[row], i.column())
                 if color_hex:
                     self._orig_cell_colors[key] = color_hex
                 else:
@@ -1798,8 +1831,11 @@ class MainWindow(QMainWindow):
         index = self.table.indexAt(pos)
         menu = QMenu(self)
         if index.isValid():
-            menu.addAction(tr("向上插入一行"), lambda: self.insert_row(index.row()))
-            menu.addAction(tr("向下插入一行"), lambda: self.insert_row(index.row() + 1))
+            # 视图行 -> 数据行（-1）；表头行上"向上插入"落到数据行 0
+            data_row = max(0, index.row() - 1)
+            menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
+            menu.addAction(tr("向下插入一行"), lambda: self.insert_row(
+                data_row + (1 if index.row() > 0 else 0)))
             menu.addAction(tr("删除选中行"), self.delete_selected_rows)
             menu.addSeparator()
             menu.addAction(tr("向左插入一列"), lambda: self._insert_col_at(index.column()))
@@ -1846,7 +1882,9 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _view_cell_image(self, index):
-        raw = str(self.model.df.iat[index.row(), index.column()]).strip()
+        if index.row() == 0:
+            return  # 表头行没有图片
+        raw = str(self.model.df.iat[index.row() - 1, index.column()]).strip()
         if not raw or raw.lower() in ("nan", "none"):
             return
         path = raw if os.path.isabs(raw) else os.path.normpath(
@@ -1860,7 +1898,8 @@ class MainWindow(QMainWindow):
         indexes = self.table.selectionModel().selectedIndexes()
         if not indexes:
             return
-        rows = sorted({i.row() for i in indexes})
+        # 视图行 -> 数据行；表头行由列名行独立提供，选中它不再重复
+        rows = sorted({i.row() - 1 for i in indexes if i.row() > 0})
         cols = sorted({i.column() for i in indexes})
         df = self.model.df
         matrix = [[str(df.columns[c]) for c in cols]]
@@ -1925,9 +1964,12 @@ class MainWindow(QMainWindow):
         row = self.table.verticalHeader().logicalIndexAt(pos)
         if row < 0:
             return
+        # 视图行 -> 数据行；表头行（视图 0）上两个动作都落到数据行 0
+        data_row = max(0, row - 1)
+        below = data_row + (1 if row > 0 else 0)
         menu = QMenu(self)
-        menu.addAction(tr("向上插入一行"), lambda: self.insert_row(row))
-        menu.addAction(tr("向下插入一行"), lambda: self.insert_row(row + 1))
+        menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
+        menu.addAction(tr("向下插入一行"), lambda: self.insert_row(below))
         menu.addAction(tr("删除选中行"), self.delete_selected_rows)
         menu.exec(self.table.verticalHeader().mapToGlobal(pos))
 

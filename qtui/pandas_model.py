@@ -7,7 +7,7 @@ PandasTableModel - 基于 QAbstractTableModel 的 pandas DataFrame 模型
 """
 
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont
 import pandas as pd
 import numpy as np
 
@@ -21,6 +21,9 @@ _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _HIGHLIGHT_BRUSH = QColor(74, 158, 219, 46)   # 当前行整行淡色高亮
 _FORMULA_BRUSH = QColor(FORMULA_TEXT_COLOR)
+_HEADER_ROW_BRUSH = QColor(127, 127, 127, 42)  # 表头行底色（浅/深主题都可读）
+_HEADER_ROW_FONT = QFont()
+_HEADER_ROW_FONT.setBold(True)
 
 
 class PandasTableModel(QAbstractTableModel):
@@ -52,10 +55,15 @@ class PandasTableModel(QAbstractTableModel):
 
     # ---------- 基本接口 ----------
 
+    # 视图第 0 行是虚拟表头行（显示/编辑列名），数据行在视图中从 1 起。
+    # 内部一切键（formulas/cell_colors/undo/依赖表）仍用 0 基数据行坐标，
+    # 只在视图边界（data/setData/信号发射）做 ±1 换算。
+    HEADER_ROWS = 1
+
     def rowCount(self, parent=QModelIndex()):
         if parent.isValid():
             return 0
-        return len(self._df)
+        return len(self._df) + self.HEADER_ROWS
 
     def columnCount(self, parent=QModelIndex()):
         if parent.isValid():
@@ -80,13 +88,16 @@ class PandasTableModel(QAbstractTableModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
+        if index.row() == 0:
+            return self._header_row_data(index.column(), role)
+        row = index.row() - self.HEADER_ROWS   # 数据行坐标
         if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
             if role == Qt.ItemDataRole.EditRole:
                 # 编辑公式单元格时显示公式本身
-                formula = self.formulas.get((index.row(), index.column()))
+                formula = self.formulas.get((row, index.column()))
                 if formula:
                     return formula
-            value = self._col_info(index.column())[0][index.row()]
+            value = self._col_info(index.column())[0][row]
             if type(value) is str:      # 最常见情况直接返回
                 return value
             if pd.isna(value):
@@ -95,7 +106,7 @@ class PandasTableModel(QAbstractTableModel):
                 return str(int(value))
             return str(value)
         if role == Qt.ItemDataRole.BackgroundRole:
-            color = self.cell_colors.get((index.row(), index.column()))
+            color = self.cell_colors.get((row, index.column()))
             if color:
                 return QColor(color)
             if index.row() == self.highlight_row:
@@ -105,27 +116,40 @@ class PandasTableModel(QAbstractTableModel):
             arr, numeric = self._col_info(index.column())
             if numeric:
                 return _ALIGN_RIGHT
-            value = arr[index.row()]
+            value = arr[row]
             if isinstance(value, (int, float, np.integer, np.floating)):
                 # NaN 靠左（与原行为一致），其余数字靠右
                 return _ALIGN_LEFT if value != value else _ALIGN_RIGHT
             return _ALIGN_LEFT
         if role == Qt.ItemDataRole.ForegroundRole:
-            if (index.row(), index.column()) in self.formulas:
+            if (row, index.column()) in self.formulas:
                 return _FORMULA_BRUSH
             return None
         if role == Qt.ItemDataRole.ToolTipRole:
-            return self.formulas.get((index.row(), index.column()))
+            return self.formulas.get((row, index.column()))
+        return None
+
+    def _header_row_data(self, col, role):
+        """视图第 0 行：列名（可编辑重命名），加粗并以底色区分。"""
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            if col < len(self._df.columns):
+                return str(self._df.columns[col])
+            return ""
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return _HEADER_ROW_BRUSH
+        if role == Qt.ItemDataRole.FontRole:
+            return _HEADER_ROW_FONT
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return _ALIGN_LEFT
         return None
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
-            if section < len(self._df.columns):
-                return str(self._df.columns[section])
-            return None
-        # 行号从 1 开始（显示位置行号，而非 DataFrame 索引）
+            # 固定字母坐标（Excel 风格），列名显示在视图第 1 行
+            return FormulaEngine.col_index_to_letter(section)
+        # 行号从 1 开始；第 1 行是表头行，数据从 2 起（与 Excel/公式引用一致）
         return str(section + 1)
 
     def flags(self, index):
@@ -140,7 +164,10 @@ class PandasTableModel(QAbstractTableModel):
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if role != Qt.ItemDataRole.EditRole or not index.isValid():
             return False
-        row, col = index.row(), index.column()
+        if index.row() == 0:
+            # 表头行：编辑即重命名列
+            return self.rename_column(index.column(), str(value).strip())
+        row, col = index.row() - self.HEADER_ROWS, index.column()
         key = (row, col)
         old = self._df.iat[row, col]
         old_formula = self.formulas.get(key)
@@ -219,7 +246,7 @@ class PandasTableModel(QAbstractTableModel):
                 continue
             result = self._evaluate(formula)
             self._set_cell(fcell[0], fcell[1], result)
-            idx = self.index(fcell[0], fcell[1])
+            idx = self.index(fcell[0] + self.HEADER_ROWS, fcell[1])
             self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
             self._recalc_dependents(fcell, visited)
 
@@ -285,7 +312,7 @@ class PandasTableModel(QAbstractTableModel):
         self._apply_formula_state(row, col, old_formula)
         self._set_cell(row, col, old)
         self._redo_stack.append(record)
-        idx = self.index(row, col)
+        idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
         self._recalc_dependents((row, col))
         self.modified = True
@@ -299,7 +326,7 @@ class PandasTableModel(QAbstractTableModel):
         self._apply_formula_state(row, col, new_formula)
         self._set_cell(row, col, new)
         self._undo_stack.append(record)
-        idx = self.index(row, col)
+        idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
         self._recalc_dependents((row, col))
         self.modified = True
@@ -349,7 +376,7 @@ class PandasTableModel(QAbstractTableModel):
             self.modified = True
 
     def set_highlight_row(self, row):
-        """设置当前整行高亮的行，刷新新旧两行。"""
+        """设置当前整行高亮的行（视图行号），刷新新旧两行。"""
         old = self.highlight_row
         if old == row:
             return
@@ -358,24 +385,26 @@ class PandasTableModel(QAbstractTableModel):
         if ncols == 0:
             return
         for r in (old, row):
-            if 0 <= r < len(self._df):
+            if 0 <= r < len(self._df) + self.HEADER_ROWS:
                 self.dataChanged.emit(self.index(r, 0), self.index(r, ncols - 1),
                                       [Qt.ItemDataRole.BackgroundRole])
 
     def set_cell_color(self, row, col, color_hex):
-        """设置/清除单元格背景色（color_hex 为 None 时清除）。"""
+        """设置/清除单元格背景色（row 为 0 基数据行；color_hex 为 None 时清除）。"""
         if color_hex:
             self.cell_colors[(row, col)] = color_hex
         else:
             self.cell_colors.pop((row, col), None)
-        idx = self.index(row, col)
+        idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole])
 
     # ---------- 结构操作 ----------
 
     def insert_row(self, position: int):
         self._invalidate_values()
-        self.beginInsertRows(QModelIndex(), position, position)
+        # position 为数据行坐标，视图中偏移一行（表头行）
+        view_pos = position + self.HEADER_ROWS
+        self.beginInsertRows(QModelIndex(), view_pos, view_pos)
         empty = pd.DataFrame([[np.nan] * len(self._df.columns)], columns=self._df.columns)
         self._df = pd.concat(
             [self._df.iloc[:position], empty, self._df.iloc[position:]]
@@ -499,7 +528,9 @@ class PandasTableModel(QAbstractTableModel):
         cols = list(self._df.columns)
         cols[position] = new_name
         self._df.columns = cols
-        self.headerDataChanged.emit(Qt.Orientation.Horizontal, position, position)
+        # 列名显示在视图第 0 行（水平表头是固定字母，无需刷新）
+        idx = self.index(0, position)
+        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
         self.modified = True
         return True
 

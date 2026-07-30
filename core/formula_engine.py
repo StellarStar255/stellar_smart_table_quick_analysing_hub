@@ -135,7 +135,8 @@ class FormulaEngine:
         row_num = int(match.group(2))
 
         col_index = self.col_letter_to_index(col_letter)
-        row_index = row_num - 1
+        # Excel 语义：第 1 行是表头，数据从第 2 行起（A2 -> 数据行 0，A1 -> -1 表头）
+        row_index = row_num - 2
 
         if df is not None and col_index < len(df.columns):
             col_name = df.columns[col_index]
@@ -152,9 +153,9 @@ class FormulaEngine:
             raise ValueError(tr("无效的区域引用: {}").format(range_ref))
 
         start_col = self.col_letter_to_index(match.group(1).upper())
-        start_row = int(match.group(2)) - 1
+        start_row = int(match.group(2)) - 2
         end_col = self.col_letter_to_index(match.group(3).upper())
-        end_row = int(match.group(4)) - 1
+        end_row = int(match.group(4)) - 2
 
         cells = []
         for row in range(start_row, end_row + 1):
@@ -192,10 +193,12 @@ class FormulaEngine:
         return dependencies
 
     def get_cell_value(self, row_index: int, col_name: str, df: Optional[pd.DataFrame] = None) -> Any:
-        """获取单元格的值"""
+        """获取单元格的值；row_index == -1 表示表头行（返回列名文本，同 Excel）"""
         df = df if df is not None else self._df
         if df is None:
             return 0
+        if row_index == -1:
+            return str(col_name)
         if row_index < 0 or row_index >= len(df):
             return 0
         if col_name not in df.columns:
@@ -263,9 +266,9 @@ class FormulaEngine:
             # 文本值占位保护，避免其中的 "A1" 等被后续替换误伤
             def replace_range(match):
                 start_col = self.col_letter_to_index(match.group(1).upper())
-                start_row = int(match.group(2)) - 1
+                start_row = int(match.group(2)) - 2
                 end_col = self.col_letter_to_index(match.group(3).upper())
-                end_row = int(match.group(4)) - 1
+                end_row = int(match.group(4)) - 2
                 row_parts = []
                 for r in range(start_row, end_row + 1):
                     parts = []
@@ -372,8 +375,9 @@ class FormulaEngine:
             return False
         expr = self.STRING_PATTERN.sub('', formula)
         for m in self.RANGE_REF_PATTERN.finditer(expr):
-            r1 = int(m.group(2)) - 1
-            r2 = int(m.group(4)) - 1
+            r1 = int(m.group(2)) - 2
+            r2 = int(m.group(4)) - 2
+            # min <= 0 表示从表头行或首个数据行开始，覆盖顶部
             if min(r1, r2) > 0 or max(r1, r2) < nrows - 1:
                 return True
         return False
@@ -404,10 +408,11 @@ class FormulaEngine:
             col_part, row_abs, row_num = m.group(1), m.group(2), int(m.group(3))
             if row_abs:
                 return m.group()
-            new_row = row_map.get(row_num - 1)
+            # 文本行号 -> 数据行（-2）；表头行（数据 -1）不在 map 中保持不变
+            new_row = row_map.get(row_num - 2)
             if new_row is None:
                 return m.group()
-            return f'{col_part}{new_row + 1}'
+            return f'{col_part}{new_row + 2}'
 
         expr = self._REMAP_CELL_PATTERN.sub(remap, expr)
         return self._STRING_PLACEHOLDER_PATTERN.sub(
@@ -455,7 +460,8 @@ class FormulaEngine:
 
         def adjust_range(m):
             c1a, c1, r1a, r1, c2a, c2, r2a, r2 = m.groups()
-            row1, row2 = int(r1) - 1, int(r2) - 1
+            # 文本行号 -> 数据行索引（-2）；表头行为 -1，映射函数会原样保留
+            row1, row2 = int(r1) - 2, int(r2) - 2
             col1 = self.col_letter_to_index(c1.upper())
             col2 = self.col_letter_to_index(c2.upper())
             if row_map is not None:
@@ -470,22 +476,22 @@ class FormulaEngine:
                     return stash('#REF!')
             # 占位保护调整结果，避免下面的单元格替换再动它
             return stash(
-                f'{c1a}{self.col_index_to_letter(col1)}{r1a}{row1 + 1}:'
-                f'{c2a}{self.col_index_to_letter(col2)}{r2a}{row2 + 1}'
+                f'{c1a}{self.col_index_to_letter(col1)}{r1a}{row1 + 2}:'
+                f'{c2a}{self.col_index_to_letter(col2)}{r2a}{row2 + 2}'
             )
 
         expr = self._RANGE_PARTS_PATTERN.sub(adjust_range, expr)
 
         def adjust_cell(m):
             col_abs, col_letter, row_abs, row_num = m.groups()
-            row = int(row_num) - 1
+            row = int(row_num) - 2
             col = self.col_letter_to_index(col_letter.upper())
             new_row = row_map(row) if row_map is not None else row
             new_col = col_map(col) if col_map is not None else col
             if new_row is None or new_col is None:
                 return '#REF!'
             return (f'{col_abs}{self.col_index_to_letter(new_col)}'
-                    f'{row_abs}{new_row + 1}')
+                    f'{row_abs}{new_row + 2}')
 
         expr = self._SHIFT_CELL_PATTERN.sub(adjust_cell, expr)
         return self._STRING_PLACEHOLDER_PATTERN.sub(

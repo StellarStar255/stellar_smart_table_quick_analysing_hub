@@ -22,24 +22,80 @@ def make_model():
     return PandasTableModel(df)
 
 
+class TestVirtualHeaderRow:
+    """视图第 0 行是表头行：显示/编辑列名，水平表头是固定字母。"""
+
+    def test_row_count_includes_header(self):
+        m = make_model()
+        assert m.rowCount() == 4  # 3 数据行 + 1 表头行
+
+    def test_header_row_shows_column_names(self):
+        m = make_model()
+        assert m.data(m.index(0, 0)) == 'X'
+        assert m.data(m.index(0, 1)) == 'Y'
+
+    def test_horizontal_header_is_fixed_letters(self):
+        m = make_model()
+        assert m.headerData(0, Qt.Orientation.Horizontal) == 'A'
+        assert m.headerData(1, Qt.Orientation.Horizontal) == 'B'
+
+    def test_editing_header_row_renames_column(self):
+        m = make_model()
+        assert m.setData(m.index(0, 0), '销售额')
+        assert list(m._df.columns) == ['销售额', 'Y']
+        assert m.headerData(0, Qt.Orientation.Horizontal) == 'A'  # 字母不变
+
+    def test_rename_to_existing_name_rejected(self):
+        m = make_model()
+        assert not m.setData(m.index(0, 0), 'Y')
+        assert list(m._df.columns) == ['X', 'Y']
+
+    def test_formula_can_reference_header(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=CONCAT(A1, "!")')
+        assert m._df.iat[0, 1] == 'X!'
+
+
+class TestXlsxRoundTrip:
+    """公式坐标与 Excel 完全一致：写盘/读盘零转换。"""
+
+    def test_formula_lands_on_excel_cell_and_reads_back(self, tmp_path):
+        from qtui import file_io
+        from openpyxl import load_workbook
+        df = pd.DataFrame({'X': [10.0, 20.0]})
+        path = str(tmp_path / 't.xlsx')
+        # 公式在数据行 1（视图/Excel 第 3 行），引用第一条数据 A2
+        file_io.save_workbook(path, {'S': df}, ['S'],
+                              {'S': {(1, 0): '=A2*2'}})
+        wb = load_workbook(path)
+        assert wb['S']['A3'].value == '=A2*2'  # Excel 里 A2 正是第一条数据
+        wb.close()
+        formulas = file_io.read_sheet_formulas(path, 'S')
+        assert formulas == {(1, 0): '=A2*2'}
+        # 读回后引擎按同一坐标计算
+        m = PandasTableModel(df.copy())
+        m.set_dataframe(df.copy(), formulas=formulas)
+        assert m._df.iat[1, 0] == 20  # 10*2
+
+
 class TestFormulaEditing:
     def test_formula_stores_text_and_result(self):
         m = make_model()
-        assert m.setData(m.index(0, 1), '=A1*2')
-        assert m.formulas[(0, 1)] == '=A1*2'
+        assert m.setData(m.index(1, 1), '=A2*2')
+        assert m.formulas[(0, 1)] == '=A2*2'
         assert m._df.iat[0, 1] == 60
 
     def test_dependent_recalc_on_edit(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1+A2')
+        m.setData(m.index(1, 1), '=A2+A3')
         assert m._df.iat[0, 1] == 40
-        m.setData(m.index(1, 0), '5')  # A2: 10 -> 5
+        m.setData(m.index(2, 0), '5')  # A2: 10 -> 5
         assert m._df.iat[0, 1] == 35
 
     def test_overwrite_formula_with_value(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')
-        m.setData(m.index(0, 1), '7')
+        m.setData(m.index(1, 1), '=A2*2')
+        m.setData(m.index(1, 1), '7')
         assert (0, 1) not in m.formulas
         assert m._df.iat[0, 1] == 7
 
@@ -47,31 +103,31 @@ class TestFormulaEditing:
 class TestSortFollowsFormulas:
     def test_formula_cell_moves_with_its_row(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')  # 行 X=30，结果 60
+        m.setData(m.index(1, 1), '=A2*2')  # 行 X=30，结果 60
         m.sort(0, Qt.SortOrder.AscendingOrder)  # X: 10, 20, 30
         # X=30 的行排到第 3 行，公式跟着走且引用重写
-        assert m.formulas == {(2, 1): '=A3*2'}
+        assert m.formulas == {(2, 1): '=A4*2'}
         assert m._df.iat[2, 1] == 60
 
     def test_recalc_after_sort_keeps_result(self):
         m = make_model()
-        m.setData(m.index(1, 1), '=A2+100')  # 行 X=10，结果 110
+        m.setData(m.index(2, 1), '=A3+100')  # 行 X=10，结果 110
         m.sort(0, Qt.SortOrder.AscendingOrder)  # X=10 的行排到第 1 行
-        assert m.formulas == {(0, 1): '=A1+100'}
+        assert m.formulas == {(0, 1): '=A2+100'}
         assert m._df.iat[0, 1] == 110
 
     def test_dependency_tracking_survives_sort(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')
+        m.setData(m.index(1, 1), '=A2*2')
         m.sort(0, Qt.SortOrder.AscendingOrder)
         # 排序后编辑被引用的单元格，公式应重算
-        m.setData(m.index(2, 0), '50')  # 原 X=30 行现在在第 3 行
+        m.setData(m.index(3, 0), '50')  # 原 X=30 行现在在第 3 行
         assert m._df.iat[2, 1] == 100
 
     def test_partial_range_formula_frozen_on_sort(self):
         # 部分区域排序后成员会变成无关行，冻结为静态值（审查 finding 4）
         m = make_model()
-        m.setData(m.index(0, 1), '=SUM(A1:A2)')  # 30+10 = 40
+        m.setData(m.index(1, 1), '=SUM(A2:A3)')  # 30+10 = 40
         frozen = m.reorder_rows([1, 2, 0])  # 相当于升序排序
         assert frozen == 1
         assert m.formulas == {}
@@ -79,10 +135,10 @@ class TestSortFollowsFormulas:
 
     def test_full_range_formula_survives_sort(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        m.setData(m.index(1, 1), '=SUM(A2:A4)')  # 60
         frozen = m.sort(0, Qt.SortOrder.AscendingOrder)
         assert frozen == 0
-        assert m.formulas == {(2, 1): '=SUM(A1:A3)'}
+        assert m.formulas == {(2, 1): '=SUM(A2:A4)'}
         assert m._df.iat[2, 1] == 60
 
     def test_sort_without_formulas(self):
@@ -94,17 +150,17 @@ class TestSortFollowsFormulas:
 class TestReorderRows:
     def test_reorder_moves_formulas_colors_and_data(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')  # 60
+        m.setData(m.index(1, 1), '=A2*2')  # 60
         m.cell_colors[(0, 0)] = '#ff0000'
         m.reorder_rows([2, 0, 1])  # 旧行 2/0/1 -> 新行 0/1/2
         assert list(m._df['X']) == [20.0, 30.0, 10.0]
-        assert m.formulas == {(1, 1): '=A2*2'}
+        assert m.formulas == {(1, 1): '=A3*2'}
         assert m.cell_colors == {(1, 0): '#ff0000'}
         assert m._df.iat[1, 1] == 60
 
     def test_reorder_clears_undo_and_marks_modified(self):
         m = make_model()
-        m.setData(m.index(0, 0), '99')
+        m.setData(m.index(1, 0), '99')
         m.reorder_rows([1, 2, 0])
         assert m.modified
         assert not m._undo_stack
@@ -113,57 +169,57 @@ class TestReorderRows:
 class TestInsertDeleteFollowsFormulas:
     def test_insert_row_shifts_formula_and_refs(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A2')  # 引用 X=10
+        m.setData(m.index(1, 1), '=A3')  # 引用 X=10
         m.insert_row(0)
         # 公式随行下移，引用也指向下移后的数据
-        assert m.formulas == {(1, 1): '=A3'}
+        assert m.formulas == {(1, 1): '=A4'}
         assert m._df.iat[1, 1] == 10
 
     def test_insert_row_below_does_not_touch_refs(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')
+        m.setData(m.index(1, 1), '=A2*2')
         m.insert_row(2)
-        assert m.formulas == {(0, 1): '=A1*2'}
+        assert m.formulas == {(0, 1): '=A2*2'}
         assert m._df.iat[0, 1] == 60
 
     def test_insert_row_grows_range(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        m.setData(m.index(1, 1), '=SUM(A2:A4)')  # 60
         m.insert_row(1)
-        assert m.formulas == {(0, 1): '=SUM(A1:A4)'}
+        assert m.formulas == {(0, 1): '=SUM(A2:A5)'}
         assert m._df.iat[0, 1] == 60  # 插入的空行按 0 计
 
     def test_insert_column_shifts_refs(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')
+        m.setData(m.index(1, 1), '=A2*2')
         m.insert_column(0)
-        assert m.formulas == {(0, 2): '=B1*2'}
+        assert m.formulas == {(0, 2): '=B2*2'}
         assert m._df.iat[0, 2] == 60
 
     def test_delete_referenced_row_becomes_ref_error(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A2')
+        m.setData(m.index(1, 1), '=A3')
         m.remove_rows([1])
         assert m.formulas == {(0, 1): '=#REF!'}
         assert m._df.iat[0, 1] == '#REF!'
 
     def test_delete_row_inside_range_shrinks_and_recalcs(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        m.setData(m.index(1, 1), '=SUM(A2:A4)')  # 60
         m.remove_rows([1])  # 删掉 X=10
-        assert m.formulas == {(0, 1): '=SUM(A1:A2)'}
+        assert m.formulas == {(0, 1): '=SUM(A2:A3)'}
         assert m._df.iat[0, 1] == 50
 
     def test_delete_referenced_column_becomes_ref_error(self):
         m = make_model()
-        m.setData(m.index(0, 1), '=A1*2')
+        m.setData(m.index(1, 1), '=A2*2')
         m.remove_columns([0])
         assert m.formulas == {(0, 0): '=#REF!*2'}
         assert m._df.iat[0, 0] == '#REF!'
 
     def test_delete_formula_cell_row_drops_formula(self):
         m = make_model()
-        m.setData(m.index(1, 1), '=A1')
+        m.setData(m.index(2, 1), '=A2')
         m.remove_rows([1])
         assert m.formulas == {}
 
@@ -174,10 +230,10 @@ class TestReviewFindings:
     def test_new_error_after_delete_is_written(self):
         # finding 1: 结构变更后新产生的 #DIV/0! 必须写入，不能保留旧值
         m = make_model()
-        m.setData(m.index(2, 1), '=AVERAGEIF(A1:A3, ">25")')  # 只有 X=30 匹配
+        m.setData(m.index(3, 1), '=AVERAGEIF(A2:A4, ">25")')  # 只有 X=30 匹配
         assert m._df.iat[2, 1] == 30
         m.remove_rows([0])  # 删掉唯一匹配行；公式收缩为 A1:A2 且无匹配
-        assert m.formulas == {(1, 1): '=AVERAGEIF(A1:A2, ">25")'}
+        assert m.formulas == {(1, 1): '=AVERAGEIF(A2:A3, ">25")'}
         assert m._df.iat[1, 1] == '#DIV/0!'
 
     def test_name_error_keeps_cached_value_on_load(self):
@@ -185,20 +241,20 @@ class TestReviewFindings:
         m = make_model()
         df = m._df.copy()
         df.iat[0, 1] = 42.0  # Excel 里的缓存计算值
-        m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A1:A3, B1:B3)'})
+        m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A2:A4, B2:B4)'})
         assert m._df.iat[0, 1] == 42.0
 
     def test_insert_column_clears_undo(self):
         # finding 6: 列插入后旧撤销记录会写错列
         m = make_model()
-        m.setData(m.index(0, 1), '99')
+        m.setData(m.index(1, 1), '99')
         assert m._undo_stack
         m.insert_column(0)
         assert not m._undo_stack and not m._redo_stack
 
     def test_remove_columns_clears_undo(self):
         m = make_model()
-        m.setData(m.index(0, 1), '99')
+        m.setData(m.index(1, 1), '99')
         m.remove_columns([0])
         assert not m._undo_stack
 
@@ -214,5 +270,5 @@ class TestReviewFindings:
         m.set_dataframe(m._df.copy()); assert m.structure_version > v
         # 普通编辑不 bump
         v = m.structure_version
-        m.setData(m.index(0, 0), '7')
+        m.setData(m.index(1, 0), '7')
         assert m.structure_version == v

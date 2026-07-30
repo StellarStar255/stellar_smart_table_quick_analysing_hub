@@ -42,39 +42,39 @@ def apply_filter(w, *filters):
 
 class TestFilterSuspendsFormulas:
     def test_suspend_on_filter_keeps_static_value(self, win):
-        win.model.setData(win.model.index(0, 1), '=A1*2')  # 60
+        win.model.setData(win.model.index(1, 1), '=A2*2')  # 60
         apply_filter(win, FILTER_X_GT_15)
         assert len(win.model.df) == 2  # X=30, X=20
         assert win.model.formulas == {}
-        assert win._suspended_formulas == {(0, 1): '=A1*2'}
+        assert win._suspended_formulas == {(0, 1): '=A2*2'}
         assert win.model.df.iat[0, 1] == 60  # 静态值保留
 
     def test_restore_recalculates_with_edits_made_while_filtered(self, win):
-        win.model.setData(win.model.index(0, 1), '=A1*2')
+        win.model.setData(win.model.index(1, 1), '=A2*2')
         apply_filter(win, FILTER_X_GT_15)
         # 筛选中编辑被引用的单元格（显示行 0 = 原行 0）：30 -> 50
-        win.model.setData(win.model.index(0, 0), '50')
+        win.model.setData(win.model.index(1, 0), '50')
         assert win.original_df.iloc[0, 0] == 50
         win.clear_all_filters()
-        assert win.model.formulas == {(0, 1): '=A1*2'}
+        assert win.model.formulas == {(0, 1): '=A2*2'}
         assert win.model.df.iat[0, 1] == 100  # 50*2
 
     def test_overwriting_formula_cell_while_filtered_drops_formula(self, win):
-        win.model.setData(win.model.index(0, 1), '=A1*2')
+        win.model.setData(win.model.index(1, 1), '=A2*2')
         apply_filter(win, FILTER_X_GT_15)
-        win.model.setData(win.model.index(0, 1), '999')
+        win.model.setData(win.model.index(1, 1), '999')
         win.clear_all_filters()
         assert win.model.formulas == {}
         assert win.model.df.iat[0, 1] == 999
 
     def test_refilter_keeps_suspended_formulas(self, win):
-        win.model.setData(win.model.index(0, 1), '=A1*2')
+        win.model.setData(win.model.index(1, 1), '=A2*2')
         apply_filter(win, FILTER_X_GT_15)
         apply_filter(win, FILTER_X_GT_15,
                      {'col': 'X', 'condition': '小于', 'value': '100'})
-        assert win._suspended_formulas == {(0, 1): '=A1*2'}
+        assert win._suspended_formulas == {(0, 1): '=A2*2'}
         win.clear_all_filters()
-        assert win.model.formulas == {(0, 1): '=A1*2'}
+        assert win.model.formulas == {(0, 1): '=A2*2'}
 
     def test_filter_without_formulas(self, win):
         apply_filter(win, FILTER_X_GT_15)
@@ -90,7 +90,7 @@ class TestReviewFindings:
     def test_refilter_notifies_frozen_view_formulas(self, win):
         # finding 5: 筛选中输入的公式被转静态值时必须提示，不能无声丢弃
         apply_filter(win, FILTER_X_GT_15)
-        win.model.setData(win.model.index(0, 1), '=A1*2')
+        win.model.setData(win.model.index(1, 1), '=A2*2')
         apply_filter(win, FILTER_X_GT_15,
                      {'col': 'X', 'condition': '小于', 'value': '100'})
         assert win.model.formulas == {}
@@ -98,7 +98,7 @@ class TestReviewFindings:
 
     def test_clear_filters_notifies_frozen_view_formulas(self, win):
         apply_filter(win, FILTER_X_GT_15)
-        win.model.setData(win.model.index(0, 1), '=A1*2')
+        win.model.setData(win.model.index(1, 1), '=A2*2')
         win.clear_all_filters()
         assert '静态值' in win.statusBar().currentMessage()
 
@@ -110,18 +110,18 @@ class TestReviewFindings:
         win.copy_selection(with_headers=False)
 
     def test_paste_shifts_formula_when_structure_unchanged(self, win):
-        win.model.setData(win.model.index(0, 1), '=A1*2')
-        self._copy_cell(win, 0, 1)
-        win.table.setCurrentIndex(win.model.index(2, 1))
+        win.model.setData(win.model.index(1, 1), '=A2*2')
+        self._copy_cell(win, 1, 1)
+        win.table.setCurrentIndex(win.model.index(3, 1))
         win.paste_selection()
-        assert win.model.formulas.get((2, 1)) == '=A3*2'
+        assert win.model.formulas.get((2, 1)) == '=A4*2'
 
     def test_paste_falls_back_after_structure_change(self, win):
         # finding 7: 复制后结构变化，剪贴板旧公式作废，按值粘贴
-        win.model.setData(win.model.index(0, 1), '=A1*2')
-        self._copy_cell(win, 0, 1)
+        win.model.setData(win.model.index(1, 1), '=A2*2')
+        self._copy_cell(win, 1, 1)
         win.model.insert_column(0)  # 结构变化：公式引用已被重写
-        win.table.setCurrentIndex(win.model.index(2, 2))
+        win.table.setCurrentIndex(win.model.index(3, 2))
         win.paste_selection()
         assert (2, 2) not in win.model.formulas  # 按值粘贴，不再是公式
         assert win.model.df.iat[2, 2] == 60     # 复制时的计算结果

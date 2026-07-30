@@ -56,7 +56,8 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **Batch operations**: Multi-row selection and bulk deletion
 
 ### 🧮 Cell Formulas
-- **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A1:A10)`, `=IF(A1>10, "high", "low")`
+- **Excel-consistent grid**: Fixed letter columns (A/B/C...), row 1 is the editable header row, data starts at row 2 — formula coordinates mean exactly the same thing here and in Excel
+- **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A2:A10)`, `=IF(A2>10, "high", "low")`
 - **39 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
 - **Auto recalculation**: Dependent formulas update when referenced cells change
@@ -323,7 +324,8 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **批量操作**: 支持多行选择和批量删除
 
 ### 🧮 单元格公式
-- **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A1:A10)`、`=IF(A1>10, "高", "低")`
+- **Excel 一致的网格**: 固定字母列（A/B/C...），第 1 行是可编辑的表头行，数据从第 2 行起——公式坐标与 Excel 完全一致，跨应用含义相同
+- **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A2:A10)`、`=IF(A2>10, "高", "低")`
 - **39 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
