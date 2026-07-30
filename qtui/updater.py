@@ -114,6 +114,11 @@ class Downloader(QThread):
                     fh.write(chunk)
                     received += len(chunk)
                     self.progress.emit(received, total)
+            # 弱网下连接提前断开时 read() 只返回 EOF 不报错，
+            # 按 Content-Length 预检出截断，让上层走自动重试
+            if total and received < total:
+                raise IOError(
+                    tr("下载不完整（{}/{} 字节）").format(received, total))
             self.done.emit(self.dest)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -283,10 +288,16 @@ class UpdateManager:
 
     # ---- 下载 + 安装 ----
 
-    def _download_and_install(self, release, asset):
+    # 首次下载 + 自动重试 2 次（弱网下截断/损坏常见，重试通常即可恢复）
+    _MAX_DOWNLOAD_ATTEMPTS = 3
+
+    def _download_and_install(self, release, asset, attempt=1):
         dest = os.path.join(tempfile.gettempdir(), asset["name"])
-        dialog = QProgressDialog(
-            tr("正在下载 {} …").format(asset['name']), tr("取消"), 0, 100, self.window)
+        label = tr("正在下载 {} …").format(asset['name'])
+        if attempt > 1:
+            label = tr("正在重试下载（第 {}/{} 次）{} …").format(
+                attempt, self._MAX_DOWNLOAD_ATTEMPTS, asset['name'])
+        dialog = QProgressDialog(label, tr("取消"), 0, 100, self.window)
         dialog.setWindowTitle(tr("下载升级包"))
         dialog.setAutoClose(False)
         dialog.setMinimumDuration(0)
@@ -298,24 +309,37 @@ class UpdateManager:
         dialog.canceled.connect(self._downloader.cancel)
         self._downloader.done.connect(
             lambda path: (dialog.close(),
-                          self._verify_and_install(release, asset, path)))
+                          self._verify_and_install(release, asset, path, attempt)))
         self._downloader.failed.connect(
-            lambda msg: (dialog.close(), QMessageBox.warning(
-                self.window, tr("下载失败"),
-                tr("升级包下载失败：\n{}").format(msg))))
+            lambda msg: (dialog.close(),
+                         self._on_download_failed(release, asset, attempt, msg)))
         self._downloader.start()
         dialog.exec()
 
-    def _verify_and_install(self, release, asset, path):
+    def _on_download_failed(self, release, asset, attempt, msg):
+        if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+            self._download_and_install(release, asset, attempt + 1)
+            return
+        QMessageBox.warning(
+            self.window, tr("下载失败"),
+            tr("升级包下载失败（已自动重试 {} 次）：\n{}").format(
+                self._MAX_DOWNLOAD_ATTEMPTS - 1, msg))
+
+    def _verify_and_install(self, release, asset, path, attempt=1):
         expected = _fetch_checksum(release, asset["name"])
         if expected:
             actual = _sha256(path)
             if actual != expected:
+                os.unlink(path)
+                if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+                    # 校验失败大概率是传输损坏，自动重新下载
+                    self._download_and_install(release, asset, attempt + 1)
+                    return
                 QMessageBox.critical(
                     self.window, tr("校验失败"),
-                    tr("升级包 SHA256 校验失败，已取消安装。\n"
-                       "请前往官方 Release 页面手动下载。"))
-                os.unlink(path)
+                    tr("升级包 SHA256 校验失败（已自动重试 {} 次），已取消安装。\n"
+                       "请前往官方 Release 页面手动下载。").format(
+                        self._MAX_DOWNLOAD_ATTEMPTS - 1))
                 return
         else:
             box = QMessageBox(self.window)
