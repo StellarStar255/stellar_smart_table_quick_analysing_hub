@@ -166,50 +166,6 @@ class _ExcelTableView(QTableView):
             self.edit(idx)
 
 
-class _HeaderRenameEdit(QLineEdit):
-    """列头原位重命名编辑框：回车/失焦提交，Esc 取消。"""
-
-    def __init__(self, parent, on_commit):
-        super().__init__(parent)
-        self._on_commit = on_commit
-        self._done = False
-        self.editingFinished.connect(self._finish)
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.cancel()
-            return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._finish()
-            return
-        super().keyPressEvent(event)
-
-    def focusOutEvent(self, event):
-        super().focusOutEvent(event)
-        self._finish()
-
-    def cancel(self):
-        if self._done:
-            return
-        self._done = True
-        self._close()
-
-    def _finish(self):
-        if self._done:
-            return
-        self._done = True
-        text = self.text()
-        self._close()
-        self._on_commit(text)
-
-    def _close(self):
-        parent = self.parentWidget()
-        self.hide()
-        self.deleteLater()
-        if parent is not None:
-            parent.update()
-
-
 class MainWindow(QMainWindow):
 
     def __init__(self, initial_file=None):
@@ -1218,33 +1174,14 @@ class MainWindow(QMainWindow):
         self.update_statusbar()
 
     def _rename_column_at(self, col_idx):
-        """在列头上原位显示编辑框重命名（回车/失焦提交，Esc 取消）。"""
-        prev = getattr(self, "_header_edit", None)
-        if prev is not None:
-            try:
-                prev._finish()
-            except RuntimeError:
-                pass  # C++ 对象已销毁
-        header = self.table.horizontalHeader()
-        edit = _HeaderRenameEdit(
-            header.viewport(),
-            lambda name, c=col_idx: self._apply_column_rename(c, name))
-        self._header_edit = edit
-        edit.setGeometry(header.sectionViewportPosition(col_idx), 0,
-                         header.sectionSize(col_idx), header.height())
-        edit.setFont(header.font())
-        edit.setText(str(self.model.df.columns[col_idx]))
-        edit.selectAll()
-        edit.show()
-        edit.setFocus()
+        """进入列名编辑：列名住在视图第 1 行，字母坐标行不可编辑。
 
-    def _apply_column_rename(self, col_idx, name):
-        name = name.strip()
-        if not name or name == str(self.model.df.columns[col_idx]):
-            return
-        # 联动簿记（original_df/筛选条件）由 columnRenamed 信号统一处理
-        if not self.model.rename_column(col_idx, name):
-            QMessageBox.warning(self, tr("重命名列"), tr("列名无效或已存在"))
+        双击字母列头 / 右键"重命名列"都跳转到第 1 行的对应单元格编辑。
+        """
+        index = self.model.index(0, col_idx)
+        self.table.setCurrentIndex(index)
+        self.table.scrollTo(index)
+        self.table.edit(index)
 
     def _after_column_rename(self, col_idx, old, new):
         """列重命名后的联动（所有路径共用：表头行编辑/列头双击/撤销重做）。"""
