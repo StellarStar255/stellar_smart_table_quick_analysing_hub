@@ -55,6 +55,23 @@ class TestVirtualHeaderRow:
         m.setData(m.index(1, 1), '=CONCAT(A1, "!")')
         assert m._df.iat[0, 1] == 'X!'
 
+    def test_default_letter_names_display_empty(self):
+        # 新建表默认列名就是字母，表头行显示为空（字母已在固定列头）
+        df = pd.DataFrame({'A': [1.0], 'B': [2.0]})
+        m = PandasTableModel(df)
+        assert m.data(m.index(0, 0)) == ''
+        assert m.data(m.index(0, 1)) == ''
+        m.setData(m.index(0, 0), '名称')
+        assert m.data(m.index(0, 0)) == '名称'
+
+    def test_empty_rename_is_silent_noop(self):
+        m = make_model()
+        messages = []
+        m.renameFailed.connect(messages.append)
+        assert not m.setData(m.index(0, 0), '')
+        assert not messages  # 不弹提示
+        assert list(m._df.columns) == ['X', 'Y']
+
 
 class TestXlsxRoundTrip:
     """公式坐标与 Excel 完全一致：写盘/读盘零转换。"""

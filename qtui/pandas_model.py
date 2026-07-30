@@ -135,10 +135,17 @@ class PandasTableModel(QAbstractTableModel):
         return None
 
     def _header_row_data(self, col, role):
-        """视图第 0 行：列名（可编辑重命名），加粗并以底色区分。"""
+        """视图第 0 行：列名（可编辑重命名），加粗并以底色区分。
+
+        默认列名就是位置字母（新建表的 A/B/C...），此时显示为空——
+        字母坐标已由固定列头提供，重复显示像脏数据；起过名才显示。
+        """
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if col < len(self._df.columns):
-                return str(self._df.columns[col])
+                name = str(self._df.columns[col])
+                if name == FormulaEngine.col_index_to_letter(col):
+                    return ""
+                return name
             return ""
         if role == Qt.ItemDataRole.BackgroundRole:
             return _HEADER_ROW_BRUSH
@@ -547,9 +554,10 @@ class PandasTableModel(QAbstractTableModel):
 
     def rename_column(self, position: int, new_name: str):
         old_name = str(self._df.columns[position])
-        if new_name == old_name:
+        if not new_name or new_name == old_name:
+            # 空输入（点开表头行又没输入）静默忽略，不算错误
             return False
-        if not new_name or new_name in self._df.columns:
+        if new_name in self._df.columns:
             self.renameFailed.emit(tr("列名无效或已存在"))
             return False
         self._rename_column_impl(position, new_name)
