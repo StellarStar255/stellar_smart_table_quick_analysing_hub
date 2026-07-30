@@ -16,6 +16,11 @@ class FormulaEngine:
     CELL_REF_PATTERN = re.compile(r'\$?([A-Z]+)\$?(\d+)', re.IGNORECASE)
     # 区域引用正则：匹配 A1:B10
     RANGE_REF_PATTERN = re.compile(r'\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)', re.IGNORECASE)
+    # 字符串字面量正则：双引号或单引号包裹
+    STRING_PATTERN = re.compile(r'"[^"]*"|\'[^\']*\'')
+    # 字符串占位符：\x00 不会出现在用户输入中，也不会被引用/函数正则误匹配
+    _STRING_PLACEHOLDER = '\x00{}\x00'
+    _STRING_PLACEHOLDER_PATTERN = re.compile('\x00(\\d+)\x00')
 
     def __init__(self, df: Optional[pd.DataFrame] = None):
         """
@@ -158,6 +163,19 @@ class FormulaEngine:
         expr = formula[1:]
 
         try:
+            # 把字符串字面量抽成占位符，避免其中的 "A1"、"SUM(" 等
+            # 被当作单元格引用或函数名误替换；求值前再还原
+            strings: List[str] = []
+
+            def stash(literal: str) -> str:
+                strings.append(literal)
+                return self._STRING_PLACEHOLDER.format(len(strings) - 1)
+
+            expr = self.STRING_PATTERN.sub(lambda m: stash(m.group()), expr)
+
+            # Excel 风格比较符转 Python 风格：= -> ==, <> -> !=
+            expr = self._normalize_operators(expr)
+
             # 替换区域引用为值列表
             def replace_range(match):
                 cells = self.parse_range_ref(match.group(), df)
@@ -172,7 +190,8 @@ class FormulaEngine:
                 row, col = self.parse_cell_ref(match.group(), df)
                 value = self.get_cell_value(row, col, df)
                 if isinstance(value, str):
-                    return f'"{value}"'
+                    # 文本值同样占位保护，repr 保证引号和转义合法
+                    return stash(repr(value))
                 return str(value)
 
             expr = self.CELL_REF_PATTERN.sub(replace_cell, expr)
@@ -180,8 +199,17 @@ class FormulaEngine:
             # 替换函数名为 Python 表达式
             expr = self._replace_functions(expr)
 
+            # 还原字符串字面量
+            expr = self._STRING_PLACEHOLDER_PATTERN.sub(
+                lambda m: strings[int(m.group(1))], expr
+            )
+
             # 安全求值
             result = self._safe_eval(expr)
+
+            # 复数（如对负数开偶次方）视为错误，与 Excel 的 #NUM! 一致
+            if isinstance(result, complex):
+                return "#ERROR"
 
             # 格式化结果
             if isinstance(result, float):
@@ -207,6 +235,86 @@ class FormulaEngine:
     _FUNC_NAME_PATTERN = re.compile(
         r'\b(' + '|'.join(FUNC_MAP) + r')\s*\(', re.IGNORECASE
     )
+
+    # 重映射用：单独捕获行号前的 $（绝对行引用不随排序移动）
+    _REMAP_CELL_PATTERN = re.compile(r'(\$?[A-Z]+)(\$?)(\d+)', re.IGNORECASE)
+
+    def remap_formula_rows(self, formula: str, row_map: dict) -> str:
+        """按 row_map（旧 0 基行号 -> 新 0 基行号）重写公式中的行引用。
+
+        用于排序后让公式引用跟随数据移动。规则：
+        - 字符串字面量跳过
+        - 区域引用（A1:B10）保持不变——整列聚合的成员排序后不变，重写反而破坏
+        - 绝对行引用（A$1）保持不变
+        - 不在 row_map 中的行号保持不变
+        """
+        if not formula.startswith('='):
+            return formula
+
+        strings: List[str] = []
+
+        def stash(m):
+            strings.append(m.group())
+            return self._STRING_PLACEHOLDER.format(len(strings) - 1)
+
+        expr = self.STRING_PATTERN.sub(stash, formula)
+        # 区域引用也占位保护，避免其端点被当作单个引用重写
+        expr = self.RANGE_REF_PATTERN.sub(stash, expr)
+
+        def remap(m):
+            col_part, row_abs, row_num = m.group(1), m.group(2), int(m.group(3))
+            if row_abs:
+                return m.group()
+            new_row = row_map.get(row_num - 1)
+            if new_row is None:
+                return m.group()
+            return f'{col_part}{new_row + 1}'
+
+        expr = self._REMAP_CELL_PATTERN.sub(remap, expr)
+        return self._STRING_PLACEHOLDER_PATTERN.sub(
+            lambda m: strings[int(m.group(1))], expr
+        )
+
+    @staticmethod
+    def _normalize_operators(expr: str) -> str:
+        """把 Excel 风格比较符转成 Python 风格：= -> ==, <> -> !=
+
+        逐字符扫描并跳过字符串字面量，不会误改 "a=b" 这类文本；
+        已经是 Python 风格的 ==, <=, >=, != 保持原样。
+        """
+        result = []
+        i = 0
+        n = len(expr)
+        in_str = None  # 当前所在字符串字面量的引号字符
+        while i < n:
+            ch = expr[i]
+            if in_str:
+                result.append(ch)
+                if ch == in_str:
+                    in_str = None
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = ch
+                result.append(ch)
+                i += 1
+                continue
+            if expr.startswith('<>', i):
+                result.append('!=')
+                i += 2
+                continue
+            if ch == '=':
+                prev = result[-1][-1] if result else ''
+                next_ch = expr[i + 1] if i + 1 < n else ''
+                if prev in ('=', '<', '>', '!') or next_ch == '=':
+                    result.append(ch)
+                else:
+                    result.append('==')
+                i += 1
+                continue
+            result.append(ch)
+            i += 1
+        return ''.join(result)
 
     def _replace_functions(self, expr: str) -> str:
         """将 Excel 函数名替换为求值环境中的实现名。
@@ -285,6 +393,12 @@ class FormulaEngine:
         def _round(value, digits=0):
             return round(value, int(digits))
 
+        def _sqrt(value):
+            if value < 0:
+                # 与 Excel 的 #NUM! 一致，不返回复数
+                raise ValueError("SQRT of negative number")
+            return value ** 0.5
+
         allowed_names = {
             'sum': sum, 'max': max, 'min': min, 'len': len,
             'abs': abs, 'round': round, 'int': int, 'float': float,
@@ -298,7 +412,7 @@ class FormulaEngine:
             '_lower': lambda text: str(text).lower(),
             '_trim': lambda text: str(text).strip(),
             '_round': _round,
-            '_sqrt': lambda value: value ** 0.5,
+            '_sqrt': _sqrt,
             '_mod': lambda num, divisor: num % divisor,
         }
 

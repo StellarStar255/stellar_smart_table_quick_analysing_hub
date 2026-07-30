@@ -468,10 +468,21 @@ class PandasTableModel(QAbstractTableModel):
             return
         colname = self._df.columns[column]
         self.beginResetModel()
-        self._df = self._df.sort_values(
+        sorted_df = self._df.sort_values(
             colname,
             ascending=(order == Qt.SortOrder.AscendingOrder),
             kind="mergesort",
             na_position="last",
-        ).reset_index(drop=True)
+        )
+        # 旧行位置 -> 新行位置，让公式单元格及其引用跟随数据移动
+        row_map = {old: new for new, old in enumerate(sorted_df.index)}
+        self._df = sorted_df.reset_index(drop=True)
+        if self.formulas:
+            self._engine.set_dataframe(self._df)
+            self.formulas = {
+                (row_map.get(r, r), c): self._engine.remap_formula_rows(f, row_map)
+                for (r, c), f in self.formulas.items()
+            }
+            # 区域引用不重写，排序后成员可能变化，全部重算一遍（内部会重建依赖）
+            self.evaluate_all_formulas()
         self.endResetModel()
