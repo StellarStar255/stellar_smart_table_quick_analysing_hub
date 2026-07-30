@@ -282,6 +282,40 @@ class TestCountSemantics:
         assert engine.evaluate('=COUNTA(A1:C1)') == 3
 
 
+# ---------- 复制/填充引用平移 ----------
+
+class TestShiftFormula:
+    def test_relative_shift(self, engine):
+        assert engine.shift_formula('=A1*2', 1, 0) == '=A2*2'
+        assert engine.shift_formula('=A1+B2', 2, 1) == '=B3+C4'
+
+    def test_negative_shift(self, engine):
+        assert engine.shift_formula('=B2', -1, -1) == '=A1'
+
+    def test_absolute_refs_stay(self, engine):
+        assert engine.shift_formula('=$A$1', 3, 3) == '=$A$1'
+        assert engine.shift_formula('=$A1', 3, 3) == '=$A4'
+        assert engine.shift_formula('=A$1', 3, 3) == '=D$1'
+
+    def test_range_endpoints_shift(self, engine):
+        assert engine.shift_formula('=SUM(A1:A3)', 1, 1) == '=SUM(B2:B4)'
+
+    def test_multi_letter_column(self, engine):
+        assert engine.shift_formula('=Z1', 0, 1) == '=AA1'
+
+    def test_out_of_bounds_becomes_ref_error(self, engine):
+        assert engine.shift_formula('=A1', -1, 0) == '=#REF!'
+        assert engine.evaluate('=#REF!') == '#REF!'
+        assert engine.evaluate('=A1+#REF!*2') == '#REF!'
+
+    def test_string_literal_untouched(self, engine):
+        assert engine.shift_formula('=CONCAT("A1", A1)', 1, 0) == '=CONCAT("A1", A2)'
+
+    def test_zero_delta_and_non_formula(self, engine):
+        assert engine.shift_formula('=A1', 0, 0) == '=A1'
+        assert engine.shift_formula('text', 1, 1) == 'text'
+
+
 # ---------- 排序行号重映射 ----------
 
 class TestRemapFormulaRows:

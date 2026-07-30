@@ -32,7 +32,9 @@ class FormulaEngine:
     _STRING_PLACEHOLDER_PATTERN = re.compile('\x00(\\d+)\x00')
 
     # 所有可能的错误返回值（对齐 Excel 错误码；#ERROR 为未分类兜底）
-    ERROR_VALUES = frozenset({"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!"})
+    ERROR_VALUES = frozenset(
+        {"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!", "#REF!"}
+    )
 
     @classmethod
     def is_error(cls, value: Any) -> bool:
@@ -190,6 +192,10 @@ class FormulaEngine:
 
             expr = self.STRING_PATTERN.sub(lambda m: stash(m.group()), expr)
 
+            # 引用越界（如复制平移出表格）直接报 #REF!
+            if '#REF!' in expr:
+                return "#REF!"
+
             # Excel 风格比较符转 Python 风格：= -> ==, <> -> !=
             expr = self._normalize_operators(expr)
 
@@ -306,6 +312,45 @@ class FormulaEngine:
             return f'{col_part}{new_row + 1}'
 
         expr = self._REMAP_CELL_PATTERN.sub(remap, expr)
+        return self._STRING_PLACEHOLDER_PATTERN.sub(
+            lambda m: strings[int(m.group(1))], expr
+        )
+
+    # 平移用：分别捕获列前 $、列字母、行前 $、行号
+    _SHIFT_CELL_PATTERN = re.compile(r'(\$?)([A-Z]+)(\$?)(\d+)', re.IGNORECASE)
+
+    def shift_formula(self, formula: str, row_delta: int, col_delta: int) -> str:
+        """按偏移量平移公式中的相对引用（复制/填充公式时用）。
+
+        与 Excel 一致：$A$1 全固定、$A1 固定列、A$1 固定行，其余随
+        偏移平移；区域引用的两个端点各自平移。平移越界的引用替换为
+        #REF!，求值时整条公式报 #REF!。字符串字面量跳过。
+        """
+        if not formula.startswith('=') or (row_delta == 0 and col_delta == 0):
+            return formula
+
+        strings: List[str] = []
+
+        def stash(m):
+            strings.append(m.group())
+            return self._STRING_PLACEHOLDER.format(len(strings) - 1)
+
+        expr = self.STRING_PATTERN.sub(stash, formula)
+
+        def shift(m):
+            col_abs, col_letter, row_abs, row_num = m.groups()
+            col_idx = self.col_letter_to_index(col_letter.upper())
+            row_idx = int(row_num) - 1
+            if not col_abs:
+                col_idx += col_delta
+            if not row_abs:
+                row_idx += row_delta
+            if col_idx < 0 or row_idx < 0:
+                return '#REF!'
+            return (f'{col_abs}{self.col_index_to_letter(col_idx)}'
+                    f'{row_abs}{row_idx + 1}')
+
+        expr = self._SHIFT_CELL_PATTERN.sub(shift, expr)
         return self._STRING_PLACEHOLDER_PATTERN.sub(
             lambda m: strings[int(m.group(1))], expr
         )

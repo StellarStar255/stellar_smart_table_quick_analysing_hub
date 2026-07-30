@@ -178,6 +178,10 @@ class PandasTableModel(QAbstractTableModel):
         self._engine.set_dataframe(self._df)
         return self._engine.evaluate(formula)
 
+    def shift_formula(self, formula, row_delta, col_delta):
+        """复制/填充公式时按偏移平移相对引用（委托给引擎）。"""
+        return self._engine.shift_formula(formula, row_delta, col_delta)
+
     def _register_deps(self, formula_cell):
         """登记公式对其他单元格的依赖（引擎返回列名，转为列位置）。"""
         self._unregister_deps(formula_cell)

@@ -1389,7 +1389,21 @@ class MainWindow(QMainWindow):
         writer = csv.writer(buf, delimiter="\t", quotechar='"',
                             quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
         writer.writerows(matrix)
-        QApplication.clipboard().setText(buf.getvalue().rstrip("\n"))
+        clip_text = buf.getvalue().rstrip("\n")
+        QApplication.clipboard().setText(clip_text)
+        # 记录选区内的公式及来源位置：同应用内粘贴时（剪贴板未被改写）
+        # 公式按相对引用平移后粘贴，外部应用粘到的仍是计算结果文本
+        header_rows = 1 if with_headers else 0
+        formula_cells = {}
+        for r, c in selected:
+            f = self.model.formulas.get((r, c))
+            if f:
+                formula_cells[(r - rows[0] + header_rows, c - cols[0])] = f
+        self._formula_clipboard = {
+            "text": clip_text,
+            "origin": (rows[0] - header_rows, cols[0]),
+            "cells": formula_cells,
+        } if formula_cells else None
         self.update_statusbar(tr("已复制 {} 行 × {} 列").format(len(rows), len(cols)))
 
     def paste_selection(self):
@@ -1438,9 +1452,17 @@ class MainWindow(QMainWindow):
                                  columns=self.model.df.columns)
             self.model.set_dataframe(
                 pd.concat([self.model.df, empty]).reset_index(drop=True), mark_modified=True)
+        clip = getattr(self, "_formula_clipboard", None)
+        use_formulas = clip is not None and clip["text"] == text
         for r_off, row_vals in enumerate(rows):
             for c_off, val in enumerate(row_vals):
                 index = self.model.index(start_row + r_off, start_col + c_off)
+                formula = clip["cells"].get((r_off, c_off)) if use_formulas else None
+                if formula:
+                    val = self.model.shift_formula(
+                        formula,
+                        start_row - clip["origin"][0],
+                        start_col - clip["origin"][1])
                 self.model.setData(index, val)
         self._mark_modified()
         self.update_statusbar(tr("已粘贴 {} 行").format(len(rows)))
@@ -1778,6 +1800,8 @@ class MainWindow(QMainWindow):
                             quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
         writer.writerows(transposed)
         QApplication.clipboard().setText(buf.getvalue().rstrip("\n"))
+        # 转置后行列互换，公式偏移模型不适用，粘贴按值处理
+        self._formula_clipboard = None
         self.update_statusbar(tr("已转置复制 {} 行 × {} 列").format(len(rows), len(cols)))
 
     def _insert_col_at(self, pos):
