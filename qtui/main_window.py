@@ -214,6 +214,7 @@ class MainWindow(QMainWindow):
         self._sheet_formulas = {}        # sheet名 -> {(row, col): "=..."}
         self.original_df = None          # 筛选前的完整数据
         self._filtered_idx_map = None    # 筛选行 -> original_df 索引标签
+        self._suspended_formulas = None  # 筛选期间挂起的公式（original_df 坐标）
         self._sort_orders = {}           # 列名 -> 上次是否升序
         self.image_columns = set()       # 标记为图片列的列名
         self._image_queue_win = None
@@ -785,10 +786,13 @@ class MainWindow(QMainWindow):
             sheets, order, missing = self._collect_all_sheets()
             excel_file = self._excel_file
             formulas_map = dict(self._sheet_formulas)
-            if self.current_sheet and not self.active_filters:
-                formulas_map[self.current_sheet] = dict(self.model.formulas)
-            elif not self.sheet_names and self.model.formulas:
-                formulas_map["Sheet1"] = dict(self.model.formulas)
+            # 当前 sheet 用权威公式表：筛选中为挂起的 original_df 坐标公式，
+            # 与保存的 original_df 数据一致
+            current_formulas = self._live_formulas()
+            if self.current_sheet:
+                formulas_map[self.current_sheet] = dict(current_formulas)
+            elif not self.sheet_names and current_formulas:
+                formulas_map["Sheet1"] = dict(current_formulas)
 
             def work():
                 # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
@@ -929,7 +933,7 @@ class MainWindow(QMainWindow):
         if self.current_sheet:
             full = self.original_df if self.original_df is not None else self.model.df
             self._cache_sheet(self.current_sheet, full)
-            self._sheet_formulas[self.current_sheet] = dict(self.model.formulas)
+            self._sheet_formulas[self.current_sheet] = dict(self._live_formulas())
             if self.active_filters:
                 self.sheet_filters[self.current_sheet] = {
                     "filters": list(self.active_filters),
@@ -962,6 +966,8 @@ class MainWindow(QMainWindow):
         if saved and saved["filters"]:
             self.original_df = df
             self.active_filters = list(saved["filters"])
+            # 公式保持挂起（original_df 坐标），清除筛选时恢复
+            self._suspended_formulas = dict(formulas) if formulas else None
             filtered, idx_map = filter_engine.apply_filters(df, self.active_filters)
             self._filtered_idx_map = idx_map
             self.model.set_dataframe(filtered)
@@ -1102,6 +1108,9 @@ class MainWindow(QMainWindow):
                     except (ValueError, TypeError):
                         self.original_df[colname] = self.original_df[colname].astype(object)
                         self.original_df.loc[orig_label, colname] = self.model.df.iat[row, col]
+                    # 编辑覆盖了挂起的公式单元格 -> 该公式作废，保留新值
+                    if self._suspended_formulas:
+                        self._suspended_formulas.pop((orig_label, col), None)
         self._mark_modified()
 
     def select_all(self):
@@ -1260,7 +1269,18 @@ class MainWindow(QMainWindow):
         self.original_df = None
         self._filtered_idx_map = None
         self._orig_cell_colors = None   # 筛选期间颜色的原始行坐标底账
+        self._suspended_formulas = None
         self._rebuild_filter_bar()
+
+    def _live_formulas(self):
+        """当前 sheet 的权威公式表（original_df 坐标）。
+
+        筛选中返回挂起的公式；筛选中新输入的公式是视图坐标、语义
+        不明确，不计入。
+        """
+        if self.active_filters:
+            return self._suspended_formulas or {}
+        return self.model.formulas
 
     def open_filter_dialog(self, preset_col=None, edit_index=None):
         base_df = self.original_df if self.original_df is not None else self.model.df
@@ -1284,10 +1304,17 @@ class MainWindow(QMainWindow):
             self.update_statusbar(tr("{}后 {} 个公式已转为静态值").format(reason, n))
 
     def _reapply_filters(self):
-        self._freeze_formulas(tr("筛选"))
         if self.original_df is None:
+            # 首次进入筛选：挂起公式（original_df 坐标），清除筛选后恢复。
+            # 单元格保留公式的计算结果静态显示。
+            if self.model.formulas:
+                self._suspended_formulas = dict(self.model.formulas)
             self.original_df = self.model.df
             self._orig_cell_colors = dict(self.model.cell_colors)
+        # 无论首次还是调整筛选条件，模型里都不保留活动公式
+        # （筛选中新输入的公式是视图坐标，调整筛选后语义失效，转为静态值）
+        self.model.formulas.clear()
+        self.model._dependents.clear()
         if not self.active_filters:
             self.clear_all_filters()
             return
@@ -1307,9 +1334,12 @@ class MainWindow(QMainWindow):
         self.model.set_dataframe(filtered)
         self._rebuild_filter_bar()
         self._update_image_context()
-        self.update_statusbar(
-            tr("筛选结果: {} 行（共 {} 个筛选条件）").format(
-                len(filtered), len(self.active_filters)))
+        message = tr("筛选结果: {} 行（共 {} 个筛选条件）").format(
+            len(filtered), len(self.active_filters))
+        if self._suspended_formulas:
+            message += tr("；{} 个公式已挂起，清除筛选后恢复").format(
+                len(self._suspended_formulas))
+        self.update_statusbar(message)
 
     def remove_filter(self, index):
         if 0 <= index < len(self.active_filters):
@@ -1323,10 +1353,16 @@ class MainWindow(QMainWindow):
         if self.original_df is not None:
             if self._orig_cell_colors is not None:
                 self.model.cell_colors = self._orig_cell_colors
-            self.model.set_dataframe(self.original_df)
+            # 恢复挂起的公式并重算（筛选期间的编辑会反映到公式结果里）
+            self.model.set_dataframe(self.original_df,
+                                     formulas=self._suspended_formulas)
+        restored = len(self._suspended_formulas) if self._suspended_formulas else 0
         self._reset_filter_state()
         self._update_image_context()
-        self.update_statusbar()
+        if restored:
+            self.update_statusbar(tr("已恢复 {} 个公式").format(restored))
+        else:
+            self.update_statusbar()
 
     def _rebuild_filter_bar(self):
         while self.filter_bar_layout.count():

@@ -60,7 +60,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **25+ functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
 - **Auto recalculation**: Dependent formulas update when referenced cells change
-- **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill
+- **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill; filtering suspends formulas and restores them when filters are cleared
 - **Error codes**: `#DIV/0!`, `#NAME?`, `#NUM!`, `#VALUE!`, `#REF!`
 - **Round-trip with Excel**: Formulas are read from and written back to .xlsx as real formulas
 
@@ -217,7 +217,7 @@ Alternatively, click a column header for quick sorting.
 ## Roadmap
 
 - [x] Excel formula evaluation (25+ functions, nesting, auto-recalc, `#REF!` tracking)
-- [ ] Keep formulas while filtering (currently formulas are frozen to static values when a filter is applied)
+- [x] Keep formulas while filtering (suspended as static values during filtering, restored and recalculated when filters are cleared)
 - [ ] Data visualization (charts)
 - [ ] Conditional formatting
 - [ ] Pivot tables
@@ -327,7 +327,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **25+ 函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
-- **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）
+- **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）；筛选期间公式挂起，清除筛选后恢复重算
 - **错误码**: `#DIV/0!`、`#NAME?`、`#NUM!`、`#VALUE!`、`#REF!`
 - **与 Excel 互通**: 公式从 .xlsx 读入，保存时也以真公式写回
 
@@ -484,7 +484,7 @@ python smart_table_quick_analysing_hub_qt.py
 ## 未来规划
 
 - [x] 支持Excel公式计算（25+ 常用函数、嵌套、自动重算、`#REF!` 追踪）
-- [ ] 筛选时保留公式（目前应用筛选会把公式冻结为静态值）
+- [x] 筛选时保留公式（筛选期间挂起为静态值，清除筛选后恢复并重算）
 - [ ] 数据可视化（图表）
 - [ ] 条件格式化
 - [ ] 数据透视表
