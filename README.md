@@ -217,6 +217,7 @@ Alternatively, click a column header for quick sorting.
 ## Roadmap
 
 - [x] Excel formula evaluation (25+ functions, nesting, auto-recalc, `#REF!` tracking)
+- [ ] Keep formulas while filtering (currently formulas are frozen to static values when a filter is applied)
 - [ ] Data visualization (charts)
 - [ ] Conditional formatting
 - [ ] Pivot tables
@@ -483,6 +484,7 @@ python smart_table_quick_analysing_hub_qt.py
 ## 未来规划
 
 - [x] 支持Excel公式计算（25+ 常用函数、嵌套、自动重算、`#REF!` 追踪）
+- [ ] 筛选时保留公式（目前应用筛选会把公式冻结为静态值）
 - [ ] 数据可视化（图表）
 - [ ] 条件格式化
 - [ ] 数据透视表
