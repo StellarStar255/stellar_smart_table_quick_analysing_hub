@@ -40,6 +40,9 @@ class PandasTableModel(QAbstractTableModel):
         self.formulas = {}
         self._dependents = {}   # (row, col) -> 依赖它的公式单元格集合
         self._engine = FormulaEngine()
+        # 行列结构版本号：任何插入/删除/重排/整表替换都会递增，
+        # 供公式剪贴板等按位置缓存的状态判断是否已失效
+        self.structure_version = 0
         # 当前行整行高亮（选中单元格所在行）
         self.highlight_row = -1
         # 列级 numpy 数组缓存：data() 每帧调用数千次，df.iat 每次都要
@@ -223,13 +226,14 @@ class PandasTableModel(QAbstractTableModel):
     def evaluate_all_formulas(self):
         """重算全部公式并写入 df（载入公式后调用）。
 
-        引擎不支持的公式（如 SUMPRODUCT）返回错误值（#NAME? 等），
-        此时保留 df 中来自 Excel 的缓存计算值，不覆盖。
-        例外：#REF! 表示引用的行/列已被删除，必须写入以显示错误。
+        #NAME?/#ERROR 表示引擎无法求值（不支持的函数/语法），保留 df 中
+        来自 Excel 的缓存计算值不覆盖；其余错误（#DIV/0!、#N/A、#REF! 等）
+        是真实的计算结果，必须写入——否则结构变更后单元格会显示并保存
+        过期的旧值。
         """
         for key, formula in self.formulas.items():
             result = self._evaluate(formula)
-            if not FormulaEngine.is_error(result) or result == "#REF!":
+            if result not in ("#NAME?", "#ERROR"):
                 self._set_cell(key[0], key[1], result)
         self._rebuild_all_deps()
 
@@ -320,6 +324,7 @@ class PandasTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._invalidate_values()
         self._df = df
+        self.structure_version += 1
         self.highlight_row = -1
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -378,6 +383,7 @@ class PandasTableModel(QAbstractTableModel):
         self._shift_keys(row_start=position, row_delta=1)
         self.endInsertRows()
         self.modified = True
+        self.structure_version += 1
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -391,6 +397,7 @@ class PandasTableModel(QAbstractTableModel):
         self._remove_keys(rows=set(positions))
         self.endResetModel()
         self.modified = True
+        self.structure_version += 1
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -403,6 +410,10 @@ class PandasTableModel(QAbstractTableModel):
         self._shift_keys(col_start=position, col_delta=1)
         self.endInsertColumns()
         self.modified = True
+        self.structure_version += 1
+        # 列位置整体平移，旧撤销记录会写错列（行操作同理已清）
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
     def remove_columns(self, positions):
         if not positions:
@@ -414,6 +425,9 @@ class PandasTableModel(QAbstractTableModel):
         self._remove_keys(cols=set(positions))
         self.endResetModel()
         self.modified = True
+        self.structure_version += 1
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
     def _shift_keys(self, row_start=None, row_delta=0, col_start=None, col_delta=0):
         """插入行/列后平移公式/背景色的键，并同步平移公式内的引用。"""
@@ -506,17 +520,29 @@ class PandasTableModel(QAbstractTableModel):
             kind="mergesort",
             na_position="last",
         ).index
-        self.reorder_rows(positions)
+        return self.reorder_rows(positions)
 
     def reorder_rows(self, positions):
         """按新行序重排（positions[i] = 新第 i 行对应的旧行号）。
 
-        公式单元格、公式内的行引用、背景色都跟随数据移动；区域引用
-        不重写（整列聚合成员不变），重排后全量重算。结构变化，撤销栈清空。
+        公式单元格、公式内的行引用、背景色都跟随数据移动。区域引用
+        不重写：覆盖全部行的区域（整列聚合）成员不变、安全保留并重算；
+        含部分区域的公式在重排后成员会变成无关行，冻结为静态值
+        （返回冻结数量，供调用方提示）。结构变化，撤销栈清空。
         """
         positions = list(positions)
         self._invalidate_values()
         self.beginResetModel()
+        frozen = 0
+        if self.formulas:
+            nrows = len(self._df)
+            kept = {}
+            for key, f in self.formulas.items():
+                if self._engine.formula_has_partial_ranges(f, nrows):
+                    frozen += 1  # 静态值留在 df 中随行移动
+                else:
+                    kept[key] = f
+            self.formulas = kept
         # 旧行位置 -> 新行位置
         row_map = {old: new for new, old in enumerate(positions)}
         self._df = self._df.iloc[positions].reset_index(drop=True)
@@ -535,5 +561,7 @@ class PandasTableModel(QAbstractTableModel):
         self.evaluate_all_formulas()
         self.endResetModel()
         self.modified = True
+        self.structure_version += 1
         self._undo_stack.clear()
         self._redo_stack.clear()
+        return frozen

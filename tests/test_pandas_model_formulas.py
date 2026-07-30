@@ -68,13 +68,22 @@ class TestSortFollowsFormulas:
         m.setData(m.index(2, 0), '50')  # 原 X=30 行现在在第 3 行
         assert m._df.iat[2, 1] == 100
 
-    def test_range_formula_recalculated_after_sort(self):
+    def test_partial_range_formula_frozen_on_sort(self):
+        # 部分区域排序后成员会变成无关行，冻结为静态值（审查 finding 4）
         m = make_model()
         m.setData(m.index(0, 1), '=SUM(A1:A2)')  # 30+10 = 40
-        m.sort(0, Qt.SortOrder.AscendingOrder)  # X: 10, 20, 30
-        # 区域引用不重写，按新行序重算：10+20 = 30
-        assert m.formulas == {(2, 1): '=SUM(A1:A2)'}
-        assert m._df.iat[2, 1] == 30
+        frozen = m.reorder_rows([1, 2, 0])  # 相当于升序排序
+        assert frozen == 1
+        assert m.formulas == {}
+        assert m._df.iat[2, 1] == 40  # 排序前的正确值随行移动
+
+    def test_full_range_formula_survives_sort(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=SUM(A1:A3)')  # 60
+        frozen = m.sort(0, Qt.SortOrder.AscendingOrder)
+        assert frozen == 0
+        assert m.formulas == {(2, 1): '=SUM(A1:A3)'}
+        assert m._df.iat[2, 1] == 60
 
     def test_sort_without_formulas(self):
         m = make_model()
@@ -157,3 +166,53 @@ class TestInsertDeleteFollowsFormulas:
         m.setData(m.index(1, 1), '=A1')
         m.remove_rows([1])
         assert m.formulas == {}
+
+
+class TestReviewFindings:
+    """代码审查确认问题的回归测试（finding 1/6/7）"""
+
+    def test_new_error_after_delete_is_written(self):
+        # finding 1: 结构变更后新产生的 #DIV/0! 必须写入，不能保留旧值
+        m = make_model()
+        m.setData(m.index(2, 1), '=AVERAGEIF(A1:A3, ">25")')  # 只有 X=30 匹配
+        assert m._df.iat[2, 1] == 30
+        m.remove_rows([0])  # 删掉唯一匹配行；公式收缩为 A1:A2 且无匹配
+        assert m.formulas == {(1, 1): '=AVERAGEIF(A1:A2, ">25")'}
+        assert m._df.iat[1, 1] == '#DIV/0!'
+
+    def test_name_error_keeps_cached_value_on_load(self):
+        # finding 1 的反面：不支持的函数（#NAME?）仍保留 Excel 缓存值
+        m = make_model()
+        df = m._df.copy()
+        df.iat[0, 1] = 42.0  # Excel 里的缓存计算值
+        m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A1:A3, B1:B3)'})
+        assert m._df.iat[0, 1] == 42.0
+
+    def test_insert_column_clears_undo(self):
+        # finding 6: 列插入后旧撤销记录会写错列
+        m = make_model()
+        m.setData(m.index(0, 1), '99')
+        assert m._undo_stack
+        m.insert_column(0)
+        assert not m._undo_stack and not m._redo_stack
+
+    def test_remove_columns_clears_undo(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '99')
+        m.remove_columns([0])
+        assert not m._undo_stack
+
+    def test_structure_version_bumps_on_structural_ops(self):
+        # finding 7: 结构版本号供公式剪贴板判断失效
+        m = make_model()
+        v = m.structure_version
+        m.insert_row(0); assert m.structure_version > v; v = m.structure_version
+        m.remove_rows([0]); assert m.structure_version > v; v = m.structure_version
+        m.insert_column(0); assert m.structure_version > v; v = m.structure_version
+        m.remove_columns([0]); assert m.structure_version > v; v = m.structure_version
+        m.reorder_rows([1, 2, 0]); assert m.structure_version > v; v = m.structure_version
+        m.set_dataframe(m._df.copy()); assert m.structure_version > v
+        # 普通编辑不 bump
+        v = m.structure_version
+        m.setData(m.index(0, 0), '7')
+        assert m.structure_version == v

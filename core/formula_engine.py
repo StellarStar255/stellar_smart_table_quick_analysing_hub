@@ -2,6 +2,7 @@
 公式引擎模块 - Excel 公式解析和计算
 解耦版本：通过参数传入DataFrame而不是依赖GUI对象
 """
+import ast
 import datetime
 import fnmatch
 import re
@@ -9,6 +10,31 @@ from typing import Any, Tuple, List, Set, Optional
 import pandas as pd
 
 from qtui.i18n import tr
+
+
+def _excel_wildcard_match(text: str, pattern: str) -> bool:
+    """Excel 通配符匹配：仅 * 和 ? 有特殊含义，[ 按字面处理。
+
+    fnmatch 会把 [seq] 当字符类，Excel 不会——把 [ 转义成 [[] 消除差异。
+    """
+    return fnmatch.fnmatchcase(text, pattern.replace('[', '[[]'))
+
+
+class _IfCallLowering(ast.NodeTransformer):
+    """把 _if(...) 调用降为 Python 条件表达式，恢复分支惰性求值。
+
+    IF 若作为普通函数调用，两个分支都会先被求值，
+    =IF(B1=0, 0, A1/B1) 这类防错写法会先触发 #DIV/0!。
+    """
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if (isinstance(node.func, ast.Name) and node.func.id == '_if'
+                and not node.keywords and len(node.args) in (2, 3)):
+            orelse = (node.args[2] if len(node.args) == 3
+                      else ast.Constant(value=False))
+            return ast.IfExp(test=node.args[0], body=node.args[1], orelse=orelse)
+        return node
 
 
 class FormulaNameError(ValueError):
@@ -30,12 +56,24 @@ class FormulaRefError(ValueError):
 class FormulaEngine:
     """Excel 公式解析和计算引擎（解耦版本）"""
 
-    # 单元格引用正则：匹配 A1, B2, $A$1 等
-    CELL_REF_PATTERN = re.compile(r'\$?([A-Z]+)\$?(\d+)', re.IGNORECASE)
+    # 单元格引用正则：匹配 A1, B2, $A$1 等。
+    # 前后守卫排除科学计数法（1E5 的 E5）等字面量片段被误认为引用
+    CELL_REF_PATTERN = re.compile(
+        r'(?<![\w.])\$?([A-Z]+)\$?(\d+)(?!\w)', re.IGNORECASE)
     # 区域引用正则：匹配 A1:B10
-    RANGE_REF_PATTERN = re.compile(r'\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)', re.IGNORECASE)
-    # 字符串字面量正则：双引号或单引号包裹
-    STRING_PATTERN = re.compile(r'"[^"]*"|\'[^\']*\'')
+    RANGE_REF_PATTERN = re.compile(
+        r'(?<![\w.])\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)(?!\w)',
+        re.IGNORECASE)
+    # 字符串字面量正则：双引号（支持 Excel 的 "" 转义）或单引号包裹
+    STRING_PATTERN = re.compile(r'"(?:""|[^"])*"|\'[^\']*\'')
+
+    @staticmethod
+    def _decode_string_literal(literal: str) -> str:
+        """去掉引号并处理 Excel 的双引号转义（"" -> "）。"""
+        body = literal[1:-1]
+        if literal[0] == '"':
+            body = body.replace('""', '"')
+        return body
     # 字符串占位符：\x00 不会出现在用户输入中，也不会被引用/函数正则误匹配
     _STRING_PLACEHOLDER = '\x00{}\x00'
     _STRING_PLACEHOLDER_PATTERN = re.compile('\x00(\\d+)\x00')
@@ -200,14 +238,18 @@ class FormulaEngine:
 
         try:
             # 把字符串字面量抽成占位符，避免其中的 "A1"、"SUM(" 等
-            # 被当作单元格引用或函数名误替换；求值前再还原
+            # 被当作单元格引用或函数名误替换；求值前再还原。
+            # 存入的是 repr 形式：反斜杠不会被当 Python 转义解释，
+            # Excel 的 "" 转义也在此处解码
             strings: List[str] = []
 
             def stash(literal: str) -> str:
                 strings.append(literal)
                 return self._STRING_PLACEHOLDER.format(len(strings) - 1)
 
-            expr = self.STRING_PATTERN.sub(lambda m: stash(m.group()), expr)
+            expr = self.STRING_PATTERN.sub(
+                lambda m: stash(repr(self._decode_string_literal(m.group()))),
+                expr)
 
             # 引用越界（如复制平移出表格）直接报 #REF!
             if '#REF!' in expr:
@@ -316,7 +358,25 @@ class FormulaEngine:
     _BOOL_LITERAL_PATTERN = re.compile(r'\b(TRUE|FALSE)\b', re.IGNORECASE)
 
     # 重映射用：单独捕获行号前的 $（绝对行引用不随排序移动）
-    _REMAP_CELL_PATTERN = re.compile(r'(\$?[A-Z]+)(\$?)(\d+)', re.IGNORECASE)
+    _REMAP_CELL_PATTERN = re.compile(
+        r'(?<![\w.])(\$?[A-Z]+)(\$?)(\d+)(?!\w)', re.IGNORECASE)
+
+    def formula_has_partial_ranges(self, formula: str, nrows: int) -> bool:
+        """公式是否含未覆盖全部数据行的区域引用。
+
+        整表重排（排序）后这类区域的成员会变成落在原位置的无关行，
+        无法用重写引用表达，调用方应将其冻结为静态值。
+        覆盖全部行的区域（如整列聚合）成员不变，可以安全保留。
+        """
+        if not formula.startswith('='):
+            return False
+        expr = self.STRING_PATTERN.sub('', formula)
+        for m in self.RANGE_REF_PATTERN.finditer(expr):
+            r1 = int(m.group(2)) - 1
+            r2 = int(m.group(4)) - 1
+            if min(r1, r2) > 0 or max(r1, r2) < nrows - 1:
+                return True
+        return False
 
     def remap_formula_rows(self, formula: str, row_map: dict) -> str:
         """按 row_map（旧 0 基行号 -> 新 0 基行号）重写公式中的行引用。
@@ -355,10 +415,12 @@ class FormulaEngine:
         )
 
     # 平移用：分别捕获列前 $、列字母、行前 $、行号
-    _SHIFT_CELL_PATTERN = re.compile(r'(\$?)([A-Z]+)(\$?)(\d+)', re.IGNORECASE)
+    _SHIFT_CELL_PATTERN = re.compile(
+        r'(?<![\w.])(\$?)([A-Z]+)(\$?)(\d+)(?!\w)', re.IGNORECASE)
     # 区域引用（带 $ 捕获）
     _RANGE_PARTS_PATTERN = re.compile(
-        r'(\$?)([A-Z]+)(\$?)(\d+)\s*:\s*(\$?)([A-Z]+)(\$?)(\d+)', re.IGNORECASE
+        r'(?<![\w.])(\$?)([A-Z]+)(\$?)(\d+)\s*:\s*(\$?)([A-Z]+)(\$?)(\d+)(?!\w)',
+        re.IGNORECASE
     )
 
     def adjust_formula_refs(self, formula: str, row_map=None, col_map=None) -> str:
@@ -567,7 +629,7 @@ class FormulaEngine:
 
         if '*' in criteria or '?' in criteria:
             pattern = criteria.lower()
-            return lambda v: fnmatch.fnmatchcase(str(v).lower(), pattern)
+            return lambda v: _excel_wildcard_match(str(v).lower(), pattern)
 
         try:
             num_target = float(criteria)
@@ -681,7 +743,7 @@ class FormulaEngine:
             """精确匹配谓词；文本目标含 * ? 时按通配符匹配（同 Excel）。"""
             if isinstance(target, str) and ('*' in target or '?' in target):
                 pattern = target.lower()
-                return lambda v: fnmatch.fnmatchcase(str(v).lower(), pattern)
+                return lambda v: _excel_wildcard_match(str(v).lower(), pattern)
             t = _norm(target)
             return lambda v: _norm(v) == t
 
@@ -913,7 +975,10 @@ class FormulaEngine:
             '_mod': lambda num, divisor: num % divisor,
         }
 
-        code = compile(expr, '<formula>', 'eval')
+        # 经 AST 把 _if 调用降为条件表达式，保证分支惰性求值
+        tree = _IfCallLowering().visit(ast.parse(expr, mode='eval'))
+        ast.fix_missing_locations(tree)
+        code = compile(tree, '<formula>', 'eval')
 
         for name in code.co_names:
             if name not in allowed_names:

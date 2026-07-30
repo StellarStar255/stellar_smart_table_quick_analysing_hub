@@ -930,10 +930,14 @@ class MainWindow(QMainWindow):
 
     def switch_sheet(self, name):
         # 保存当前 sheet 状态（含筛选和公式）
+        dropped_view_formulas = 0
         if self.current_sheet:
             full = self.original_df if self.original_df is not None else self.model.df
             self._cache_sheet(self.current_sheet, full)
             self._sheet_formulas[self.current_sheet] = dict(self._live_formulas())
+            if self.active_filters:
+                # 筛选中输入的公式（视图坐标）无法随 sheet 保存，转为静态值
+                dropped_view_formulas = len(self.model.formulas)
             if self.active_filters:
                 self.sheet_filters[self.current_sheet] = {
                     "filters": list(self.active_filters),
@@ -978,7 +982,12 @@ class MainWindow(QMainWindow):
         self._rebuild_filter_bar()
         self._update_image_context()
         self._save_file_config()   # 记住最后停留的 sheet
-        self.update_statusbar()
+        if dropped_view_formulas:
+            self.update_statusbar(
+                tr("上一 sheet 筛选中输入的 {} 个公式已转为静态值").format(
+                    dropped_view_formulas))
+        else:
+            self.update_statusbar()
 
     def create_new_sheet(self):
         name, ok = QInputDialog.getText(self, tr("新建Sheet"), tr("Sheet 名称:"))
@@ -1256,11 +1265,15 @@ class MainWindow(QMainWindow):
             ascending=ascending, kind="mergesort", na_position="last").index
         if self._filtered_idx_map:
             self._filtered_idx_map = [self._filtered_idx_map[i] for i in positions]
-        # 公式单元格/引用与背景色在模型内跟随行序移动
-        self.model.reorder_rows(positions)
+        # 公式单元格/引用与背景色在模型内跟随行序移动；
+        # 含部分区域的公式无法安全重排，被冻结为静态值
+        frozen = self.model.reorder_rows(positions)
         self._mark_modified()
-        self.update_statusbar(tr("已按 {} {}排序").format(
-            colname, tr("升序") if ascending else tr("降序")))
+        message = tr("已按 {} {}排序").format(
+            colname, tr("升序") if ascending else tr("降序"))
+        if frozen:
+            message += tr("；{} 个含部分区域引用的公式已转为静态值").format(frozen)
+        self.update_statusbar(message)
 
     # ================= 筛选 =================
 
@@ -1304,15 +1317,19 @@ class MainWindow(QMainWindow):
             self.update_statusbar(tr("{}后 {} 个公式已转为静态值").format(reason, n))
 
     def _reapply_filters(self):
+        frozen_view = 0
         if self.original_df is None:
             # 首次进入筛选：挂起公式（original_df 坐标），清除筛选后恢复。
             # 单元格保留公式的计算结果静态显示。
             if self.model.formulas:
                 self._suspended_formulas = dict(self.model.formulas)
+        else:
+            # 调整筛选条件：筛选中新输入的公式是视图坐标，语义失效，
+            # 转为静态值（计数用于提示，不能无声丢弃）
+            frozen_view = len(self.model.formulas)
+        if self.original_df is None:
             self.original_df = self.model.df
             self._orig_cell_colors = dict(self.model.cell_colors)
-        # 无论首次还是调整筛选条件，模型里都不保留活动公式
-        # （筛选中新输入的公式是视图坐标，调整筛选后语义失效，转为静态值）
         self.model.formulas.clear()
         self.model._dependents.clear()
         if not self.active_filters:
@@ -1339,6 +1356,8 @@ class MainWindow(QMainWindow):
         if self._suspended_formulas:
             message += tr("；{} 个公式已挂起，清除筛选后恢复").format(
                 len(self._suspended_formulas))
+        if frozen_view:
+            message += tr("；筛选中输入的 {} 个公式已转为静态值").format(frozen_view)
         self.update_statusbar(message)
 
     def remove_filter(self, index):
@@ -1350,6 +1369,8 @@ class MainWindow(QMainWindow):
                 self.clear_all_filters()
 
     def clear_all_filters(self):
+        # 筛选中输入的公式是视图坐标，恢复原表时转为静态值（值已同步）
+        frozen_view = len(self.model.formulas) if self.original_df is not None else 0
         if self.original_df is not None:
             if self._orig_cell_colors is not None:
                 self.model.cell_colors = self._orig_cell_colors
@@ -1359,8 +1380,13 @@ class MainWindow(QMainWindow):
         restored = len(self._suspended_formulas) if self._suspended_formulas else 0
         self._reset_filter_state()
         self._update_image_context()
+        parts = []
         if restored:
-            self.update_statusbar(tr("已恢复 {} 个公式").format(restored))
+            parts.append(tr("已恢复 {} 个公式").format(restored))
+        if frozen_view:
+            parts.append(tr("筛选中输入的 {} 个公式已转为静态值").format(frozen_view))
+        if parts:
+            self.update_statusbar(tr("；").join(parts))
         else:
             self.update_statusbar()
 
@@ -1434,6 +1460,9 @@ class MainWindow(QMainWindow):
             "text": clip_text,
             "origin": (rows[0] - header_rows, cols[0]),
             "cells": formula_cells,
+            # 复制后行列结构一旦变化（插删/排序/换表），公式引用已被
+            # 重写，剪贴板里的旧公式文本作废，粘贴退回按值处理
+            "version": self.model.structure_version,
         } if formula_cells else None
         self.update_statusbar(tr("已复制 {} 行 × {} 列").format(len(rows), len(cols)))
 
@@ -1456,7 +1485,14 @@ class MainWindow(QMainWindow):
         text = QApplication.clipboard().text()
         if not text:
             return
-        rows = self._parse_clipboard_text(text)
+        # 公式粘贴的判定必须在扩表之前：剪贴板文本未被改写，且复制后
+        # 行列结构没有变化（结构变化会重写公式引用，剪贴板旧文本作废）
+        clip = getattr(self, "_formula_clipboard", None)
+        use_formulas = (clip is not None and clip["text"] == text
+                        and clip.get("version") == self.model.structure_version)
+        # 公式粘贴需与复制矩阵逐行对齐（公式结果可能是空串产生全空行），
+        # 保留空行；按值粘贴维持旧行为（跳过全空行）
+        rows = self._parse_clipboard_text(text, keep_blank=use_formulas)
         if not rows:
             return
 
@@ -1485,8 +1521,6 @@ class MainWindow(QMainWindow):
             self.model.set_dataframe(
                 pd.concat([self.model.df, empty]).reset_index(drop=True),
                 mark_modified=True, formulas=self.model.formulas)
-        clip = getattr(self, "_formula_clipboard", None)
-        use_formulas = clip is not None and clip["text"] == text
         for r_off, row_vals in enumerate(rows):
             for c_off, val in enumerate(row_vals):
                 index = self.model.index(start_row + r_off, start_col + c_off)
@@ -1501,11 +1535,17 @@ class MainWindow(QMainWindow):
         self.update_statusbar(tr("已粘贴 {} 行").format(len(rows)))
 
     @staticmethod
-    def _parse_clipboard_text(text):
-        """自动识别制表符/逗号分隔（与旧版 _parse_tsv_clipboard 一致）。"""
+    def _parse_clipboard_text(text, keep_blank=False):
+        """自动识别制表符/逗号分隔（与旧版 _parse_tsv_clipboard 一致）。
+
+        keep_blank: 保留全空行。公式粘贴按行偏移对齐复制矩阵时必须保留，
+        否则空行（如公式结果为空串）会让后续公式错位。
+        """
         first_line = text.splitlines()[0] if text.splitlines() else ""
         delimiter = "\t" if ("\t" in first_line or "," not in first_line) else ","
         reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        if keep_blank:
+            return list(reader)
         return [row for row in reader if any(cell.strip() for cell in row)]
 
     def _is_empty_default_table(self):

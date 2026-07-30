@@ -455,6 +455,94 @@ class TestCountSemantics:
         assert engine.evaluate('=COUNTA(A1:C1)') == 3
 
 
+# ---------- 代码审查回归（finding 2/3/9/10/4） ----------
+
+class TestIfLazyEvaluation:
+    """finding 2: IF 分支必须惰性求值，防错写法不能先触发错误"""
+
+    def test_guarded_division(self, engine):
+        # A9 越界读为 0，防除零守卫应返回 0 而不是 #DIV/0!
+        assert engine.evaluate('=IF(A9=0, 0, A1/A9)') == 0
+
+    def test_guarded_lookup_untaken_branch(self, engine):
+        assert engine.evaluate(
+            '=IF(FALSE, VLOOKUP("zz", A1:B3, 2, FALSE), "ok")') == 'ok'
+
+    def test_taken_branch_error_still_surfaces(self, engine):
+        assert engine.evaluate('=IF(TRUE, A1/A9, 0)') == '#DIV/0!'
+
+    def test_two_arg_if(self, engine):
+        assert engine.evaluate('=IF(A1>10, "big")') is False
+        assert engine.evaluate('=IF(A1>1, "big")') == 'big'
+
+
+class TestStringEscapes:
+    """finding 3: 反斜杠不是转义符，"" 是 Excel 的引号转义"""
+
+    def test_backslash_not_python_escape(self, engine):
+        assert engine.evaluate(r'=CONCAT("C:\new", "!")') == r'C:\new!'
+
+    def test_invalid_python_escape_ok(self, engine):
+        assert engine.evaluate(r'="C:\Users"') == r'C:\Users'
+
+    def test_doubled_quote_escape(self, engine):
+        assert engine.evaluate('="He said ""hi"""') == 'He said "hi"'
+
+    def test_doubled_quote_in_comparison(self, engine):
+        assert engine.evaluate('=IF("a""b"="a""b", 1, 0)') == 1
+
+
+class TestScientificNotation:
+    """finding 9: 1E5 是数字字面量，不是 E 列引用"""
+
+    def test_evaluate(self, engine):
+        assert engine.evaluate('=1E5') == 100000
+        assert engine.evaluate('=1e5+A1') == 100005
+
+    def test_shift_leaves_literal(self, engine):
+        assert engine.shift_formula('=1E5+A1', 1, 0) == '=1E5+A2'
+
+    def test_adjust_leaves_literal(self, engine):
+        assert engine.adjust_formula_refs(
+            '=1E5+A1', row_map=lambda i: i + 1) == '=1E5+A2'
+
+    def test_remap_leaves_literal(self, engine):
+        assert engine.remap_formula_rows('=1E5+A1', {0: 1}) == '=1E5+A2'
+
+
+class TestWildcardBracketLiteral:
+    """finding 10: Excel 通配符里 [ 是字面字符，不是字符类"""
+
+    def test_countif(self):
+        df = pd.DataFrame({'C': ['item[12]a', 'item1x', 'item2y', 'other']})
+        e = FormulaEngine(df)
+        assert e.evaluate('=COUNTIF(A1:A4, "item[12]*")') == 1
+
+    def test_vlookup(self):
+        df = pd.DataFrame({'C': ['a[1]', 'a1'], 'V': [10, 20]})
+        e = FormulaEngine(df)
+        assert e.evaluate('=VLOOKUP("a[1]*", A1:B2, 2, FALSE)') == 10
+
+
+class TestPartialRangeDetection:
+    """finding 4 的引擎助手"""
+
+    def test_partial(self, engine):
+        assert engine.formula_has_partial_ranges('=SUM(A1:A2)', 3)
+        assert engine.formula_has_partial_ranges('=SUM(A2:A3)', 3)
+
+    def test_full_coverage(self, engine):
+        assert not engine.formula_has_partial_ranges('=SUM(A1:A3)', 3)
+        assert not engine.formula_has_partial_ranges('=SUM(A1:A999)', 3)
+
+    def test_no_range(self, engine):
+        assert not engine.formula_has_partial_ranges('=A1*2', 3)
+        assert not engine.formula_has_partial_ranges('text', 3)
+
+    def test_range_in_string_ignored(self, engine):
+        assert not engine.formula_has_partial_ranges('=CONCAT("A1:A2")', 3)
+
+
 # ---------- 复制/填充引用平移 ----------
 
 class TestShiftFormula:
