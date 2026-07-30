@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """版本信息（发版时只需修改此文件）。"""
 
-__version__ = "1.2.4"
+__version__ = "1.3.0"
 
 APP_NAME = "Smart Table Hub"
 BUNDLE_ID = "com.stellarstar255.smarttablehub"
