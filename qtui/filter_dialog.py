@@ -153,14 +153,17 @@ class FilterDialog(QDialog):
     def _on_ok(self):
         col = self.col_combo.currentText()
         if self.tabs.currentIndex() == 0:
+            # 只统计"当前可见"的勾选项（与 Excel 一致）：搜索框过滤后，
+            # 被隐藏的值不参与筛选——否则默认全选的隐藏值会全部混进来
             checked = [self.value_list.item(i).text()
                        for i in range(self.value_list.count())
-                       if self.value_list.item(i).checkState() == Qt.CheckState.Checked]
+                       if not self.value_list.item(i).isHidden()
+                       and self.value_list.item(i).checkState() == Qt.CheckState.Checked]
             if not checked:
                 QMessageBox.warning(self, tr("筛选"), tr("请至少勾选一个值"))
                 return
             if len(checked) == self.value_list.count():
-                # 全选等于没筛选
+                # 全选（且无搜索过滤）等于没筛选
                 self.reject()
                 return
             self.result = {"col": col, "condition": "值在列表中", "value": checked}
