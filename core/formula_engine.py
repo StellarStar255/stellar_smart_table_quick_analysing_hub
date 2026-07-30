@@ -193,54 +193,57 @@ class FormulaEngine:
         except Exception:
             return "#ERROR"
 
-    def _replace_functions(self, expr: str) -> str:
-        """将 Excel 函数替换为 Python 表达式"""
-        # CONCAT - 字符串连接（支持多参数）
-        expr = re.sub(r'CONCAT\s*\(([^)]+)\)', r'_concat(\1)', expr, flags=re.IGNORECASE)
-        # CONCATENATE - 同 CONCAT
-        expr = re.sub(r'CONCATENATE\s*\(([^)]+)\)', r'_concat(\1)', expr, flags=re.IGNORECASE)
-        # LEFT(text, num) - 取左边字符
-        expr = re.sub(r'LEFT\s*\(([^,]+),([^)]+)\)', r'str(\1)[:int(\2)]', expr, flags=re.IGNORECASE)
-        # RIGHT(text, num) - 取右边字符
-        expr = re.sub(r'RIGHT\s*\(([^,]+),([^)]+)\)', r'str(\1)[-int(\2):]', expr, flags=re.IGNORECASE)
-        # MID(text, start, num) - 取中间字符
-        expr = re.sub(r'MID\s*\(([^,]+),([^,]+),([^)]+)\)', r'str(\1)[int(\2)-1:int(\2)-1+int(\3)]', expr, flags=re.IGNORECASE)
-        # LEN(text) - 字符串长度
-        expr = re.sub(r'LEN\s*\(([^)]+)\)', r'len(str(\1))', expr, flags=re.IGNORECASE)
-        # UPPER(text) - 转大写
-        expr = re.sub(r'UPPER\s*\(([^)]+)\)', r'str(\1).upper()', expr, flags=re.IGNORECASE)
-        # LOWER(text) - 转小写
-        expr = re.sub(r'LOWER\s*\(([^)]+)\)', r'str(\1).lower()', expr, flags=re.IGNORECASE)
-        # TRIM(text) - 去除空格
-        expr = re.sub(r'TRIM\s*\(([^)]+)\)', r'str(\1).strip()', expr, flags=re.IGNORECASE)
-        # SUM
-        expr = re.sub(r'SUM\s*\(([^)]+)\)', r'sum(\1)', expr, flags=re.IGNORECASE)
-        # AVERAGE
-        expr = re.sub(r'AVERAGE\s*\(([^)]+)\)', r'(_avg(\1))', expr, flags=re.IGNORECASE)
-        # MAX
-        expr = re.sub(r'MAX\s*\(([^)]+)\)', r'max(\1)', expr, flags=re.IGNORECASE)
-        # MIN
-        expr = re.sub(r'MIN\s*\(([^)]+)\)', r'min(\1)', expr, flags=re.IGNORECASE)
-        # COUNT
-        expr = re.sub(r'COUNT\s*\(([^)]+)\)', r'_count(\1)', expr, flags=re.IGNORECASE)
-        # IF(condition, true_val, false_val)
-        expr = re.sub(r'IF\s*\(([^,]+),([^,]+),([^)]+)\)', r'((\2) if (\1) else (\3))', expr, flags=re.IGNORECASE)
-        # ABS
-        expr = re.sub(r'ABS\s*\(([^)]+)\)', r'abs(\1)', expr, flags=re.IGNORECASE)
-        # ROUND
-        expr = re.sub(r'ROUND\s*\(([^,]+),([^)]+)\)', r'round(\1,int(\2))', expr, flags=re.IGNORECASE)
-        # POWER(base, exp)
-        expr = re.sub(r'POWER\s*\(([^,]+),([^)]+)\)', r'pow(\1,\2)', expr, flags=re.IGNORECASE)
-        # SQRT
-        expr = re.sub(r'SQRT\s*\(([^)]+)\)', r'(\1)**0.5', expr, flags=re.IGNORECASE)
-        # MOD(num, divisor)
-        expr = re.sub(r'MOD\s*\(([^,]+),([^)]+)\)', r'((\1)%(\2))', expr, flags=re.IGNORECASE)
+    # Excel 函数名 -> 求值环境中的实现名（长名在前，避免 CONCAT 抢先匹配 CONCATENATE）
+    FUNC_MAP = {
+        'CONCATENATE': '_concat', 'CONCAT': '_concat',
+        'AVERAGE': '_avg', 'COUNT': '_count',
+        'LEFT': '_left', 'RIGHT': '_right', 'MID': '_mid',
+        'LEN': '_len', 'UPPER': '_upper', 'LOWER': '_lower', 'TRIM': '_trim',
+        'SUM': '_sum', 'MAX': '_max', 'MIN': '_min',
+        'IF': '_if', 'ABS': 'abs', 'ROUND': '_round',
+        'POWER': 'pow', 'SQRT': '_sqrt', 'MOD': '_mod',
+    }
 
-        return expr
+    _FUNC_NAME_PATTERN = re.compile(
+        r'\b(' + '|'.join(FUNC_MAP) + r')\s*\(', re.IGNORECASE
+    )
+
+    def _replace_functions(self, expr: str) -> str:
+        """将 Excel 函数名替换为求值环境中的实现名。
+
+        只改写函数名本身、不用正则切分参数，参数结构交给表达式
+        编译器处理，因此嵌套调用（如 IF(SUM(A1:A3)>10, ...)）可以正常工作。
+        """
+        return self._FUNC_NAME_PATTERN.sub(
+            lambda m: self.FUNC_MAP[m.group(1).upper()] + '(', expr
+        )
 
     def _safe_eval(self, expr: str) -> Any:
         """安全求值，限制可用函数"""
-        def _avg(values):
+        def _flat_numeric(args):
+            # 展平区域产生的列表并只保留数值，供聚合函数使用
+            values = []
+            for a in args:
+                items = a if isinstance(a, (list, tuple)) else [a]
+                values.extend(
+                    v for v in items
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                )
+            return values
+
+        def _sum(*args):
+            return sum(_flat_numeric(args))
+
+        def _max(*args):
+            values = _flat_numeric(args)
+            return max(values) if values else 0
+
+        def _min(*args):
+            values = _flat_numeric(args)
+            return min(values) if values else 0
+
+        def _avg(*args):
+            values = _flat_numeric(args)
             if not values:
                 return 0
             return sum(values) / len(values)
@@ -265,12 +268,38 @@ class FormulaEngine:
                     total += 1
             return total
 
+        def _if(condition, true_val, false_val):
+            return true_val if condition else false_val
+
+        def _left(text, num=1):
+            return str(text)[:int(num)]
+
+        def _right(text, num=1):
+            num = int(num)
+            return str(text)[-num:] if num > 0 else ''
+
+        def _mid(text, start, num):
+            start = int(start)
+            return str(text)[start - 1:start - 1 + int(num)]
+
+        def _round(value, digits=0):
+            return round(value, int(digits))
+
         allowed_names = {
             'sum': sum, 'max': max, 'min': min, 'len': len,
             'abs': abs, 'round': round, 'int': int, 'float': float,
             'str': str, 'pow': pow,
             'True': True, 'False': False,
-            '_avg': _avg, '_concat': _concat, '_count': _count
+            '_avg': _avg, '_concat': _concat, '_count': _count,
+            '_sum': _sum, '_max': _max, '_min': _min, '_if': _if,
+            '_left': _left, '_right': _right, '_mid': _mid,
+            '_len': lambda text: len(str(text)),
+            '_upper': lambda text: str(text).upper(),
+            '_lower': lambda text: str(text).lower(),
+            '_trim': lambda text: str(text).strip(),
+            '_round': _round,
+            '_sqrt': lambda value: value ** 0.5,
+            '_mod': lambda num, divisor: num % divisor,
         }
 
         code = compile(expr, '<formula>', 'eval')
