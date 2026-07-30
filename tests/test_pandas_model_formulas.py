@@ -82,6 +82,25 @@ class TestSortFollowsFormulas:
         assert list(m._df['X']) == [10.0, 20.0, 30.0]
 
 
+class TestReorderRows:
+    def test_reorder_moves_formulas_colors_and_data(self):
+        m = make_model()
+        m.setData(m.index(0, 1), '=A1*2')  # 60
+        m.cell_colors[(0, 0)] = '#ff0000'
+        m.reorder_rows([2, 0, 1])  # 旧行 2/0/1 -> 新行 0/1/2
+        assert list(m._df['X']) == [20.0, 30.0, 10.0]
+        assert m.formulas == {(1, 1): '=A2*2'}
+        assert m.cell_colors == {(1, 0): '#ff0000'}
+        assert m._df.iat[1, 1] == 60
+
+    def test_reorder_clears_undo_and_marks_modified(self):
+        m = make_model()
+        m.setData(m.index(0, 0), '99')
+        m.reorder_rows([1, 2, 0])
+        assert m.modified
+        assert not m._undo_stack
+
+
 class TestInsertDeleteFollowsFormulas:
     def test_insert_row_shifts_formula_and_refs(self):
         m = make_model()

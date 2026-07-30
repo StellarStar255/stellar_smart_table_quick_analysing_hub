@@ -1232,7 +1232,9 @@ class MainWindow(QMainWindow):
         self._sort_by(list(df.columns).index(col), order == tr("升序"))
 
     def _sort_by(self, col_idx, ascending):
-        self._freeze_formulas(tr("排序"))
+        if self.active_filters:
+            # 筛选视图下位置引用语义模糊，公式仍冻结为静态值
+            self._freeze_formulas(tr("排序"))
         df = self.model.df
         colname = df.columns[col_idx]
         # 数值列按数值排，混合列按字符串排
@@ -1243,17 +1245,10 @@ class MainWindow(QMainWindow):
             sort_series = df[colname].astype(str)
         positions = sort_series.sort_values(
             ascending=ascending, kind="mergesort", na_position="last").index
-        new_df = df.loc[positions].reset_index(drop=True)
         if self._filtered_idx_map:
             self._filtered_idx_map = [self._filtered_idx_map[i] for i in positions]
-        if self.model.cell_colors:
-            # 背景色按行号存，必须跟着行一起重排
-            old_to_new = {old: new for new, old in enumerate(positions)}
-            self.model.cell_colors = {
-                (old_to_new[r], c): v
-                for (r, c), v in self.model.cell_colors.items()
-                if r in old_to_new}
-        self.model.set_dataframe(new_df, mark_modified=True)
+        # 公式单元格/引用与背景色在模型内跟随行序移动
+        self.model.reorder_rows(positions)
         self._mark_modified()
         self.update_statusbar(tr("已按 {} {}排序").format(
             colname, tr("升序") if ascending else tr("降序")))
@@ -1450,8 +1445,10 @@ class MainWindow(QMainWindow):
         if need_rows > 0:
             empty = pd.DataFrame(np.full((need_rows, len(self.model.df.columns)), np.nan),
                                  columns=self.model.df.columns)
+            # 追加空行不改变既有位置，必须把公式传回去，否则会被 set_dataframe 清空
             self.model.set_dataframe(
-                pd.concat([self.model.df, empty]).reset_index(drop=True), mark_modified=True)
+                pd.concat([self.model.df, empty]).reset_index(drop=True),
+                mark_modified=True, formulas=self.model.formulas)
         clip = getattr(self, "_formula_clipboard", None)
         use_formulas = clip is not None and clip["text"] == text
         for r_off, row_vals in enumerate(rows):
