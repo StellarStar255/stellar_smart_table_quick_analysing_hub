@@ -1,0 +1,126 @@
+"""Python 数据分析窗口测试：代码执行、预设合并、编辑器行为"""
+import json
+import os
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pandas as pd
+from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtWidgets import QApplication
+
+_app = QApplication.instance() or QApplication([])
+
+from qtui import python_analysis
+from qtui.python_analysis import (
+    CodeEditor, CodeRunWorker, PythonAnalysisWindow,
+    DEFAULT_PRESETS, DEFAULTS_VERSION, _DEFAULTS_VERSION_KEY,
+)
+
+
+def run_worker(code, df):
+    worker = CodeRunWorker(code, df, None)
+    results = []
+    worker.done.connect(lambda *args: results.append(args))
+    worker.run()  # 直接同步执行，不开线程
+    return results[0]  # (output, result_dfs, sheet_requests, figure_files)
+
+
+class TestCodeRunWorker:
+    def test_print_output_and_df_scan(self):
+        df = pd.DataFrame({'A': [1, 2, 3]})
+        output, result_dfs, sheets, figures = run_worker(
+            "result = df[df['A'] > 1]\nprint(len(result))", df)
+        assert '2' in output
+        assert 'result' in result_dfs and len(result_dfs['result']) == 2
+        assert sheets == [] and figures == []
+
+    def test_save_as_sheet_queued(self):
+        df = pd.DataFrame({'A': [1, 2]})
+        output, _, sheets, _ = run_worker(
+            "save_as_sheet(df.head(1), '测试')", df)
+        assert len(sheets) == 1
+        assert sheets[0][1] == '测试'
+        assert len(sheets[0][0]) == 1
+
+    def test_error_is_captured_not_raised(self):
+        output, _, sheets, _ = run_worker("1/0", pd.DataFrame())
+        assert 'ZeroDivisionError' in output
+        assert sheets == []
+
+
+class TestPresetMerge:
+    def _make_window(self, monkeypatch, tmp_path, file_content=None):
+        path = str(tmp_path / "presets.json")
+        if file_content is not None:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(file_content, f, ensure_ascii=False)
+        monkeypatch.setattr(python_analysis, "PRESETS_FILE", path)
+        win = PythonAnalysisWindow(host=SimpleNamespace(model=None))
+        return win, path
+
+    def test_fresh_install_gets_defaults(self, monkeypatch, tmp_path):
+        win, _ = self._make_window(monkeypatch, tmp_path)
+        assert set(DEFAULT_PRESETS) <= set(win.presets)
+        win.close()
+
+    def test_v1_file_merges_new_defaults_keeping_user_override(
+            self, monkeypatch, tmp_path):
+        # 老版本文件：用户自定义 + 覆盖过的同名默认预设
+        win, path = self._make_window(monkeypatch, tmp_path, {
+            "我的分析": "print(1)",
+            "描述统计": "print('用户改过的')",
+        })
+        assert win.presets["我的分析"] == "print(1)"
+        assert win.presets["描述统计"] == "print('用户改过的')"  # 用户优先
+        assert "透视表" in win.presets  # 新默认预设并入
+        # 合并后写回了版本号
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+        assert saved[_DEFAULTS_VERSION_KEY] == DEFAULTS_VERSION
+        win.close()
+
+    def test_deleted_default_stays_deleted_after_merge(
+            self, monkeypatch, tmp_path):
+        # 已带版本号的文件里没有"透视表"（用户删过），不应复活
+        content = {_DEFAULTS_VERSION_KEY: DEFAULTS_VERSION, "我的": "print(1)"}
+        win, _ = self._make_window(monkeypatch, tmp_path, content)
+        assert "透视表" not in win.presets
+        assert win.presets == {"我的": "print(1)"}
+        win.close()
+
+
+class TestCodeEditor:
+    def _press_return(self, editor):
+        editor.keyPressEvent(QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Return,
+            Qt.KeyboardModifier.NoModifier, "\r"))
+
+    def test_auto_indent_keeps_level(self):
+        ed = CodeEditor()
+        ed.setPlainText("    x = 1")
+        ed.moveCursor(ed.textCursor().MoveOperation.End)
+        self._press_return(ed)
+        assert ed.toPlainText() == "    x = 1\n    "
+
+    def test_auto_indent_adds_level_after_colon(self):
+        ed = CodeEditor()
+        ed.setPlainText("if x:")
+        ed.moveCursor(ed.textCursor().MoveOperation.End)
+        self._press_return(ed)
+        assert ed.toPlainText() == "if x:\n    "
+
+    def test_tab_inserts_spaces(self):
+        ed = CodeEditor()
+        ed.keyPressEvent(QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Tab,
+            Qt.KeyboardModifier.NoModifier))
+        assert ed.toPlainText() == "    "
+
+    def test_line_number_width_grows(self):
+        ed = CodeEditor()
+        w_small = ed.line_number_width()
+        ed.setPlainText("\n" * 120)
+        assert ed.line_number_width() > w_small

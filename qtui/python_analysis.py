@@ -10,6 +10,7 @@ import io
 import json
 import keyword
 import os
+import time
 import traceback
 import contextlib
 from datetime import datetime
@@ -17,15 +18,15 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression, QRect, QSize
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QKeySequence, QSyntaxHighlighter,
-    QTextCharFormat, QFontDatabase,
+    QTextCharFormat, QFontDatabase, QPainter, QPalette, QTextFormat,
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QPushButton, QPlainTextEdit, QSplitter, QToolBar, QMessageBox,
-    QInputDialog, QDialog, QTableView, QDialogButtonBox,
+    QInputDialog, QDialog, QTableView, QDialogButtonBox, QTextEdit,
 )
 
 from .pandas_model import PandasTableModel
@@ -33,11 +34,53 @@ from qtui.i18n import tr
 
 PRESETS_FILE = os.path.join(os.path.expanduser("~"), ".smart_table_hub", "qt_python_presets.json")
 
+# 默认预设版本：新增默认预设时 +1，老用户的预设文件会做一次性合并
+# （用户同名预设优先；合并后写回版本号，之后用户删除默认预设不会复活）
+DEFAULTS_VERSION = 2
+_DEFAULTS_VERSION_KEY = "__defaults_version__"
+
 DEFAULT_PRESETS = {
     "描述统计": "print(df.describe(include='all'))",
     "缺失值统计": "print(df.isnull().sum())",
     "数据类型": "print(df.dtypes)",
     "去重": "result = df.drop_duplicates()\nsave_as_sheet(result, '去重结果')",
+    "分组聚合": (
+        "# 把列名改成你的：按一列分组，对数值列做多种聚合\n"
+        "result = df.groupby('分组列').agg({'数值列': ['sum', 'mean', 'count']})\n"
+        "print(result)\n"
+        "# save_as_sheet(result.reset_index(), '分组聚合')"
+    ),
+    "透视表": (
+        "# 把行/列/值改成你的列名\n"
+        "result = pd.pivot_table(df, index='行维度', columns='列维度',\n"
+        "                        values='数值列', aggfunc='sum', fill_value=0)\n"
+        "print(result)\n"
+        "# save_as_sheet(result.reset_index(), '透视表')"
+    ),
+    "相关性矩阵": (
+        "result = df.select_dtypes('number').corr().round(3)\n"
+        "print(result)\n"
+        "# save_as_sheet(result.reset_index(), '相关性')"
+    ),
+    "TopN 排序": (
+        "# 按某数值列取最大的 10 行\n"
+        "result = df.nlargest(10, '数值列')\n"
+        "print(result)\n"
+        "# save_as_sheet(result, 'Top10')"
+    ),
+    "缺失值清洗": (
+        "# 丢弃全空行，数值列缺失填 0\n"
+        "result = df.dropna(how='all')\n"
+        "result = result.fillna({c: 0 for c in result.select_dtypes('number').columns})\n"
+        "print(result.isnull().sum())\n"
+        "# save_as_sheet(result, '清洗结果')"
+    ),
+    "直方图": (
+        "import matplotlib.pyplot as plt\n"
+        "fig, ax = plt.subplots(figsize=(8, 5))\n"
+        "df['数值列'].hist(ax=ax, bins=30)\n"
+        "save_figure(fig, '直方图.png')"
+    ),
 }
 
 
@@ -140,12 +183,104 @@ class PythonHighlighter(QSyntaxHighlighter):
 # 代码编辑器
 # ---------------------------------------------------------------------------
 
+class _LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self):
+        return QSize(self._editor.line_number_width(), 0)
+
+    def paintEvent(self, event):
+        self._editor.paint_line_numbers(event)
+
+
 class CodeEditor(QPlainTextEdit):
-    """Tab 键插入 4 个空格。"""
+    """带行号栏、当前行高亮、自动缩进的代码编辑器；Tab 插入 4 空格。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._line_area = _LineNumberArea(self)
+        self.blockCountChanged.connect(lambda _: self._update_margin())
+        self.updateRequest.connect(self._on_update_request)
+        self.cursorPositionChanged.connect(self._highlight_current_line)
+        self._update_margin()
+        self._highlight_current_line()
+
+    # ---- 行号栏 ----
+
+    def line_number_width(self):
+        digits = max(2, len(str(self.blockCount())))
+        return 12 + self.fontMetrics().horizontalAdvance('9') * digits
+
+    def _update_margin(self):
+        self.setViewportMargins(self.line_number_width(), 0, 0, 0)
+
+    def _on_update_request(self, rect, dy):
+        if dy:
+            self._line_area.scroll(0, dy)
+        else:
+            self._line_area.update(0, rect.y(), self._line_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_margin()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self._line_area.setGeometry(
+            QRect(cr.left(), cr.top(), self.line_number_width(), cr.height()))
+
+    def paint_line_numbers(self, event):
+        painter = QPainter(self._line_area)
+        palette = self.palette()
+        painter.fillRect(event.rect(), palette.color(QPalette.ColorRole.Window))
+        painter.setPen(palette.color(QPalette.ColorRole.PlaceholderText))
+        painter.setFont(self.font())
+
+        block = self.firstVisibleBlock()
+        top = round(self.blockBoundingGeometry(block)
+                    .translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        number = block.blockNumber() + 1
+        height = self.fontMetrics().height()
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.drawText(0, top, self._line_area.width() - 6, height,
+                                 Qt.AlignmentFlag.AlignRight, str(number))
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            number += 1
+
+    # ---- 当前行高亮 ----
+
+    def _highlight_current_line(self):
+        selection = QTextEdit.ExtraSelection()
+        selection.format.setBackground(
+            self.palette().color(QPalette.ColorRole.AlternateBase))
+        selection.format.setProperty(
+            QTextFormat.Property.FullWidthSelection, True)
+        selection.cursor = self.textCursor()
+        selection.cursor.clearSelection()
+        self.setExtraSelections([selection])
+
+    # ---- 编辑行为 ----
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Tab and not event.modifiers():
             self.insertPlainText("    ")
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                and not event.modifiers():
+            # 自动缩进：继承上一行缩进；行尾是冒号再加一级
+            cursor = self.textCursor()
+            line = cursor.block().text()[:cursor.positionInBlock()]
+            indent = line[:len(line) - len(line.lstrip())]
+            if line.rstrip().endswith(':'):
+                indent += '    '
+            super().keyPressEvent(event)
+            if indent:
+                self.insertPlainText(indent)
             return
         super().keyPressEvent(event)
 
@@ -277,7 +412,10 @@ class PythonAnalysisWindow(QMainWindow):
         toolbar.addSeparator()
 
         self.run_action = QAction(tr("▶ 运行"), self)
-        self.run_action.setShortcut(QKeySequence(Qt.Key.Key_F5))
+        # F5 与 Cmd/Ctrl+Enter 都能运行（后者是笔记本用户的肌肉记忆）
+        self.run_action.setShortcuts([
+            QKeySequence(Qt.Key.Key_F5), QKeySequence("Ctrl+Return")])
+        self.run_action.setToolTip(tr("运行代码（F5 或 Ctrl+Enter）"))
         self.run_action.triggered.connect(self.run_code)
         toolbar.addAction(self.run_action)
 
@@ -309,6 +447,9 @@ class PythonAnalysisWindow(QMainWindow):
         self.output_edit = QPlainTextEdit()
         self.output_edit.setReadOnly(True)
         self.output_edit.setFont(mono)
+        self.output_edit.setPlaceholderText(tr(
+            "运行结果显示在这里（print 输出与错误信息）。\n"
+            "运行后代码里的 DataFrame 变量会出现在下方下拉框，可预览或保存为 Sheet。"))
         splitter.addWidget(self.output_edit)
 
         splitter.setSizes([420, 220])
@@ -339,16 +480,27 @@ class PythonAnalysisWindow(QMainWindow):
                 with open(PRESETS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
+                    version = data.pop(_DEFAULTS_VERSION_KEY, 1)
+                    if version < DEFAULTS_VERSION:
+                        # 一次性合并新增的默认预设（用户同名优先），
+                        # 立即写回版本号，之后删除默认预设不会复活
+                        data = {**DEFAULT_PRESETS, **data}
+                        self._write_presets_file(data)
                     return data
         except Exception as e:
             print(f"加载预设失败: {e}")
         return dict(DEFAULT_PRESETS)
 
+    @staticmethod
+    def _write_presets_file(presets):
+        os.makedirs(os.path.dirname(PRESETS_FILE), exist_ok=True)
+        payload = {_DEFAULTS_VERSION_KEY: DEFAULTS_VERSION, **presets}
+        with open(PRESETS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
     def _save_presets(self):
         try:
-            os.makedirs(os.path.dirname(PRESETS_FILE), exist_ok=True)
-            with open(PRESETS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.presets, f, ensure_ascii=False, indent=2)
+            self._write_presets_file(self.presets)
         except Exception as e:
             QMessageBox.critical(self, tr("错误"), tr("保存预设失败:\n{}").format(e))
 
@@ -416,6 +568,7 @@ class PythonAnalysisWindow(QMainWindow):
         self.output_edit.clear()
         self.output_edit.setPlainText(tr("正在运行...\n"))
         self.run_action.setEnabled(False)
+        self._run_started = time.perf_counter()
 
         self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None), self)
         self._worker.done.connect(self._on_run_done)
@@ -442,11 +595,13 @@ class PythonAnalysisWindow(QMainWindow):
                 self.output_edit.appendPlainText(
                     tr("[保存Sheet失败] {}: {}").format(sheet_name, e))
 
+        elapsed = time.perf_counter() - getattr(self, "_run_started", time.perf_counter())
         if sheet_requests:
             names = ", ".join(n for _, n in sheet_requests)
-            self._status(tr("已保存 {} 个Sheet: {}").format(len(sheet_requests), names))
+            self._status(tr("已保存 {} 个Sheet: {}（耗时 {:.2f} 秒）").format(
+                len(sheet_requests), names, elapsed))
         else:
-            self._status(tr("代码执行完成"))
+            self._status(tr("代码执行完成（耗时 {:.2f} 秒）").format(elapsed))
 
         worker = self._worker
         self._worker = None
