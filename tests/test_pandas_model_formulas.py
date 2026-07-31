@@ -298,6 +298,32 @@ class TestSortFollowsFormulas:
         assert list(m._df['X']) == [10.0, 20.0, 30.0]
 
 
+class TestCellColors:
+    def test_data_row_color_via_background_role(self):
+        m = make_model()
+        m.set_cell_color(0, 0, '#ffcc00')
+        assert m.data(m.index(1, 0), Qt.ItemDataRole.BackgroundRole).name() == '#ffcc00'
+        m.set_cell_color(0, 0, None)
+        assert m.data(m.index(1, 0), Qt.ItemDataRole.BackgroundRole) is None
+
+    def test_header_row_color_supported(self):
+        # 回归：表头行（视图行 0）也能设背景色，此前被静默跳过
+        m = make_model()
+        m.set_cell_color(-1, 0, '#ff0000')
+        assert m.data(m.index(0, 0), Qt.ItemDataRole.BackgroundRole).name() == '#ff0000'
+        m.set_cell_color(-1, 0, None)
+        # 清除后回落到表头默认底色（非自定义色）
+        assert m.data(m.index(0, 0), Qt.ItemDataRole.BackgroundRole).name() != '#ff0000'
+
+    def test_header_color_survives_sort(self):
+        m = make_model()
+        m.set_cell_color(-1, 0, '#ff0000')
+        m.set_cell_color(1, 1, '#00ff00')
+        m.reorder_rows([1, 2, 0])
+        assert m.cell_colors[(-1, 0)] == '#ff0000'   # 表头色不动
+        assert m.cell_colors[(0, 1)] == '#00ff00'    # 数据行色跟随（旧1->新0）
+
+
 class TestReorderRows:
     def test_reorder_moves_formulas_colors_and_data(self):
         m = make_model()

@@ -148,6 +148,10 @@ class PandasTableModel(QAbstractTableModel):
                 return name
             return ""
         if role == Qt.ItemDataRole.BackgroundRole:
+            # 表头行也支持自定义背景色（键为 (-1, col)）
+            color = self.cell_colors.get((-1, col))
+            if color:
+                return QColor(color)
             return _HEADER_ROW_BRUSH
         if role == Qt.ItemDataRole.FontRole:
             return _HEADER_ROW_FONT
@@ -420,7 +424,8 @@ class PandasTableModel(QAbstractTableModel):
                                       [Qt.ItemDataRole.BackgroundRole])
 
     def set_cell_color(self, row, col, color_hex):
-        """设置/清除单元格背景色（row 为 0 基数据行；color_hex 为 None 时清除）。"""
+        """设置/清除单元格背景色（row 为 0 基数据行，-1 表示表头行；
+        color_hex 为 None 时清除）。"""
         if color_hex:
             self.cell_colors[(row, col)] = color_hex
         else:
@@ -673,9 +678,9 @@ class PandasTableModel(QAbstractTableModel):
             }
         if self.cell_colors:
             self.cell_colors = {
-                (row_map[r], c): v
+                ((row_map[r] if r >= 0 else r), c): v
                 for (r, c), v in self.cell_colors.items()
-                if r in row_map
+                if r in row_map or r < 0   # 表头行颜色（-1）不随行序移动
             }
         self.evaluate_all_formulas()
         self.endResetModel()

@@ -1326,6 +1326,10 @@ class MainWindow(QMainWindow):
                 (disp, c): v
                 for disp, orig in enumerate(idx_map)
                 for c, v in by_row.get(orig, ())}
+            # 表头行颜色（-1）不参与行映射，原样保留
+            self.model.cell_colors.update(
+                {(r, c): v for (r, c), v in self._orig_cell_colors.items()
+                 if r < 0})
         else:
             self.model.cell_colors = {}
         self.model.set_dataframe(filtered)
@@ -1832,15 +1836,18 @@ class MainWindow(QMainWindow):
     # ================= 背景颜色 =================
 
     def _set_selection_color(self, color_hex):
-        indexes = [i for i in self.table.selectionModel().selectedIndexes()
-                   if i.row() > 0]  # 视图行 0 是表头行，不设背景色
+        indexes = self.table.selectionModel().selectedIndexes()
         for i in indexes:
-            row = i.row() - HEADER_ROWS   # 数据行
+            row = i.row() - HEADER_ROWS   # 数据行；-1 = 表头行（同样支持着色）
             self.model.set_cell_color(row, i.column(), color_hex)
             # 筛选状态下同步到原始行坐标底账，清除筛选后颜色仍在正确的行上
-            if self._filtered_idx_map is not None and self._orig_cell_colors is not None \
-                    and row < len(self._filtered_idx_map):
-                key = (self._filtered_idx_map[row], i.column())
+            if self._filtered_idx_map is not None and self._orig_cell_colors is not None:
+                if 0 <= row < len(self._filtered_idx_map):
+                    key = (self._filtered_idx_map[row], i.column())
+                elif row == -1:
+                    key = (-1, i.column())   # 表头行颜色不随筛选映射
+                else:
+                    continue
                 if color_hex:
                     self._orig_cell_colors[key] = color_hex
                 else:
