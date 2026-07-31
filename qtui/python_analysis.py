@@ -500,6 +500,8 @@ class PythonAnalysisWindow(QMainWindow):
         toolbar.addWidget(QLabel(tr(" 预设: ")))
         self.preset_combo = QComboBox()
         self.preset_combo.setMinimumWidth(180)
+        # 选中即自动应用（编辑器有未保存的自定义内容时不覆盖）
+        self.preset_combo.currentTextChanged.connect(self._on_preset_selected)
         toolbar.addWidget(self.preset_combo)
 
         apply_btn = QPushButton(tr("应用预设"))
@@ -622,6 +624,19 @@ class PythonAnalysisWindow(QMainWindow):
         if select_name and select_name in self.presets:
             self.preset_combo.setCurrentText(select_name)
         self.preset_combo.blockSignals(False)
+
+    def _on_preset_selected(self, name):
+        """下拉选中即自动应用；编辑器有自定义未保存内容时不覆盖。
+
+        判定"干净"：为空，或与任一预设完全一致（说明是上次应用后未改动）。
+        """
+        if not name or name not in self.presets:
+            return
+        current = self.code_edit.toPlainText().strip()
+        if current and current not in {c.strip() for c in self.presets.values()}:
+            self._status(tr("编辑器有未保存内容，未自动应用；可点\"应用预设\"覆盖"))
+            return
+        self._apply_preset(append=False)
 
     def _apply_preset(self, append=False):
         name = self.preset_combo.currentText()

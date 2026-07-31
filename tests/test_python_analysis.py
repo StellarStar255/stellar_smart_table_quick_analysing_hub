@@ -94,6 +94,31 @@ class TestPresetMerge:
         win.close()
 
 
+class TestAutoApplyPreset:
+    def _make_window(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(python_analysis, "PRESETS_FILE",
+                            str(tmp_path / "p.json"))
+        return PythonAnalysisWindow(host=SimpleNamespace(
+            model=None, update_statusbar=lambda *a: None))
+
+    def test_selecting_preset_applies_when_editor_clean(
+            self, monkeypatch, tmp_path):
+        win = self._make_window(monkeypatch, tmp_path)
+        win.preset_combo.setCurrentText('数据类型')
+        assert win.code_edit.toPlainText() == DEFAULT_PRESETS['数据类型']
+        # 未改动时继续切换，直接替换
+        win.preset_combo.setCurrentText('缺失值统计')
+        assert win.code_edit.toPlainText() == DEFAULT_PRESETS['缺失值统计']
+        win.close()
+
+    def test_selecting_preset_keeps_dirty_editor(self, monkeypatch, tmp_path):
+        win = self._make_window(monkeypatch, tmp_path)
+        win.code_edit.setPlainText('my_custom = 1')
+        win.preset_combo.setCurrentText('数据类型')
+        assert win.code_edit.toPlainText() == 'my_custom = 1'  # 不覆盖
+        win.close()
+
+
 class TestDefaultPresetBatches:
     def test_version_batches_cover_all_presets(self):
         batched = [k for keys in DEFAULT_PRESET_VERSIONS.values() for k in keys]
