@@ -145,6 +145,53 @@ def read_sheet_formulas(file_path, sheet_name) -> dict:
     return formulas
 
 
+def _xlsx_has_custom_fills(file_path) -> bool:
+    """styles.xml 里默认只有 none+gray125 两个 fill，更多说明存在自定义填充。
+
+    字节级预检，避免为绝大多数无背景色的文件做整表样式扫描。
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(file_path) as z:
+            with z.open("xl/styles.xml") as f:
+                return f.read().count(b"<fill>") > 2
+    except (OSError, KeyError, zipfile.BadZipFile, TypeError,
+            ValueError, AttributeError):
+        return False
+
+
+def read_sheet_colors(file_path, sheet_name) -> dict:
+    """读取 sheet 的单元格背景色，返回 {(数据行, 列): '#rrggbb'}。
+
+    行号 -1 表示表头行（Excel 第 1 行）。仅支持 .xlsx；
+    无自定义填充或读取失败返回空 dict。
+    """
+    if not str(file_path).lower().endswith(".xlsx"):
+        return {}
+    if not _xlsx_has_custom_fills(file_path):
+        return {}
+    colors = {}
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(file_path, read_only=True)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            return {}
+        for row in wb[sheet_name].iter_rows():
+            for cell in row:
+                fill = cell.fill
+                if fill is None or fill.fill_type != "solid":
+                    continue
+                rgb = getattr(fill.fgColor, "rgb", None)
+                if not isinstance(rgb, str) or rgb == "00000000":
+                    continue
+                colors[(cell.row - 2, cell.column - 1)] = "#" + rgb[-6:].lower()
+        wb.close()
+    except Exception as e:
+        print(f"读取背景色失败: {e}")
+    return colors
+
+
 def _dedupe_headers(headers):
     seen = {}
     result = []
@@ -179,20 +226,25 @@ def xlsx_has_coord_marker(file_path) -> bool:
 
 
 def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
-                  progress_cb=None):
+                  progress_cb=None, cell_colors=None):
     """把 {sheet名: DataFrame} 全量写入 xlsx。
 
     formulas: 可选 {sheet名: {(row, col): "=..."}}，公式覆盖写入对应单元格，
     Excel 打开时仍是可计算的公式（df 中已存计算结果，作为兜底值先写入）。
+    cell_colors: 可选 {sheet名: {(数据行, 列): '#rrggbb'}}，行 -1 为表头行，
+    写成真实的单元格填充（Excel 中同样可见）。
     progress_cb: 可选 (sheet名, 序号从1起, 总数) -> None，逐 sheet 汇报进度。
     先写临时文件再原子替换，避免写一半损坏原文件（与旧版后台保存策略一致）。
     """
+    from openpyxl.styles import PatternFill
     order = sheet_order or list(sheets.keys())
     order = [n for n in order if n in sheets]
     formulas = formulas or {}
+    cell_colors = cell_colors or {}
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(file_path) or ".")
     os.close(fd)
     try:
+        fill_cache = {}
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
             for i, name in enumerate(order):
                 if progress_cb:
@@ -203,6 +255,16 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                     # +2: 跳过表头行且 openpyxl 从 1 开始计数
                     writer.sheets[safe_name].cell(row=row + 2, column=col + 1,
                                                   value=formula)
+                for (row, col), color in cell_colors.get(name, {}).items():
+                    argb = "FF" + str(color).lstrip("#").upper()
+                    fill = fill_cache.get(argb)
+                    if fill is None:
+                        fill = PatternFill(start_color=argb, end_color=argb,
+                                           fill_type="solid")
+                        fill_cache[argb] = fill
+                    excel_row = row + 2 if row >= 0 else 1   # -1 = 表头行
+                    writer.sheets[safe_name].cell(
+                        row=excel_row, column=col + 1).fill = fill
             # 坐标版本标记：本应用保存的文件加载时公式结果可放心写入
             writer.book.properties.keywords = COORD_MARKER
         shutil.move(tmp_path, file_path)

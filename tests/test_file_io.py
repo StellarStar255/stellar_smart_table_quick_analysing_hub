@@ -72,6 +72,26 @@ class TestHeaderCandidateDetection:
         assert MainWindow._detect_header_candidate(df) == -1
 
 
+class TestCellColorPersistence:
+    """背景色写入 xlsx 真实填充并可读回（重启不丢、Excel 可见）"""
+
+    def test_colors_round_trip(self, tmp_path):
+        df = pd.DataFrame({'X': [1.0, 2.0], 'Y': [3.0, 4.0]})
+        path = str(tmp_path / 'c.xlsx')
+        colors = {(-1, 0): '#ff0000',   # 表头行
+                  (0, 1): '#e3f2fd',
+                  (1, 0): '#00ff00'}
+        file_io.save_workbook(path, {'S': df}, ['S'],
+                              cell_colors={'S': colors})
+        assert file_io.read_sheet_colors(path, 'S') == colors
+
+    def test_plain_file_fast_path_returns_empty(self, tmp_path):
+        path = str(tmp_path / 'p.xlsx')
+        file_io.save_workbook(path, {'S': pd.DataFrame({'X': [1.0]})}, ['S'])
+        assert not file_io._xlsx_has_custom_fills(path)
+        assert file_io.read_sheet_colors(path, 'S') == {}
+
+
 class TestDetectPreambleEnd:
     def test_world_bank_style_rows(self):
         rows = [['数据源', '世界发展指标'],

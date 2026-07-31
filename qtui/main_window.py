@@ -182,6 +182,7 @@ class MainWindow(QMainWindow):
         self.active_filters = []
         self.sheet_filters = {}          # sheet名 -> {'filters':…, 'original_df':…, 'idx_map':…}
         self._sheet_formulas = {}        # sheet名 -> {(row, col): "=..."}
+        self._sheet_colors = {}          # sheet名 -> {(row, col): '#rrggbb'}
         self.original_df = None          # 筛选前的完整数据
         self._filtered_idx_map = None    # 筛选行 -> original_df 索引标签
         self._suspended_formulas = None  # 筛选期间挂起的公式（original_df 坐标）
@@ -639,6 +640,7 @@ class MainWindow(QMainWindow):
         self._reset_filter_state()
         self.sheet_filters.clear()
         self._sheet_formulas.clear()
+        self._sheet_colors.clear()
         self.model.cell_colors.clear()
         self.model.set_dataframe(df)
         self.model.modified = False
@@ -677,15 +679,16 @@ class MainWindow(QMainWindow):
                 active = target if target in sheets else sheets[0]
                 df = file_io.read_sheet(excel_file, active)
                 formulas = file_io.read_sheet_formulas(path, active)
-                return ("excel", excel_file, sheets, active, df, formulas)
+                colors = file_io.read_sheet_colors(path, active)
+                return ("excel", excel_file, sheets, active, df, formulas, colors)
             df = file_io.read_csv_any_encoding(path)
-            return ("csv", None, [], None, df, {})
+            return ("csv", None, [], None, df, {}, {})
 
         def done(result):
             if result is None:
                 QMessageBox.critical(self, tr("打开文件"), tr("加载失败:\n{}").format(path))
                 return
-            kind, excel_file, sheets, active_sheet, df, formulas = result
+            kind, excel_file, sheets, active_sheet, df, formulas, colors = result
             self.current_file = path
             self._excel_file = excel_file
             self.sheet_names = sheets
@@ -693,10 +696,11 @@ class MainWindow(QMainWindow):
             self._sheet_cache.clear()
             self.sheet_filters.clear()
             self._sheet_formulas.clear()
+            self._sheet_colors.clear()
             self._reset_filter_state()
             if self.current_sheet:
                 self._cache_sheet(self.current_sheet, df)
-            self.model.cell_colors.clear()
+            self.model.cell_colors = dict(colors)   # 文件里的背景色
             # 本应用（新坐标系）保存的文件带标记，公式结果可放心写入；
             # 无标记（Excel/旧版来源）保守处理：错误不覆盖文件缓存值
             self.model.set_dataframe(
@@ -763,17 +767,25 @@ class MainWindow(QMainWindow):
         if ext == ".csv":
             df = self.original_df if self.original_df is not None else self.model.df
             work = lambda: file_io.save_csv(path, df)
+            if self._current_colors():
+                self.update_statusbar(tr("提示：CSV 格式不保存背景色，用 xlsx 可保留"))
         else:
             sheets, order, missing = self._collect_all_sheets()
             excel_file = self._excel_file
             formulas_map = dict(self._sheet_formulas)
-            # 当前 sheet 用权威公式表：筛选中为挂起的 original_df 坐标公式，
+            colors_map = dict(self._sheet_colors)
+            # 当前 sheet 用权威副本：筛选中为原始坐标的公式/颜色底账，
             # 与保存的 original_df 数据一致
             current_formulas = self._live_formulas()
+            current_colors = self._current_colors()
             if self.current_sheet:
                 formulas_map[self.current_sheet] = dict(current_formulas)
-            elif not self.sheet_names and current_formulas:
-                formulas_map["Sheet1"] = dict(current_formulas)
+                colors_map[self.current_sheet] = dict(current_colors)
+            elif not self.sheet_names:
+                if current_formulas:
+                    formulas_map["Sheet1"] = dict(current_formulas)
+                if current_colors:
+                    colors_map["Sheet1"] = dict(current_colors)
 
             def work():
                 # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
@@ -783,7 +795,8 @@ class MainWindow(QMainWindow):
                 file_io.save_workbook(
                     path, sheets, order, formulas_map,
                     progress_cb=lambda name, i, total: dialog.report(
-                        tr("正在写入 {} ({}/{}) ...").format(name, i, total)))
+                        tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
+                    cell_colors=colors_map)
 
         def done(result):
             # run_in_background 失败时回调 None；成功且 work 返回 None 无法区分，
@@ -916,6 +929,11 @@ class MainWindow(QMainWindow):
             full = self.original_df if self.original_df is not None else self.model.df
             self._cache_sheet(self.current_sheet, full)
             self._sheet_formulas[self.current_sheet] = dict(self._live_formulas())
+            # 背景色权威副本：筛选中为原始行坐标底账
+            self._sheet_colors[self.current_sheet] = dict(
+                self._orig_cell_colors
+                if self.active_filters and self._orig_cell_colors is not None
+                else self.model.cell_colors)
             if self.active_filters:
                 # 筛选中输入的公式（视图坐标）无法随 sheet 保存，转为静态值
                 dropped_view_formulas = len(self.model.formulas)
@@ -929,6 +947,7 @@ class MainWindow(QMainWindow):
 
         # 加载目标 sheet
         formulas = self._sheet_formulas.get(name)
+        colors = self._sheet_colors.get(name)
         if name in self._sheet_cache:
             df = self._sheet_cache[name]
         elif self._excel_file is not None:
@@ -937,11 +956,14 @@ class MainWindow(QMainWindow):
                 self._cache_sheet(name, df)
                 if formulas is None and self.current_file:
                     formulas = file_io.read_sheet_formulas(self.current_file, name)
+                if colors is None and self.current_file:
+                    colors = file_io.read_sheet_colors(self.current_file, name)
             except Exception as e:
                 QMessageBox.critical(self, tr("切换Sheet"), tr("读取 sheet 失败: {}").format(e))
                 return
         else:
             df = pd.DataFrame()
+        colors = colors or {}
 
         self.current_sheet = name
         self._reset_filter_state()
@@ -956,12 +978,15 @@ class MainWindow(QMainWindow):
             filtered, idx_map = filter_engine.apply_filters(df, self.active_filters)
             self._filtered_idx_map = idx_map
             self.model.set_dataframe(filtered)
+            # 颜色底账按原始坐标保存，映射到筛选后的显示行
+            self._orig_cell_colors = dict(colors)
+            self.model.cell_colors = self._map_colors_to_view(colors, idx_map)
         else:
             self.model.set_dataframe(
                 df, formulas=formulas,
                 from_file=bool(self.current_file)
                 and not file_io.xlsx_has_coord_marker(self.current_file))
-        self.model.cell_colors.clear()
+            self.model.cell_colors = dict(colors)
         self._refresh_sheet_combo()
         self._rebuild_filter_bar()
         self._update_image_context()
@@ -1267,6 +1292,12 @@ class MainWindow(QMainWindow):
         self._suspended_formulas = None
         self._rebuild_filter_bar()
 
+    def _current_colors(self):
+        """当前 sheet 的权威背景色表：筛选中为原始行坐标底账。"""
+        if self.active_filters and self._orig_cell_colors is not None:
+            return self._orig_cell_colors
+        return self.model.cell_colors
+
     def _live_formulas(self):
         """当前 sheet 的权威公式表（original_df 坐标）。
 
@@ -1298,6 +1329,18 @@ class MainWindow(QMainWindow):
             self._sheet_formulas.pop(self.current_sheet, None)
             self.update_statusbar(tr("{}后 {} 个公式已转为静态值").format(reason, n))
 
+    @staticmethod
+    def _map_colors_to_view(orig_colors, idx_map):
+        """把原始行坐标的背景色映射到筛选后的显示行；表头行（-1）原样保留。"""
+        by_row = {}
+        for (r, c), v in orig_colors.items():
+            by_row.setdefault(r, []).append((c, v))
+        mapped = {(disp, c): v
+                  for disp, orig in enumerate(idx_map)
+                  for c, v in by_row.get(orig, ())}
+        mapped.update({(r, c): v for (r, c), v in orig_colors.items() if r < 0})
+        return mapped
+
     def _reapply_filters(self):
         frozen_view = 0
         if self.original_df is None:
@@ -1320,20 +1363,8 @@ class MainWindow(QMainWindow):
         filtered, idx_map = filter_engine.apply_filters(self.original_df, self.active_filters)
         self._filtered_idx_map = idx_map
         # 背景色从原始行坐标映射到筛选后的显示行
-        if self._orig_cell_colors:
-            by_row = {}
-            for (r, c), v in self._orig_cell_colors.items():
-                by_row.setdefault(r, []).append((c, v))
-            self.model.cell_colors = {
-                (disp, c): v
-                for disp, orig in enumerate(idx_map)
-                for c, v in by_row.get(orig, ())}
-            # 表头行颜色（-1）不参与行映射，原样保留
-            self.model.cell_colors.update(
-                {(r, c): v for (r, c), v in self._orig_cell_colors.items()
-                 if r < 0})
-        else:
-            self.model.cell_colors = {}
+        self.model.cell_colors = self._map_colors_to_view(
+            self._orig_cell_colors or {}, idx_map)
         self.model.set_dataframe(filtered)
         self._rebuild_filter_bar()
         self._update_image_context()
