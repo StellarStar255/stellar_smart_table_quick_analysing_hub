@@ -241,6 +241,8 @@ class MainWindow(QMainWindow):
         # 列重命名联动：同步筛选条件/original_df；失败时状态栏提示
         self.model.columnRenamed.connect(self._after_column_rename)
         self.model.renameFailed.connect(self.update_statusbar)
+        # 背景色变化（含撤销/重做）同步筛选期间的颜色底账
+        self.model.cellColorsChanged.connect(self._on_cell_colors_changed)
 
         # 数据结构变化（排序/筛选/粘贴/插删行列都会替换 df 对象）时，
         # 图片面板必须换成新 df，否则行号和图片对不上
@@ -1836,24 +1838,27 @@ class MainWindow(QMainWindow):
     # ================= 背景颜色 =================
 
     def _set_selection_color(self, color_hex):
-        indexes = self.table.selectionModel().selectedIndexes()
-        for i in indexes:
-            row = i.row() - HEADER_ROWS   # 数据行；-1 = 表头行（同样支持着色）
-            self.model.set_cell_color(row, i.column(), color_hex)
-            # 筛选状态下同步到原始行坐标底账，清除筛选后颜色仍在正确的行上
-            if self._filtered_idx_map is not None and self._orig_cell_colors is not None:
-                if 0 <= row < len(self._filtered_idx_map):
-                    key = (self._filtered_idx_map[row], i.column())
-                elif row == -1:
-                    key = (-1, i.column())   # 表头行颜色不随筛选映射
-                else:
-                    continue
-                if color_hex:
-                    self._orig_cell_colors[key] = color_hex
-                else:
-                    self._orig_cell_colors.pop(key, None)
-        if indexes:
+        cells = [(i.row() - HEADER_ROWS, i.column())   # -1 = 表头行（同样支持着色）
+                 for i in self.table.selectionModel().selectedIndexes()]
+        # 批量应用并记入撤销栈；筛选底账经 cellColorsChanged 信号统一同步
+        if cells and self.model.apply_cell_colors(cells, color_hex):
             self._mark_modified()
+
+    def _on_cell_colors_changed(self, changes):
+        """背景色变化（含撤销/重做）时同步筛选期间的原始行坐标底账。"""
+        if self._filtered_idx_map is None or self._orig_cell_colors is None:
+            return
+        for row, col, color_hex in changes:
+            if 0 <= row < len(self._filtered_idx_map):
+                key = (self._filtered_idx_map[row], col)
+            elif row == -1:
+                key = (-1, col)   # 表头行颜色不随筛选映射
+            else:
+                continue
+            if color_hex:
+                self._orig_cell_colors[key] = color_hex
+            else:
+                self._orig_cell_colors.pop(key, None)
 
     # ================= 右键菜单 =================
 

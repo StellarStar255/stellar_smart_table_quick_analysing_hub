@@ -315,6 +315,35 @@ class TestCellColors:
         # 清除后回落到表头默认底色（非自定义色）
         assert m.data(m.index(0, 0), Qt.ItemDataRole.BackgroundRole).name() != '#ff0000'
 
+    def test_color_batch_is_undoable(self):
+        # 回归：设置背景颜色可用 Cmd+Z 撤销；一次选区着色 = 一条记录
+        m = make_model()
+        m.set_cell_color(0, 0, '#111111')   # 已有颜色，撤销应还原它
+        m.apply_cell_colors([(-1, 0), (0, 0), (1, 1)], '#ffcc00')
+        assert m.cell_colors[(-1, 0)] == '#ffcc00'
+        assert m.undo()
+        assert (-1, 0) not in m.cell_colors          # 原本无色 -> 清除
+        assert m.cell_colors[(0, 0)] == '#111111'    # 原有色 -> 还原
+        assert (1, 1) not in m.cell_colors
+        assert m.redo()
+        assert m.cell_colors[(0, 0)] == '#ffcc00'
+
+    def test_color_undo_interleaves_with_cell_edits(self):
+        m = make_model()
+        m.setData(m.index(1, 0), '99')
+        m.apply_cell_colors([(0, 1)], '#ff0000')
+        m.undo()                                     # 先撤销颜色
+        assert (0, 1) not in m.cell_colors
+        assert m._df.iat[0, 0] == 99
+        m.undo()                                     # 再撤销单元格编辑
+        assert m._df.iat[0, 0] == 30
+
+    def test_noop_color_not_recorded(self):
+        m = make_model()
+        m.set_cell_color(0, 0, '#ff0000')
+        assert not m.apply_cell_colors([(0, 0)], '#ff0000')  # 无变化
+        assert not m._undo_stack
+
     def test_header_color_survives_sort(self):
         m = make_model()
         m.set_cell_color(-1, 0, '#ff0000')

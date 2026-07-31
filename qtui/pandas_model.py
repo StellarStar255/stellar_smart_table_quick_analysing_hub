@@ -33,6 +33,9 @@ class PandasTableModel(QAbstractTableModel):
     columnRenamed = pyqtSignal(int, str, str)
     # 列重命名失败（提示文本）——表头行内联编辑没有对话框，宿主用状态栏反馈
     renameFailed = pyqtSignal(str)
+    # 背景色变化 [(数据行, 列, 生效颜色或 None), ...]——含撤销/重做，
+    # 宿主据此维护筛选期间的原始行坐标颜色底账
+    cellColorsChanged = pyqtSignal(list)
 
     def __init__(self, df: pd.DataFrame = None, parent=None):
         super().__init__(parent)
@@ -336,6 +339,14 @@ class PandasTableModel(QAbstractTableModel):
             self._rename_column_impl(col, old_name)
             self._redo_stack.append(record)
             return True
+        if record[0] == "__color__":
+            for row, col, old, _new in record[1]:
+                self.set_cell_color(row, col, old)
+            self._redo_stack.append(record)
+            self.modified = True
+            self.cellColorsChanged.emit(
+                [(r, c, old) for r, c, old, _new in record[1]])
+            return True
         row, col, old, new, old_formula, new_formula = record
         self._apply_formula_state(row, col, old_formula)
         self._set_cell(row, col, old)
@@ -354,6 +365,14 @@ class PandasTableModel(QAbstractTableModel):
             _, col, old_name, new_name = record
             self._rename_column_impl(col, new_name)
             self._undo_stack.append(record)
+            return True
+        if record[0] == "__color__":
+            for row, col, _old, new in record[1]:
+                self.set_cell_color(row, col, new)
+            self._undo_stack.append(record)
+            self.modified = True
+            self.cellColorsChanged.emit(
+                [(r, c, new) for r, c, _old, new in record[1]])
             return True
         row, col, old, new, old_formula, new_formula = record
         self._apply_formula_state(row, col, new_formula)
@@ -425,13 +444,32 @@ class PandasTableModel(QAbstractTableModel):
 
     def set_cell_color(self, row, col, color_hex):
         """设置/清除单元格背景色（row 为 0 基数据行，-1 表示表头行；
-        color_hex 为 None 时清除）。"""
+        color_hex 为 None 时清除）。不入撤销栈，批量入栈用 apply_cell_colors。"""
         if color_hex:
             self.cell_colors[(row, col)] = color_hex
         else:
             self.cell_colors.pop((row, col), None)
         idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole])
+
+    def apply_cell_colors(self, cells, color_hex):
+        """批量设置/清除背景色并记入撤销栈（一次操作 = 一条撤销记录）。
+
+        cells 为 (数据行, 列) 列表，行 -1 表示表头行。
+        """
+        changes = []
+        for row, col in cells:
+            old = self.cell_colors.get((row, col))
+            if old == (color_hex or None):
+                continue
+            changes.append((row, col, old, color_hex))
+            self.set_cell_color(row, col, color_hex)
+        if changes:
+            self._push_undo(("__color__", changes))
+            self.modified = True
+            self.cellColorsChanged.emit(
+                [(r, c, new) for r, c, _old, new in changes])
+        return bool(changes)
 
     # ---------- 结构操作 ----------
 
