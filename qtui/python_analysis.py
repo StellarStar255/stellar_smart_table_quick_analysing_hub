@@ -45,15 +45,22 @@ DEFAULT_PRESETS = {
     "数据类型": "print(df.dtypes)",
     "去重": "result = df.drop_duplicates()\nsave_as_sheet(result, '去重结果')",
     "分组聚合": (
-        "# 把列名改成你的：按一列分组，对数值列做多种聚合\n"
-        "result = df.groupby('分组列').agg({'数值列': ['sum', 'mean', 'count']})\n"
+        "# ===== 参数：把引号里的列名改成你的 =====\n"
+        "分组列 = '分组列'\n"
+        "数值列 = '数值列'\n"
+        "# =====================================\n"
+        "result = df.groupby(分组列).agg({数值列: ['sum', 'mean', 'count']})\n"
         "print(result)\n"
         "# save_as_sheet(result.reset_index(), '分组聚合')"
     ),
     "透视表": (
-        "# 把行/列/值改成你的列名\n"
-        "result = pd.pivot_table(df, index='行维度', columns='列维度',\n"
-        "                        values='数值列', aggfunc='sum', fill_value=0)\n"
+        "# ===== 参数：把引号里的列名改成你的 =====\n"
+        "行维度 = '行维度'\n"
+        "列维度 = '列维度'\n"
+        "数值列 = '数值列'\n"
+        "# =====================================\n"
+        "result = pd.pivot_table(df, index=行维度, columns=列维度,\n"
+        "                        values=数值列, aggfunc='sum', fill_value=0)\n"
         "print(result)\n"
         "# save_as_sheet(result.reset_index(), '透视表')"
     ),
@@ -63,22 +70,32 @@ DEFAULT_PRESETS = {
         "# save_as_sheet(result.reset_index(), '相关性')"
     ),
     "TopN 排序": (
-        "# 按某数值列取最大的 10 行\n"
-        "result = df.nlargest(10, '数值列')\n"
+        "# ===== 参数 =====\n"
+        "数值列 = '数值列'\n"
+        "N = 10\n"
+        "# ===============\n"
+        "result = df.nlargest(N, 数值列)\n"
         "print(result)\n"
-        "# save_as_sheet(result, 'Top10')"
+        "# save_as_sheet(result, 'TopN')"
     ),
     "缺失值清洗": (
-        "# 丢弃全空行，数值列缺失填 0\n"
-        "result = df.dropna(how='all')\n"
-        "result = result.fillna({c: 0 for c in result.select_dtypes('number').columns})\n"
+        "# ===== 参数 =====\n"
+        "数值缺失填充值 = 0\n"
+        "# ===============\n"
+        "result = df.dropna(how='all')  # 丢弃全空行\n"
+        "result = result.fillna({c: 数值缺失填充值\n"
+        "                        for c in result.select_dtypes('number').columns})\n"
         "print(result.isnull().sum())\n"
         "# save_as_sheet(result, '清洗结果')"
     ),
     "直方图": (
+        "# ===== 参数 =====\n"
+        "数值列 = '数值列'\n"
+        "分箱数 = 30\n"
+        "# ===============\n"
         "import matplotlib.pyplot as plt\n"
         "fig, ax = plt.subplots(figsize=(8, 5))\n"
-        "df['数值列'].hist(ax=ax, bins=30)\n"
+        "df[数值列].hist(ax=ax, bins=分箱数)\n"
         "save_figure(fig, '直方图.png')"
     ),
     # ---- v3 新增 ----
@@ -93,74 +110,97 @@ DEFAULT_PRESETS = {
         "print(df.head())"
     ),
     "频次统计": (
-        "# 统计某一列每个值出现的次数与占比，改成你的列名\n"
-        "counts = df['分类列'].value_counts()\n"
+        "# ===== 参数 =====\n"
+        "分类列 = '分类列'\n"
+        "# ===============\n"
+        "counts = df[分类列].value_counts()\n"
         "result = counts.to_frame('次数')\n"
         "result['占比%'] = (counts / len(df) * 100).round(2)\n"
         "print(result)\n"
         "# save_as_sheet(result.reset_index(), '频次统计')"
     ),
     "条件筛选导出": (
-        "# 按条件筛选行并另存为 Sheet（& 与、| 或，注意每个条件加括号）\n"
-        "result = df[(df['数值列'] > 100) & (df['分类列'] == '目标值')]\n"
+        "# ===== 参数 =====\n"
+        "数值列 = '数值列'\n"
+        "阈值 = 100\n"
+        "分类列 = '分类列'\n"
+        "目标值 = '目标值'\n"
+        "# ===============\n"
+        "# & 与、| 或，注意每个条件加括号\n"
+        "result = df[(df[数值列] > 阈值) & (df[分类列] == 目标值)]\n"
         "print(f'筛出 {len(result)} 行')\n"
         "save_as_sheet(result, '筛选结果')"
     ),
     "新增计算列": (
+        "# ===== 参数 =====\n"
+        "数量列 = '数量'\n"
+        "单价列 = '单价'\n"
+        "金额阈值 = 10000\n"
+        "# ===============\n"
         "import numpy as np\n"
         "result = df.copy()\n"
-        "# 算术：两列相乘\n"
-        "result['金额'] = result['数量'] * result['单价']\n"
-        "# 条件分档\n"
-        "result['等级'] = np.where(result['金额'] >= 10000, '高', '普通')\n"
+        "result['金额'] = result[数量列] * result[单价列]\n"
+        "result['等级'] = np.where(result['金额'] >= 金额阈值, '高', '普通')\n"
         "print(result.head())\n"
         "# save_as_sheet(result, '含计算列')"
     ),
     "文本清洗": (
+        "# ===== 参数 =====\n"
+        "文本列 = '文本列'\n"
+        "# ===============\n"
         "result = df.copy()\n"
-        "col = '文本列'  # 改成你的列名\n"
-        "result[col] = (result[col].astype(str)\n"
+        "result[文本列] = (result[文本列].astype(str)\n"
         "               .str.strip()          # 去首尾空格\n"
         "               .str.upper()          # 转大写（不需要就删掉）\n"
         "               .str.replace('旧', '新', regex=False))\n"
         "# 按分隔符拆出新列：\n"
-        "# result[['前段', '后段']] = result[col].str.split('-', n=1, expand=True)\n"
+        "# result[['前段', '后段']] = result[文本列].str.split('-', n=1, expand=True)\n"
         "print(result.head())\n"
         "# save_as_sheet(result, '清洗结果')"
     ),
     "日期处理": (
+        "# ===== 参数 =====\n"
+        "日期列 = '日期列'\n"
+        "数值列 = '数值列'\n"
+        "# ===============\n"
         "result = df.copy()\n"
-        "col = '日期列'  # 改成你的列名\n"
-        "result[col] = pd.to_datetime(result[col], errors='coerce')\n"
-        "result['年'] = result[col].dt.year\n"
-        "result['月'] = result[col].dt.to_period('M').astype(str)\n"
-        "# 按月聚合：\n"
-        "monthly = result.groupby('月')['数值列'].sum()\n"
+        "result[日期列] = pd.to_datetime(result[日期列], errors='coerce')\n"
+        "result['年'] = result[日期列].dt.year\n"
+        "result['月'] = result[日期列].dt.to_period('M').astype(str)\n"
+        "monthly = result.groupby('月')[数值列].sum()\n"
         "print(monthly)\n"
         "# save_as_sheet(monthly.reset_index(), '按月汇总')"
     ),
     "异常值检测": (
-        "# IQR 法：找出超出 [Q1-1.5IQR, Q3+1.5IQR] 的行\n"
-        "col = '数值列'  # 改成你的列名\n"
-        "q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)\n"
+        "# ===== 参数 =====\n"
+        "数值列 = '数值列'\n"
+        "倍数 = 1.5   # IQR 倍数，越大越宽松\n"
+        "# ===============\n"
+        "q1, q3 = df[数值列].quantile(0.25), df[数值列].quantile(0.75)\n"
         "iqr = q3 - q1\n"
-        "lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr\n"
-        "result = df[(df[col] < lo) | (df[col] > hi)]\n"
+        "lo, hi = q1 - 倍数 * iqr, q3 + 倍数 * iqr\n"
+        "result = df[(df[数值列] < lo) | (df[数值列] > hi)]\n"
         "print(f'正常范围 [{lo:.2f}, {hi:.2f}]，异常 {len(result)} 行')\n"
         "print(result.head(20))\n"
         "# save_as_sheet(result, '异常值')"
     ),
     "重复值检查": (
-        "# 查看重复的行（keep=False 把每组重复全部列出）；只想去重用\"去重\"预设\n"
-        "# 按整行判断：subset=None；按某几列判断：subset=['列1', '列2']\n"
-        "result = df[df.duplicated(subset=None, keep=False)]\n"
+        "# ===== 参数：按整行判断用 None，按某几列判断填 ['列1', '列2'] =====\n"
+        "判断列 = None\n"
+        "# ===========================================================\n"
+        "# keep=False 把每组重复全部列出；只想去重用\"去重\"预设\n"
+        "result = df[df.duplicated(subset=判断列, keep=False)]\n"
         "print(f'重复行数: {len(result)}')\n"
         "print(result.head(20))\n"
         "# save_as_sheet(result, '重复行')"
     ),
     "条形图": (
+        "# ===== 参数 =====\n"
+        "分类列 = '分类列'\n"
+        "显示前N = 15\n"
+        "# ===============\n"
         "import matplotlib.pyplot as plt\n"
-        "counts = df['分类列'].value_counts().head(15)\n"
+        "counts = df[分类列].value_counts().head(显示前N)\n"
         "fig, ax = plt.subplots(figsize=(9, 5))\n"
         "counts.plot.barh(ax=ax)\n"
         "ax.invert_yaxis()\n"
@@ -168,28 +208,85 @@ DEFAULT_PRESETS = {
         "save_figure(fig, '条形图.png')"
     ),
     "散点图": (
+        "# ===== 参数 =====\n"
+        "X列 = '数值列X'\n"
+        "Y列 = '数值列Y'\n"
+        "# ===============\n"
         "import matplotlib.pyplot as plt\n"
         "fig, ax = plt.subplots(figsize=(7, 6))\n"
-        "df.plot.scatter(x='数值列X', y='数值列Y', alpha=0.5, ax=ax)\n"
+        "df.plot.scatter(x=X列, y=Y列, alpha=0.5, ax=ax)\n"
         "save_figure(fig, '散点图.png')"
     ),
     "箱线图": (
+        "# ===== 参数 =====\n"
+        "数值列 = '数值列'\n"
+        "分组列 = '分类列'\n"
+        "# ===============\n"
         "import matplotlib.pyplot as plt\n"
         "fig, ax = plt.subplots(figsize=(8, 5))\n"
-        "df.boxplot(column='数值列', by='分类列', ax=ax)\n"
+        "df.boxplot(column=数值列, by=分组列, ax=ax)\n"
         "fig.suptitle('')\n"
         "fig.tight_layout()\n"
         "save_figure(fig, '箱线图.png')"
     ),
 }
 
-# 每个版本批次新增的默认预设键：合并时只补比文件版本更新的批次，
-# 用户删除过的旧批次默认预设不会复活
+# 每个版本批次新增的默认预设键（仅用于旧格式预设文件的迁移）
 DEFAULT_PRESET_VERSIONS = {
     2: ["描述统计", "缺失值统计", "数据类型", "去重", "分组聚合", "透视表",
         "相关性矩阵", "TopN 排序", "缺失值清洗", "直方图"],
     3: ["数据概览", "频次统计", "条件筛选导出", "新增计算列", "文本清洗",
         "日期处理", "异常值检测", "重复值检查", "条形图", "散点图", "箱线图"],
+}
+
+# 历史版本的默认预设文本：旧格式文件迁移时与之完全一致的条目
+# 视为"未改动的旧默认"，直接采用内置的最新版本（用户改过的绝不动）
+_SUPERSEDED_DEFAULT_TEXTS = {
+    "分组聚合": [
+        "# 把列名改成你的：按一列分组，对数值列做多种聚合\nresult = df.groupby('分组列').agg({'数值列': ['sum', 'mean', 'count']})\nprint(result)\n# save_as_sheet(result.reset_index(), '分组聚合')"
+    ],
+    "透视表": [
+        "# 把行/列/值改成你的列名\nresult = pd.pivot_table(df, index='行维度', columns='列维度',\n                        values='数值列', aggfunc='sum', fill_value=0)\nprint(result)\n# save_as_sheet(result.reset_index(), '透视表')"
+    ],
+    "TopN 排序": [
+        "# 按某数值列取最大的 10 行\nresult = df.nlargest(10, '数值列')\nprint(result)\n# save_as_sheet(result, 'Top10')"
+    ],
+    "缺失值清洗": [
+        "# 丢弃全空行，数值列缺失填 0\nresult = df.dropna(how='all')\nresult = result.fillna({c: 0 for c in result.select_dtypes('number').columns})\nprint(result.isnull().sum())\n# save_as_sheet(result, '清洗结果')"
+    ],
+    "直方图": [
+        "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(8, 5))\ndf['数值列'].hist(ax=ax, bins=30)\nsave_figure(fig, '直方图.png')"
+    ],
+    "频次统计": [
+        "# 统计某一列每个值出现的次数与占比，改成你的列名\ncounts = df['分类列'].value_counts()\nresult = counts.to_frame('次数')\nresult['占比%'] = (counts / len(df) * 100).round(2)\nprint(result)\n# save_as_sheet(result.reset_index(), '频次统计')"
+    ],
+    "条件筛选导出": [
+        "# 按条件筛选行并另存为 Sheet（& 与、| 或，注意每个条件加括号）\nresult = df[(df['数值列'] > 100) & (df['分类列'] == '目标值')]\nprint(f'筛出 {len(result)} 行')\nsave_as_sheet(result, '筛选结果')"
+    ],
+    "新增计算列": [
+        "import numpy as np\nresult = df.copy()\n# 算术：两列相乘\nresult['金额'] = result['数量'] * result['单价']\n# 条件分档\nresult['等级'] = np.where(result['金额'] >= 10000, '高', '普通')\nprint(result.head())\n# save_as_sheet(result, '含计算列')"
+    ],
+    "文本清洗": [
+        "result = df.copy()\ncol = '文本列'  # 改成你的列名\nresult[col] = (result[col].astype(str)\n               .str.strip()          # 去首尾空格\n               .str.upper()          # 转大写（不需要就删掉）\n               .str.replace('旧', '新', regex=False))\n# 按分隔符拆出新列：\n# result[['前段', '后段']] = result[col].str.split('-', n=1, expand=True)\nprint(result.head())\n# save_as_sheet(result, '清洗结果')"
+    ],
+    "日期处理": [
+        "result = df.copy()\ncol = '日期列'  # 改成你的列名\nresult[col] = pd.to_datetime(result[col], errors='coerce')\nresult['年'] = result[col].dt.year\nresult['月'] = result[col].dt.to_period('M').astype(str)\n# 按月聚合：\nmonthly = result.groupby('月')['数值列'].sum()\nprint(monthly)\n# save_as_sheet(monthly.reset_index(), '按月汇总')"
+    ],
+    "异常值检测": [
+        "# IQR 法：找出超出 [Q1-1.5IQR, Q3+1.5IQR] 的行\ncol = '数值列'  # 改成你的列名\nq1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)\niqr = q3 - q1\nlo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr\nresult = df[(df[col] < lo) | (df[col] > hi)]\nprint(f'正常范围 [{lo:.2f}, {hi:.2f}]，异常 {len(result)} 行')\nprint(result.head(20))\n# save_as_sheet(result, '异常值')"
+    ],
+    "重复值检查": [
+        "# 查看重复的行（keep=False 把每组重复全部列出）；只想去重用\"去重\"预设\n# 按整行判断：subset=None；按某几列判断：subset=['列1', '列2']\nresult = df[df.duplicated(subset=None, keep=False)]\nprint(f'重复行数: {len(result)}')\nprint(result.head(20))\n# save_as_sheet(result, '重复行')"
+    ],
+    "条形图": [
+        "import matplotlib.pyplot as plt\ncounts = df['分类列'].value_counts().head(15)\nfig, ax = plt.subplots(figsize=(9, 5))\ncounts.plot.barh(ax=ax)\nax.invert_yaxis()\nfig.tight_layout()\nsave_figure(fig, '条形图.png')"
+    ],
+    "散点图": [
+        "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(7, 6))\ndf.plot.scatter(x='数值列X', y='数值列Y', alpha=0.5, ax=ax)\nsave_figure(fig, '散点图.png')"
+    ],
+    "箱线图": [
+        "import matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(8, 5))\ndf.boxplot(column='数值列', by='分类列', ax=ax)\nfig.suptitle('')\nfig.tight_layout()\nsave_figure(fig, '箱线图.png')"
+    ]
 }
 
 
@@ -585,35 +682,76 @@ class PythonAnalysisWindow(QMainWindow):
 
     # ---------------- 预设 ----------------
 
+    # 预设存储格式 4：默认预设住在代码里（应用升级模板自动更新），
+    # 用户文件只存自定义/改动过的预设与被删除的默认预设名
+    _FORMAT_KEY = "__format__"
+    _DELETED_KEY = "__deleted_defaults__"
+    PRESETS_FORMAT = 4
+
     def _load_presets(self):
+        self._user_presets = {}
+        self._deleted_defaults = set()
         try:
             if os.path.exists(PRESETS_FILE):
                 with open(PRESETS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    version = data.pop(_DEFAULTS_VERSION_KEY, 1)
-                    if version < DEFAULTS_VERSION:
-                        # 只补比文件版本更新的批次（用户同名/已删除的不动），
-                        # 立即写回版本号
-                        for v in range(version + 1, DEFAULTS_VERSION + 1):
-                            for key in DEFAULT_PRESET_VERSIONS.get(v, []):
-                                data.setdefault(key, DEFAULT_PRESETS[key])
-                        self._write_presets_file(data)
-                    return data
+                    if data.get(self._FORMAT_KEY) == self.PRESETS_FORMAT:
+                        self._deleted_defaults = set(
+                            data.get(self._DELETED_KEY, []))
+                        self._user_presets = {
+                            k: v for k, v in data.items()
+                            if not str(k).startswith("__")}
+                    else:
+                        self._migrate_legacy_presets(data)
         except Exception as e:
             print(f"加载预设失败: {e}")
-        return dict(DEFAULT_PRESETS)
+        return self._compose_presets()
 
-    @staticmethod
-    def _write_presets_file(presets):
+    def _compose_presets(self):
+        """显示用预设表 = 内置默认（去掉用户删除的）+ 用户预设（同名覆盖）。"""
+        presets = {k: v for k, v in DEFAULT_PRESETS.items()
+                   if k not in self._deleted_defaults}
+        presets.update(self._user_presets)
+        return presets
+
+    def _migrate_legacy_presets(self, data):
+        """旧格式（全量快照）一次性迁移。
+
+        与当前或历史默认文本完全一致的条目视为未改动（改用内置最新版），
+        其余保留为用户预设；按批次版本推断用户删除过的默认预设。
+        用户改过的内容绝不丢弃。
+        """
+        version = data.pop(_DEFAULTS_VERSION_KEY, 1)
+        for key, code in data.items():
+            if str(key).startswith("__"):
+                continue
+            if key in DEFAULT_PRESETS and (
+                    code == DEFAULT_PRESETS[key]
+                    or code in _SUPERSEDED_DEFAULT_TEXTS.get(key, ())):
+                continue
+            self._user_presets[key] = code
+        for v, keys in DEFAULT_PRESET_VERSIONS.items():
+            if v <= version:
+                for k in keys:
+                    if k not in data:
+                        self._deleted_defaults.add(k)
+        try:
+            self._write_presets_file()
+        except OSError:
+            pass
+
+    def _write_presets_file(self):
         os.makedirs(os.path.dirname(PRESETS_FILE), exist_ok=True)
-        payload = {_DEFAULTS_VERSION_KEY: DEFAULTS_VERSION, **presets}
+        payload = {self._FORMAT_KEY: self.PRESETS_FORMAT,
+                   self._DELETED_KEY: sorted(self._deleted_defaults),
+                   **self._user_presets}
         with open(PRESETS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def _save_presets(self):
         try:
-            self._write_presets_file(self.presets)
+            self._write_presets_file()
         except Exception as e:
             QMessageBox.critical(self, tr("错误"), tr("保存预设失败:\n{}").format(e))
 
@@ -663,7 +801,8 @@ class PythonAnalysisWindow(QMainWindow):
             ans = QMessageBox.question(self, tr("确认"), tr("预设 “{}” 已存在，是否覆盖?").format(name))
             if ans != QMessageBox.StandardButton.Yes:
                 return
-        self.presets[name] = code
+        self._user_presets[name] = code
+        self.presets = self._compose_presets()
         self._save_presets()
         self._update_preset_combo(select_name=name)
 
@@ -674,7 +813,10 @@ class PythonAnalysisWindow(QMainWindow):
         ans = QMessageBox.question(self, tr("确认"), tr("确定删除预设 “{}”?").format(name))
         if ans != QMessageBox.StandardButton.Yes:
             return
-        del self.presets[name]
+        self._user_presets.pop(name, None)
+        if name in DEFAULT_PRESETS:
+            self._deleted_defaults.add(name)   # 删除的默认预设不再复活
+        self.presets = self._compose_presets()
         self._save_presets()
         self._update_preset_combo()
 

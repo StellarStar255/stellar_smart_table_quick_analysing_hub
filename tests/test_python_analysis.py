@@ -18,7 +18,7 @@ from qtui import python_analysis
 from qtui.python_analysis import (
     CodeEditor, CodeRunWorker, PythonAnalysisWindow,
     DEFAULT_PRESETS, DEFAULT_PRESET_VERSIONS,
-    DEFAULTS_VERSION, _DEFAULTS_VERSION_KEY,
+    DEFAULTS_VERSION, _DEFAULTS_VERSION_KEY, _SUPERSEDED_DEFAULT_TEXTS,
 )
 
 
@@ -78,11 +78,40 @@ class TestPresetMerge:
         assert win.presets["我的分析"] == "print(1)"
         assert win.presets["描述统计"] == "print('用户改过的')"  # 用户优先
         assert "透视表" in win.presets  # 新默认预设并入
-        # 合并后写回了版本号
+        # 迁移为格式 4：文件只存用户条目，默认预设不落盘
         with open(path, encoding="utf-8") as f:
             saved = json.load(f)
-        assert saved[_DEFAULTS_VERSION_KEY] == DEFAULTS_VERSION
+        assert saved["__format__"] == PythonAnalysisWindow.PRESETS_FORMAT
+        assert saved["我的分析"] == "print(1)"
+        assert "透视表" not in saved
         win.close()
+
+    def test_stale_default_text_upgraded_on_migration(
+            self, monkeypatch, tmp_path):
+        # 旧格式文件里存着"未改动的旧版默认文本"——迁移后自动用上新版模板
+        old_text = _SUPERSEDED_DEFAULT_TEXTS["分组聚合"][0]
+        win, path = self._make_window(monkeypatch, tmp_path, {
+            _DEFAULTS_VERSION_KEY: DEFAULTS_VERSION,
+            "分组聚合": old_text,
+        })
+        assert win.presets["分组聚合"] == DEFAULT_PRESETS["分组聚合"]
+        assert win.presets["分组聚合"] != old_text
+        win.close()
+
+    def test_format4_roundtrip_custom_and_deleted(self, monkeypatch, tmp_path):
+        # 格式 4 往返：自定义预设与删除的默认预设都持久化
+        win, path = self._make_window(monkeypatch, tmp_path)
+        win.code_edit.setPlainText("print('mine')")
+        win._user_presets["我的"] = "print('mine')"
+        win._deleted_defaults.add("直方图")
+        win.presets = win._compose_presets()
+        win._save_presets()
+        win.close()
+        win2 = PythonAnalysisWindow(host=SimpleNamespace(model=None))
+        assert win2.presets["我的"] == "print('mine')"
+        assert "直方图" not in win2.presets
+        assert "描述统计" in win2.presets
+        win2.close()
 
     def test_deleted_default_stays_deleted_after_merge(
             self, monkeypatch, tmp_path):
