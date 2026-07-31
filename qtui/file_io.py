@@ -40,8 +40,33 @@ def read_sheet(excel_file: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
     return df
 
 
+def detect_csv_header_row(file_path, enc, sep, probe_lines=200) -> int:
+    """定位真正表头行的 0 基行号。
+
+    世界银行等导出的 CSV 前几行是字段数远少于数据区的元数据行，
+    pandas 按首行推断列数会解析失败。取样前若干行，以出现次数最多的
+    字段宽度（并列取更宽者）为数据区宽度，返回首个达到该宽度的行号。
+    """
+    import csv as _csv
+    from collections import Counter
+    widths = []
+    with open(file_path, "r", encoding=enc, newline="") as f:
+        for i, row in enumerate(_csv.reader(f, delimiter=sep)):
+            widths.append(len(row))
+            if i >= probe_lines:
+                break
+    if not widths:
+        return 0
+    target = max(Counter(widths).items(), key=lambda t: (t[1], t[0]))[0]
+    return next((i for i, w in enumerate(widths) if w == target), 0)
+
+
 def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
-    """按 utf-8 → gbk → gb2312 → latin1 顺序尝试读取 CSV/TSV。"""
+    """按 utf-8 → gbk → gb2312 → latin1 顺序尝试读取 CSV/TSV。
+
+    列数不一致（前言元数据行比数据行窄）导致解析失败时，
+    自动定位真正的表头行并跳过前面的行重试。
+    """
     last_err = None
     sep = delimiter
     if sep is None:
@@ -51,6 +76,16 @@ def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
             return pd.read_csv(file_path, encoding=enc, sep=sep)
         except UnicodeDecodeError as e:
             last_err = e
+            continue
+        except pd.errors.ParserError as e:
+            last_err = e
+            try:
+                header_row = detect_csv_header_row(file_path, enc, sep)
+                if header_row > 0:
+                    return pd.read_csv(file_path, encoding=enc, sep=sep,
+                                       skiprows=header_row)
+            except (UnicodeDecodeError, pd.errors.ParserError) as e2:
+                last_err = e2
             continue
     raise last_err
 

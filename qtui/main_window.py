@@ -1577,7 +1577,30 @@ class MainWindow(QMainWindow):
         return (self.current_file is None and not self.model.modified
                 and df.isna().all().all())
 
+    @staticmethod
+    def _detect_preamble_end(rows):
+        """返回真正表格区起始行号（0 基）。
+
+        以出现次数最多的行宽（并列取更宽者）为数据区宽度，前面比它窄的
+        行视为说明性前言（如世界银行导出的元数据行）。
+        """
+        from collections import Counter
+        if len(rows) < 3:
+            return 0
+        widths = [len(r) for r in rows]
+        target = max(Counter(widths).items(), key=lambda t: (t[1], t[0]))[0]
+        return next((i for i, w in enumerate(widths) if w == target), 0)
+
     def _load_rows_as_table(self, rows):
+        preamble = self._detect_preamble_end(rows)
+        if preamble > 0:
+            ret = QMessageBox.question(
+                self, tr("粘贴"),
+                tr("前 {} 行比数据区窄，像是说明性内容。是否跳过它们？").format(preamble),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ret == QMessageBox.StandardButton.Yes:
+                rows = rows[preamble:]
         header_likely = self._detect_header_row(rows)
         ret = QMessageBox.question(
             self, tr("粘贴"), tr("是否把第一行作为列名？"),
