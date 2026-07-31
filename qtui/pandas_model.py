@@ -552,6 +552,36 @@ class PandasTableModel(QAbstractTableModel):
             }
         self.evaluate_all_formulas()
 
+    def promote_row_to_header(self, data_row: int):
+        """把指定数据行提升为表头：该行值成为列名，其上方行连同该行移除。
+
+        用于真实表头不在首行的文件（如世界银行导出的 CSV 前几行是元数据）。
+        空值列名用位置字母代替，重名自动加后缀。
+        """
+        if not 0 <= data_row < len(self._df):
+            return False
+        raw = list(self._df.iloc[data_row])
+        names, used = [], set()
+        for i, v in enumerate(raw):
+            text = "" if pd.isna(v) else str(v).strip()
+            if isinstance(v, float) and v.is_integer():
+                text = str(int(v))    # 年份类表头 1960.0 -> 1960
+            name = text or FormulaEngine.col_index_to_letter(i)
+            base, n = name, 1
+            while name in used:
+                name = f"{base}_{n}"
+                n += 1
+            used.add(name)
+            names.append(name)
+        # 先移除表头行及其上方行（公式/颜色/撤销/结构版本统一处理）
+        self.remove_rows(list(range(data_row + 1)))
+        self.beginResetModel()
+        self._invalidate_values()
+        self._df.columns = names
+        self.endResetModel()
+        self.modified = True
+        return True
+
     def rename_column(self, position: int, new_name: str):
         old_name = str(self._df.columns[position])
         if not new_name or new_name == old_name:

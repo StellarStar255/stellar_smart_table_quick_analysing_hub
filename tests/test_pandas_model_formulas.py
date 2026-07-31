@@ -95,6 +95,35 @@ class TestXlsxRoundTrip:
         assert m._df.iat[1, 0] == 20  # 10*2
 
 
+class TestPromoteRowToHeader:
+    """真实表头不在首行的文件（如世界银行导出）：把数据行提升为表头"""
+
+    def test_promote_world_bank_style_layout(self):
+        df = pd.DataFrame({
+            'Data Source': ['Last Updated', None, 'Country Name', '阿鲁巴', '阿富汗'],
+            '世界发展指标': ['2026-01-01', None, 'Country Code', 'ABW', 'AFG'],
+            'Unnamed: 2': [None, None, 1960.0, 100.0, 200.0],
+            'Unnamed: 3': [None, None, None, 300.0, 400.0],
+        })
+        m = PandasTableModel(df)
+        assert m.promote_row_to_header(2)
+        # 年份 1960.0 -> '1960'；空表头 -> 位置字母
+        assert list(m._df.columns) == ['Country Name', 'Country Code', '1960', 'D']
+        assert len(m._df) == 2
+        assert m._df.iloc[0, 0] == '阿鲁巴'
+
+    def test_duplicate_header_values_deduped(self):
+        df = pd.DataFrame({'A': ['x', 1.0], 'B': ['x', 2.0]})
+        m = PandasTableModel(df)
+        assert m.promote_row_to_header(0)
+        assert list(m._df.columns) == ['x', 'x_1']
+
+    def test_invalid_row_rejected(self):
+        m = make_model()
+        assert not m.promote_row_to_header(99)
+        assert not m.promote_row_to_header(-1)
+
+
 class TestHeaderRenameIntegrity:
     """坐标系迁移审查回归：重命名的撤销/依赖重算/失败反馈"""
 

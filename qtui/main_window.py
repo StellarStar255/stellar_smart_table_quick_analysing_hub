@@ -1835,6 +1835,9 @@ class MainWindow(QMainWindow):
             menu.addAction(tr("向下插入一行"), lambda: self.insert_row(
                 data_row + (1 if index.row() > 0 else 0)))
             menu.addAction(tr("删除选中行"), self.delete_selected_rows)
+            if index.row() > 0:
+                menu.addAction(tr("将此行设为表头"),
+                               lambda: self.promote_row_to_header(index.row() - 1))
             menu.addSeparator()
             menu.addAction(tr("向左插入一列"), lambda: self._insert_col_at(index.column()))
             menu.addAction(tr("向右插入一列"), lambda: self._insert_col_at(index.column() + 1))
@@ -1969,7 +1972,26 @@ class MainWindow(QMainWindow):
         menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
         menu.addAction(tr("向下插入一行"), lambda: self.insert_row(below))
         menu.addAction(tr("删除选中行"), self.delete_selected_rows)
+        if row > 0:
+            menu.addSeparator()
+            menu.addAction(tr("将此行设为表头"),
+                           lambda: self.promote_row_to_header(row - 1))
         menu.exec(self.table.verticalHeader().mapToGlobal(pos))
+
+    def promote_row_to_header(self, data_row):
+        """把数据行提升为表头（真实表头不在首行的文件，如带元数据前言的导出）。"""
+        if not self._require_no_filter():
+            return
+        if data_row > 0:
+            ret = QMessageBox.question(
+                self, tr("设为表头"),
+                tr("将第 {} 行设为表头？其上方的 {} 行将被删除。").format(
+                    data_row + 2, data_row))
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        if self.model.promote_row_to_header(data_row):
+            self._mark_modified()
+            self.update_statusbar(tr("已将该行设为表头"))
 
     def _open_file_folder(self):
         if self.current_file:
