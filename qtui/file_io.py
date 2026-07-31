@@ -40,32 +40,32 @@ def read_sheet(excel_file: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-def detect_csv_header_row(file_path, enc, sep, probe_lines=200) -> int:
-    """定位真正表头行的 0 基行号。
+def _read_full_ragged_csv(file_path, enc, sep):
+    """整文件按最大行宽原样读入：不丢弃任何行（含元数据前言与空行），
+    列名用位置字母占位。
 
-    世界银行等导出的 CSV 前几行是字段数远少于数据区的元数据行，
-    pandas 按首行推断列数会解析失败。取样前若干行，以出现次数最多的
-    字段宽度（并列取更宽者）为数据区宽度，返回首个达到该宽度的行号。
+    世界银行等导出的 CSV 前几行比数据区窄，pandas 按首行推断列数会
+    解析失败。这里只负责"完整载入"；是否把某行提升为表头由用户在
+    界面上自行决定（绝不静默删行）。
     """
     import csv as _csv
-    from collections import Counter
-    widths = []
+    width = 0
     with open(file_path, "r", encoding=enc, newline="") as f:
-        for i, row in enumerate(_csv.reader(f, delimiter=sep)):
-            widths.append(len(row))
-            if i >= probe_lines:
-                break
-    if not widths:
-        return 0
-    target = max(Counter(widths).items(), key=lambda t: (t[1], t[0]))[0]
-    return next((i for i, w in enumerate(widths) if w == target), 0)
+        for row in _csv.reader(f, delimiter=sep):
+            width = max(width, len(row))
+    if width == 0:
+        return None
+    from core.formula_engine import FormulaEngine
+    names = [FormulaEngine.col_index_to_letter(i) for i in range(width)]
+    return pd.read_csv(file_path, encoding=enc, sep=sep, header=None,
+                       names=names, skip_blank_lines=False)
 
 
 def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
     """按 utf-8 → gbk → gb2312 → latin1 顺序尝试读取 CSV/TSV。
 
-    列数不一致（前言元数据行比数据行窄）导致解析失败时，
-    自动定位真正的表头行并跳过前面的行重试。
+    列数不一致（前言元数据行比数据行窄）导致解析失败时，改为整文件
+    原样载入（首行也作为数据、列名用位置字母），由用户决定表头。
     """
     last_err = None
     sep = delimiter
@@ -80,10 +80,9 @@ def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
         except pd.errors.ParserError as e:
             last_err = e
             try:
-                header_row = detect_csv_header_row(file_path, enc, sep)
-                if header_row > 0:
-                    return pd.read_csv(file_path, encoding=enc, sep=sep,
-                                       skiprows=header_row)
+                df = _read_full_ragged_csv(file_path, enc, sep)
+                if df is not None:
+                    return df
             except (UnicodeDecodeError, pd.errors.ParserError) as e2:
                 last_err = e2
             continue

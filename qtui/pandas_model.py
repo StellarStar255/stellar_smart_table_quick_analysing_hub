@@ -578,6 +578,16 @@ class PandasTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._invalidate_values()
         self._df.columns = names
+        # 原样载入的文件所有列都是文本，提升表头后重新推断数值列
+        try:
+            self._df = self._df.apply(pd.to_numeric, errors="ignore")
+        except TypeError:
+            pass  # 新版 pandas 移除 errors="ignore" 时逐列回退
+        if self._df.dtypes.eq(object).all():
+            for c in self._df.columns:
+                converted = pd.to_numeric(self._df[c], errors="coerce")
+                if converted.notna().sum() >= self._df[c].notna().sum():
+                    self._df[c] = converted
         self.endResetModel()
         self.modified = True
         return True

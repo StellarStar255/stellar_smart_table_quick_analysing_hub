@@ -123,6 +123,15 @@ class TestPromoteRowToHeader:
         assert not m.promote_row_to_header(99)
         assert not m.promote_row_to_header(-1)
 
+    def test_promote_reinfers_numeric_columns(self):
+        # 原样载入的文件全是文本，提升表头后数值列应恢复为数值类型
+        df = pd.DataFrame({'A': ['名称', 'x', 'y'], 'B': ['金额', '100', '200']})
+        m = PandasTableModel(df)
+        assert m.promote_row_to_header(0)
+        assert list(m._df.columns) == ['名称', '金额']
+        assert pd.api.types.is_numeric_dtype(m._df['金额'])
+        assert m._df['金额'].tolist() == [100, 200]
+
 
 class TestHeaderRenameIntegrity:
     """坐标系迁移审查回归：重命名的撤销/依赖重算/失败反馈"""

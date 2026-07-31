@@ -709,6 +709,8 @@ class MainWindow(QMainWindow):
             self._save_recent()
             self._rebuild_recent_menu()
             self.update_statusbar(tr("已打开 {}：{} 行 × {} 列").format(os.path.basename(path), len(df), len(df.columns)))
+            # 整文件原样载入（无表头）的文件：提示是否提升表头，由用户决定
+            self._offer_header_promotion()
 
         dialog.run_in_background(work, done)
 
@@ -2001,17 +2003,44 @@ class MainWindow(QMainWindow):
                            lambda: self.promote_row_to_header(row - 1))
         menu.exec(self.table.verticalHeader().mapToGlobal(pos))
 
+    @staticmethod
+    def _detect_header_candidate(df):
+        """整文件原样载入（列名是位置字母）时，找出更像表头的行号。
+
+        表头行通常是首个非空单元格数达到全表最大的行；仅当它前面的行都
+        明显更窄（≤ 一半）时才提示，避免误报。返回 0 基数据行号；
+        不适用（正常带表头的文件等）返回 -1。
+        """
+        if df.empty or len(df) < 3:
+            return -1
+        letters = [_col_letter(i) for i in range(len(df.columns))]
+        if [str(c) for c in df.columns] != letters:
+            return -1
+        widths = df.notna().sum(axis=1).tolist()
+        target = max(widths)
+        if target < 2:
+            return -1
+        idx = next((i for i, w in enumerate(widths) if w == target), 0)
+        if idx > 0 and all(w <= target / 2 for w in widths[:idx]):
+            return idx
+        return -1
+
+    def _offer_header_promotion(self):
+        """检测到疑似表头行时提示用户（用户拒绝则保持原样，绝不静默删行）。"""
+        idx = self._detect_header_candidate(self.model.df)
+        if idx >= 0:
+            self.promote_row_to_header(idx)   # 内部弹确认对话框
+
     def promote_row_to_header(self, data_row):
         """把数据行提升为表头（真实表头不在首行的文件，如带元数据前言的导出）。"""
         if not self._require_no_filter():
             return
+        message = tr("将第 {} 行设为表头？").format(data_row + 2)
         if data_row > 0:
-            ret = QMessageBox.question(
-                self, tr("设为表头"),
-                tr("将第 {} 行设为表头？其上方的 {} 行将被删除。").format(
-                    data_row + 2, data_row))
-            if ret != QMessageBox.StandardButton.Yes:
-                return
+            message += tr("其上方的 {} 行将被删除。").format(data_row)
+        ret = QMessageBox.question(self, tr("设为表头"), message)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
         if self.model.promote_row_to_header(data_row):
             self._mark_modified()
             self.update_statusbar(tr("已将该行设为表头"))
