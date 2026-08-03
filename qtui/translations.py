@@ -146,6 +146,7 @@ TRANSLATIONS = {
     '已复制 {} 行 × {} 列': 'Copied {} rows × {} columns',
     '筛选状态下粘贴内容不能超出表格范围': 'Pasted content cannot extend beyond the table while filtered',
     '已粘贴 {} 行': 'Pasted {} row(s)',
+    '已填充 {} 个单元格': 'Filled {} cell(s)',
     '是否把第一行作为列名？': 'Use the first row as column headers?',
     '已从剪贴板载入 {} 行 × {} 列': 'Loaded {} rows × {} columns from clipboard',
     '统计失败: {}': 'Statistics failed: {}',

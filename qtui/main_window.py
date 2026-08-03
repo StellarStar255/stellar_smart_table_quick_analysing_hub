@@ -17,8 +17,12 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 
-from PyQt6.QtCore import Qt, QTimer, QSettings
-from PyQt6.QtGui import QAction, QKeySequence, QFont, QFontMetrics
+from PyQt6.QtCore import (
+    Qt, QTimer, QSettings, QEvent, QRect, QItemSelection, QItemSelectionModel,
+)
+from PyQt6.QtGui import (
+    QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
+)
 from PyQt6.QtWidgets import (
     QMainWindow, QTableView, QVBoxLayout, QHBoxLayout, QWidget, QLabel,
     QComboBox, QToolBar, QPushButton, QMessageBox, QFileDialog,
@@ -28,6 +32,7 @@ from PyQt6.QtWidgets import (
     QApplication, QFrame, QDockWidget, QLineEdit,
 )
 
+from core.formula_engine import FormulaEngine
 from . import file_io, filter_engine
 from .pandas_model import PandasTableModel
 
@@ -72,6 +77,10 @@ def _col_letter(n):
     return result
 
 
+_PEN_DARK = QColor(0, 0, 0)      # 浅底黑字
+_PEN_LIGHT = QColor(255, 255, 255)  # 深底白字
+
+
 class _FastCellDelegate(QStyledItemDelegate):
     """精简单元格绘制：跳过 QStyle 全套状态机，只画背景/选中/文字。
 
@@ -86,6 +95,32 @@ class _FastCellDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self._model = model
         self._elide_cache = {}   # (text, width) -> 截断后的文本
+        self.active_editor = None  # 当前打开的单元格编辑器（公式点选引用用）
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        self.active_editor = editor
+        return editor
+
+    def destroyEditor(self, editor, index):
+        if editor is self.active_editor:
+            self.active_editor = None
+        super().destroyEditor(editor, index)
+
+    def eventFilter(self, editor, event):
+        # 公式点选引用（Excel point mode）：正在输入公式且光标处可插入
+        # 引用时，点击表格导致的失焦不提交编辑器——随后视图的
+        # mousePressEvent 会把点中的单元格引用插入公式
+        if (event.type() == QEvent.Type.FocusOut
+                and editor is self.active_editor):
+            view = self.parent()
+            if (isinstance(view, _ExcelTableView)
+                    and view._formula_editor() is editor
+                    and view._point_insert_start(editor) is not None):
+                w = QApplication.focusWidget()
+                if w is view or w is view.viewport():
+                    return False
+        return super().eventFilter(editor, event)
 
     def paint(self, painter, option, index):
         model = self._model
@@ -108,7 +143,16 @@ class _FastCellDelegate(QStyledItemDelegate):
             else:
                 fg = (model.data(index, Qt.ItemDataRole.ForegroundRole)
                       if model.formulas else None)
-                pen_color = fg if fg is not None else option.palette.text().color()
+                if fg is not None:
+                    pen_color = fg
+                elif bg is not None and bg.alpha() == 255:
+                    # 不透明自定义底色（文件填充/表头橙底）按亮度配黑白字，
+                    # 避免深色主题下浅底白字不可读
+                    lum = (299 * bg.red() + 587 * bg.green()
+                           + 114 * bg.blue()) // 1000
+                    pen_color = _PEN_DARK if lum >= 128 else _PEN_LIGHT
+                else:
+                    pen_color = option.palette.text().color()
             painter.setPen(pen_color)
             is_header = index.row() == 0
             if is_header:
@@ -144,7 +188,243 @@ class _FastCellDelegate(QStyledItemDelegate):
 
 
 class _ExcelTableView(QTableView):
-    """回车提交单元格编辑后，自动跳到下一行同列并继续编辑（Excel 风格）。"""
+    """Excel 风格交互：回车提交后跳下一行继续编辑；
+    输入公式时点击/拖选其他单元格插入引用（point mode）；
+    拖拽选区右下角填充柄把公式/值填充到相邻区域（fill handle）。"""
+
+    # 光标紧跟这些字符时点击才插入引用，否则视为普通点击（提交编辑）
+    _REF_TRIGGERS = '=(,:+-*/^&<>'
+    _point_anchor = None   # 点选拖拽的起始 index（拖出区域引用用）
+    _HANDLE_SIZE = 6       # 填充柄边长（像素）
+    _fill_source = None    # 拖拽起始选区 (top, left, bottom, right)，视图行号
+    _fill_target = None    # 拖拽预览区域（含源区），同上格式
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 悬停填充柄要变十字光标，需要无按键的 move 事件
+        self.viewport().setMouseTracking(True)
+
+    def _formula_editor(self):
+        """正在编辑且内容以 = 开头的单元格编辑器；否则 None。"""
+        editor = getattr(self.itemDelegate(), 'active_editor', None)
+        if (isinstance(editor, QLineEdit) and editor.isVisible()
+                and editor.text().startswith('=')):
+            return editor
+        return None
+
+    def _point_insert_start(self, editor):
+        """公式点选状态下引用应插入/替换的起始位置；不可插入返回 None。
+
+        连续点击不同单元格时替换上一次点选插入的引用（记录在
+        editor._point_span），与 Excel 行为一致。
+        """
+        text = editor.text()
+        pos = editor.cursorPosition()
+        span = getattr(editor, '_point_span', None)
+        if span and span[1] == pos and text[span[0]:pos] == span[2]:
+            return span[0]
+        i = pos
+        while i and text[i - 1] == ' ':
+            i -= 1
+        if i and text[i - 1] in self._REF_TRIGGERS:
+            return pos
+        return None
+
+    @staticmethod
+    def _cell_ref(index):
+        # 视图行 0 是表头行（引用为第 1 行），数据行依次 +1，与公式引擎一致
+        return FormulaEngine.col_index_to_letter(index.column()) + str(index.row() + 1)
+
+    def _apply_point_ref(self, editor, start, ref):
+        text = editor.text()
+        pos = editor.cursorPosition()
+        editor.setText(text[:start] + ref + text[pos:])
+        end = start + len(ref)
+        editor.setCursorPosition(end)
+        editor._point_span = (start, end, ref)
+
+    def _insert_point_ref(self, editor, index):
+        start = self._point_insert_start(editor)
+        if start is None:
+            return False
+        self._apply_point_ref(editor, start, self._cell_ref(index))
+        return True
+
+    def _drag_point_range(self, editor, index):
+        """拖选时把已插入的单格引用扩成区域引用（如 A2:B5）。"""
+        span = getattr(editor, '_point_span', None)
+        if not span:
+            return
+        text = editor.text()
+        if editor.cursorPosition() != span[1] or text[span[0]:span[1]] != span[2]:
+            return
+        a = self._point_anchor
+        r1, r2 = sorted((a.row(), index.row()))
+        c1, c2 = sorted((a.column(), index.column()))
+        ref = FormulaEngine.col_index_to_letter(c1) + str(r1 + 1)
+        if (r1, c1) != (r2, c2):
+            ref += ':' + FormulaEngine.col_index_to_letter(c2) + str(r2 + 1)
+        self._apply_point_ref(editor, span[0], ref)
+
+    # ---------- 填充柄（fill handle） ----------
+
+    def _selection_range(self):
+        """当前选区包围盒 (top, left, bottom, right)；无选区返回 None。"""
+        sm = self.selectionModel()
+        if sm is None:
+            return None
+        ranges = sm.selection()
+        if ranges:
+            return (min(r.top() for r in ranges),
+                    min(r.left() for r in ranges),
+                    max(r.bottom() for r in ranges),
+                    max(r.right() for r in ranges))
+        idx = self.currentIndex()
+        if idx.isValid():
+            return idx.row(), idx.column(), idx.row(), idx.column()
+        return None
+
+    def _fill_handle_rect(self):
+        """选区右下角填充柄的视口矩形；不可用时返回 None。"""
+        if self.state() == QAbstractItemView.State.EditingState:
+            return None    # 编辑中不显示（避免与公式点选冲突）
+        rng = self._selection_range()
+        if rng is None or self.model() is None:
+            return None
+        cell = self.visualRect(self.model().index(rng[2], rng[3]))
+        if not cell.isValid():
+            return None
+        s = self._HANDLE_SIZE
+        return QRect(cell.right() - s // 2, cell.bottom() - s // 2, s, s)
+
+    def _fill_step(self, pos):
+        """拖拽中按光标位置更新预览区域（Excel 语义：主轴向外扩展）。"""
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return
+        t, l, b, r = self._fill_source
+        row, col = idx.row(), idx.column()
+        dr = 0 if t <= row <= b else (row - b if row > b else row - t)
+        dc = 0 if l <= col <= r else (col - r if col > r else col - l)
+        if abs(dr) >= abs(dc):    # 纵向填充（含拖回源区 = 取消）
+            top = max(1, min(t, row))   # 表头行不参与填充
+            new = (top, l, max(b, row), r)
+        else:
+            new = (t, min(l, col), b, max(r, col))
+        if new != self._fill_target:
+            self._fill_target = new
+            self.viewport().update()
+
+    def _perform_fill(self):
+        """把源区公式/值循环填充到目标区（公式平移相对引用，逐格可撤销）。"""
+        src, tgt = self._fill_source, self._fill_target
+        if not src or not tgt or tgt == src:
+            return
+        m = self.model()
+        t, l, b, r = src
+        filled = 0
+        for row in range(tgt[0], tgt[2] + 1):
+            for col in range(tgt[1], tgt[3] + 1):
+                if (t <= row <= b and l <= col <= r) or row == 0:
+                    continue    # 跳过源区与表头行
+                src_row = t + (row - t) % (b - t + 1)
+                src_col = l + (col - l) % (r - l + 1)
+                formula = (m.formulas.get((src_row - 1, src_col))
+                           if src_row >= 1 else None)
+                if formula:
+                    val = m.shift_formula(formula, row - src_row, col - src_col)
+                else:
+                    val = m.data(m.index(src_row, src_col),
+                                 Qt.ItemDataRole.EditRole)
+                if m.setData(m.index(row, col), val):
+                    filled += 1
+        sm = self.selectionModel()
+        if sm is not None:
+            sm.select(QItemSelection(m.index(tgt[0], tgt[1]),
+                                     m.index(tgt[2], tgt[3])),
+                      QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        win = self.window()
+        if filled and hasattr(win, 'update_statusbar'):
+            win.update_statusbar(tr("已填充 {} 个单元格").format(filled))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        handle = self._fill_handle_rect()
+        if handle is None:
+            return
+        painter = QPainter(self.viewport())
+        color = self.palette().highlight().color()
+        if self._fill_target is not None:
+            m = self.model()
+            area = self.visualRect(
+                m.index(self._fill_target[0], self._fill_target[1])).united(
+                self.visualRect(
+                    m.index(self._fill_target[2], self._fill_target[3])))
+            painter.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+            painter.drawRect(area.adjusted(1, 1, -2, -2))
+        painter.fillRect(handle, color)
+
+    # ---------- 鼠标事件分发（公式点选 / 填充柄 / 默认） ----------
+
+    def mousePressEvent(self, event):
+        editor = self._formula_editor()
+        if editor is not None and event.button() == Qt.MouseButton.LeftButton:
+            idx = self.indexAt(event.position().toPoint())
+            if idx.isValid() and self._insert_point_ref(editor, idx):
+                self._point_anchor = idx
+                editor.setFocus()
+                event.accept()
+                return
+        if event.button() == Qt.MouseButton.LeftButton and editor is None:
+            handle = self._fill_handle_rect()
+            if (handle is not None and handle.adjusted(-2, -2, 2, 2)
+                    .contains(event.position().toPoint())):
+                self._fill_source = self._selection_range()
+                self._fill_target = None
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._point_anchor is not None:
+            editor = self._formula_editor()
+            idx = self.indexAt(event.position().toPoint())
+            if editor is not None and idx.isValid():
+                self._drag_point_range(editor, idx)
+            event.accept()
+            return
+        if self._fill_source is not None:
+            self._fill_step(event.position().toPoint())
+            event.accept()
+            return
+        # 悬停填充柄时提示可拖拽
+        handle = self._fill_handle_rect()
+        if (handle is not None and handle.adjusted(-2, -2, 2, 2)
+                .contains(event.position().toPoint())):
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.viewport().unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._point_anchor is not None:
+            self._point_anchor = None
+            event.accept()
+            return
+        if self._fill_source is not None:
+            self._perform_fill()
+            self._fill_source = None
+            self._fill_target = None
+            self.viewport().update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self._formula_editor() is not None:
+            event.accept()   # 公式点选中，双击不切换编辑目标
+            return
+        super().mouseDoubleClickEvent(event)
 
     def closeEditor(self, editor, hint):
         if hint == QAbstractItemDelegate.EndEditHint.SubmitModelCache:

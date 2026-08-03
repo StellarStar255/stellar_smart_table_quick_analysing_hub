@@ -21,7 +21,7 @@ _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _HIGHLIGHT_BRUSH = QColor(74, 158, 219, 46)   # 当前行整行淡色高亮
 _FORMULA_BRUSH = QColor(FORMULA_TEXT_COLOR)
-_HEADER_ROW_BRUSH = QColor(127, 127, 127, 42)  # 表头行底色（浅/深主题都可读）
+_HEADER_ROW_BRUSH = QColor(230, 126, 34)  # 表头行底色（橙色，委托按亮度自动配黑字）
 _HEADER_ROW_FONT = QFont()
 _HEADER_ROW_FONT.setBold(True)
 
