@@ -557,7 +557,6 @@ class MainWindow(QMainWindow):
         self.original_df = None          # 筛选前的完整数据
         self._filtered_idx_map = None    # 筛选行 -> original_df 索引标签
         self._suspended_formulas = None  # 筛选期间挂起的公式（original_df 坐标）
-        self._sort_orders = {}           # 列名 -> 上次是否升序
         self.image_columns = set()       # 标记为图片列的列名
         self._image_queue_win = None
         self._image_viewers = []
@@ -585,8 +584,9 @@ class MainWindow(QMainWindow):
             | QAbstractItemView.EditTrigger.SelectedClicked
             | QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.horizontalHeader().setDefaultSectionSize(140)
+        # 列头单击仅选中整列，不触发排序——大表排序开销大且易误触，
+        # 排序走工具栏/菜单/右键三个显式入口
         self.table.horizontalHeader().setSectionsClickable(True)
-        self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._show_col_menu)
         self.table.horizontalHeader().sectionDoubleClicked.connect(self._rename_column_at)
@@ -1607,12 +1607,6 @@ class MainWindow(QMainWindow):
         self._mark_modified()
 
     # ================= 排序 =================
-
-    def _on_header_clicked(self, col_idx):
-        colname = str(self.model.df.columns[col_idx])
-        ascending = not self._sort_orders.get(colname, False)
-        self._sort_orders[colname] = ascending
-        self._sort_by(col_idx, ascending)
 
     def sort_dialog(self):
         df = self.model.df
