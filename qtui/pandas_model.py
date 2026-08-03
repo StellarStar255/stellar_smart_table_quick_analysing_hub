@@ -21,7 +21,8 @@ _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _HIGHLIGHT_BRUSH = QColor(74, 158, 219, 46)   # 当前行整行淡色高亮
 _FORMULA_BRUSH = QColor(FORMULA_TEXT_COLOR)
-_HEADER_ROW_BRUSH = QColor(230, 126, 34)  # 表头行底色（橙色，委托按亮度自动配黑字）
+_HEADER_ROW_BRUSH = QColor(230, 126, 34)  # 表头行底色（橙色）
+_HEADER_TEXT_BRUSH = QColor(255, 255, 255)  # 默认橙底配白字（用户偏好）
 _HEADER_ROW_FONT = QFont()
 _HEADER_ROW_FONT.setBold(True)
 
@@ -158,6 +159,12 @@ class PandasTableModel(QAbstractTableModel):
             return _HEADER_ROW_BRUSH
         if role == Qt.ItemDataRole.FontRole:
             return _HEADER_ROW_FONT
+        if role == Qt.ItemDataRole.ForegroundRole:
+            # 默认橙底固定配白字；自定义底色返回 None，
+            # 由绘制委托按底色亮度自动选黑/白字
+            if (-1, col) not in self.cell_colors:
+                return _HEADER_TEXT_BRUSH
+            return None
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return _ALIGN_LEFT
         return None

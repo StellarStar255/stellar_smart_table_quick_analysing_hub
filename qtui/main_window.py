@@ -142,7 +142,7 @@ class _FastCellDelegate(QStyledItemDelegate):
                 pen_color = option.palette.highlightedText().color()
             else:
                 fg = (model.data(index, Qt.ItemDataRole.ForegroundRole)
-                      if model.formulas else None)
+                      if (model.formulas or index.row() == 0) else None)
                 if fg is not None:
                     pen_color = fg
                 elif bg is not None and bg.alpha() == 255:
