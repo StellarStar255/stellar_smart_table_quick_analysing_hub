@@ -366,6 +366,29 @@ class _ExcelTableView(QTableView):
 
     # ---------- 鼠标事件分发（公式点选 / 填充柄 / 默认） ----------
 
+    def keyPressEvent(self, event):
+        # Delete/Backspace 清空选中单元格内容（Excel 语义，逐格可撤销）；
+        # 表头行跳过——清列名属重命名，不随手清
+        if (event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self.state() != QAbstractItemView.State.EditingState):
+            sm = self.selectionModel()
+            indexes = sm.selectedIndexes() if sm is not None else []
+            if indexes:
+                cleared = 0
+                for idx in indexes:
+                    if idx.row() == 0:
+                        continue
+                    if self.model().setData(idx, ''):
+                        cleared += 1
+                win = self.window()
+                if cleared and hasattr(win, 'update_statusbar'):
+                    win.update_statusbar(
+                        tr("已清除 {} 个单元格").format(cleared))
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event):
         editor = self._formula_editor()
         if editor is not None and event.button() == Qt.MouseButton.LeftButton:
