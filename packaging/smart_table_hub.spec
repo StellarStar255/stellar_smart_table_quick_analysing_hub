@@ -30,6 +30,8 @@ a = Analysis(
         "openpyxl", "xlrd", "python_calamine",
         "PIL", "PIL.Image", "PIL.ImageQt",
         "certifi",
+        # 图表预设的 import 写在预设代码字符串里，静态分析扫不到，必须显式声明
+        "matplotlib", "matplotlib.pyplot", "matplotlib.backends.backend_agg",
     ],
     excludes=[
         # 只保留 PyQt6 一套 Qt 绑定（Anaconda 环境常同时装有 PyQt5）

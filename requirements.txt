@@ -7,3 +7,4 @@ PyQt6>=6.6.0  # PyQt 界面（smart_table_quick_analysing_hub_qt.py）
 python-calamine>=0.2.0  # 快速 Excel 读取引擎（大文件提速数倍，缺失时自动回退 openpyxl）
 certifi>=2024.2.2  # 打包后应用的 HTTPS CA 证书（应用内检查更新用）
 lxml>=5.0.0  # openpyxl 写 xlsx 的加速路径（大文件保存提速约 2-3 倍）
+matplotlib>=3.8.0  # Python 分析的图表预设（直方图/条形图/散点图/箱线图）
