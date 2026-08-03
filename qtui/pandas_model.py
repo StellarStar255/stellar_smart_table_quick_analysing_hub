@@ -63,6 +63,9 @@ class PandasTableModel(QAbstractTableModel):
         # 公式: (row, col) -> "=..."；df 中存计算结果
         self.formulas = {}
         self._dependents = {}   # (row, col) -> 依赖它的公式单元格集合
+        # 正向索引：公式单元格 -> 它依赖的键集合。注销依赖只按此索引
+        # 精确清除，避免线性扫描 _dependents（大量公式时是 O(N²) 热点）
+        self._formula_deps = {}
         self._engine = FormulaEngine()
         # 行列结构版本号：任何插入/删除/重排/整表替换都会递增，
         # 供公式剪贴板等按位置缓存的状态判断是否已失效
@@ -258,17 +261,27 @@ class PandasTableModel(QAbstractTableModel):
             return
         col_pos = {str(c): i for i, c in enumerate(self._df.columns)}
         self._engine.set_dataframe(self._df)
+        keys = set()
         for row, col_name in self._engine.extract_dependencies(formula):
             col = col_pos.get(str(col_name))
             if col is not None:
-                self._dependents.setdefault((row, col), set()).add(formula_cell)
+                key = (row, col)
+                self._dependents.setdefault(key, set()).add(formula_cell)
+                keys.add(key)
+        if keys:
+            self._formula_deps[formula_cell] = keys
 
     def _unregister_deps(self, formula_cell):
-        for deps in self._dependents.values():
-            deps.discard(formula_cell)
+        for key in self._formula_deps.pop(formula_cell, ()):
+            deps = self._dependents.get(key)
+            if deps is not None:
+                deps.discard(formula_cell)
+                if not deps:
+                    del self._dependents[key]
 
     def _rebuild_all_deps(self):
         self._dependents.clear()
+        self._formula_deps.clear()
         for key in list(self.formulas):
             self._register_deps(key)
 
@@ -429,6 +442,7 @@ class PandasTableModel(QAbstractTableModel):
         self._redo_stack.clear()
         self.formulas = dict(formulas) if formulas else {}
         self._dependents.clear()
+        self._formula_deps.clear()
         if self.formulas:
             # 纯公式行读回来是空行会被 pandas 裁掉，把表格补齐到公式覆盖的范围
             need_rows = max(r for r, _ in self.formulas) + 1 - len(self._df)
