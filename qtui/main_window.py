@@ -443,9 +443,39 @@ class _ExcelTableView(QTableView):
             return
         super().mouseReleaseEvent(event)
 
+    def _fill_to_bottom(self):
+        """双击填充柄：把选区向下填充到表格最后一行（Excel 语义）。"""
+        src = self._selection_range()
+        if src is None or self.model() is None:
+            return
+        last = self.model().rowCount() - 1
+        if last <= src[2]:
+            return    # 已在最后一行，无处可填
+        self._fill_source = src
+        self._fill_target = (src[0], src[1], last, src[3])
+        cells = (last - src[2]) * (src[3] - src[1] + 1)
+        if cells > 1000:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._perform_fill()
+        finally:
+            if cells > 1000:
+                QApplication.restoreOverrideCursor()
+            self._fill_source = None
+            self._fill_target = None
+            self.viewport().update()
+
     def mouseDoubleClickEvent(self, event):
         if self._formula_editor() is not None:
             event.accept()   # 公式点选中，双击不切换编辑目标
+            return
+        handle = self._fill_handle_rect()
+        if (handle is not None
+                and event.button() == Qt.MouseButton.LeftButton
+                and handle.adjusted(-2, -2, 2, 2)
+                .contains(event.position().toPoint())):
+            self._fill_to_bottom()
+            event.accept()
             return
         super().mouseDoubleClickEvent(event)
 

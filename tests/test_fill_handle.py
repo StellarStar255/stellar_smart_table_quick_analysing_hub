@@ -80,6 +80,24 @@ class TestFillHandle:
         assert abs(handle.center().x() - cell.right()) <= 3
         assert abs(handle.center().y() - cell.bottom()) <= 3
 
+    def test_double_click_fills_to_bottom(self, win):
+        win.model.setData(win.model.index(1, 1), '=A2*2')
+        sm = win.table.selectionModel()
+        sm.select(win.model.index(1, 1),
+                  sm.SelectionFlag.ClearAndSelect)
+        win.table._fill_to_bottom()
+        assert win.model.formulas == {
+            (0, 1): '=A2*2', (1, 1): '=A3*2', (2, 1): '=A4*2', (3, 1): '=A5*2'}
+        assert list(win.model.df['Y']) == [2.0, 4.0, 6.0, 8.0]
+
+    def test_double_click_at_last_row_is_noop(self, win):
+        sm = win.table.selectionModel()
+        sm.select(win.model.index(4, 0),
+                  sm.SelectionFlag.ClearAndSelect)
+        before = win.model.df.copy()
+        win.table._fill_to_bottom()
+        assert win.model.df.equals(before)
+
     def test_fill_step_vertical_clamps_and_previews(self, win):
         win.table._fill_source = (1, 0, 1, 0)
         win.table._fill_target = None
