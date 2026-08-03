@@ -367,6 +367,44 @@ class _ExcelTableView(QTableView):
     # ---------- 鼠标事件分发（公式点选 / 填充柄 / 默认） ----------
 
     def keyPressEvent(self, event):
+        # Cmd/Ctrl+方向键：跳到表格边缘；加 Shift 扩展选区到边缘
+        # （Excel 语义；macOS 上 Cmd 映射为 Qt 的 ControlModifier）
+        key = event.key()
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        arrows = (Qt.Key.Key_Down, Qt.Key.Key_Up,
+                  Qt.Key.Key_Left, Qt.Key.Key_Right)
+        if (key in arrows
+                and mods & Qt.KeyboardModifier.ControlModifier
+                and not mods & ~(Qt.KeyboardModifier.ControlModifier
+                                 | Qt.KeyboardModifier.ShiftModifier)
+                and self.state() != QAbstractItemView.State.EditingState):
+            m = self.model()
+            cur = self.currentIndex()
+            if m is not None and cur.isValid():
+                row, col = cur.row(), cur.column()
+                if key == Qt.Key.Key_Down:
+                    row = m.rowCount() - 1
+                elif key == Qt.Key.Key_Up:
+                    row = min(1, m.rowCount() - 1)   # 首数据行（0 是表头）
+                elif key == Qt.Key.Key_Left:
+                    col = 0
+                else:
+                    col = m.columnCount() - 1
+                target = m.index(row, col)
+                sm = self.selectionModel()
+                if mods & Qt.KeyboardModifier.ShiftModifier and sm is not None:
+                    tl = m.index(min(cur.row(), row), min(cur.column(), col))
+                    br = m.index(max(cur.row(), row), max(cur.column(), col))
+                    sm.select(
+                        QItemSelection(tl, br),
+                        QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    sm.setCurrentIndex(
+                        target, QItemSelectionModel.SelectionFlag.NoUpdate)
+                else:
+                    self.setCurrentIndex(target)
+                self.scrollTo(target)
+                event.accept()
+                return
         # Delete/Backspace 清空选中单元格内容（Excel 语义，逐格可撤销）；
         # 表头行跳过——清列名属重命名，不随手清
         if (event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
