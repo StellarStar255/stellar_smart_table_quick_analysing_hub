@@ -21,6 +21,18 @@ _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _HIGHLIGHT_BRUSH = QColor(74, 158, 219, 46)   # 当前行整行淡色高亮
 _FORMULA_BRUSH = QColor(FORMULA_TEXT_COLOR)
+def to_numeric_or_keep(series):
+    """整列可转数值才转，否则原样返回。
+
+    等价旧版 pd.to_numeric(errors="ignore")——该参数 pandas 2.2 起废弃、
+    3.x 移除（传入会抛 ValueError），统一用此实现兼容各版本。
+    """
+    try:
+        return pd.to_numeric(series)
+    except (ValueError, TypeError):
+        return series
+
+
 _HEADER_ROW_BRUSH = QColor(230, 126, 34)  # 表头行底色（橙色）
 _HEADER_TEXT_BRUSH = QColor(255, 255, 255)  # 默认橙底配白字（用户偏好）
 _HEADER_ROW_FONT = QFont()
@@ -629,10 +641,7 @@ class PandasTableModel(QAbstractTableModel):
         self._invalidate_values()
         self._df.columns = names
         # 原样载入的文件所有列都是文本，提升表头后重新推断数值列
-        try:
-            self._df = self._df.apply(pd.to_numeric, errors="ignore")
-        except TypeError:
-            pass  # 新版 pandas 移除 errors="ignore" 时逐列回退
+        self._df = self._df.apply(to_numeric_or_keep)
         if self._df.dtypes.eq(object).all():
             for c in self._df.columns:
                 converted = pd.to_numeric(self._df[c], errors="coerce")

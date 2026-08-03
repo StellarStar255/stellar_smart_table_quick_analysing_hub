@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 
 from core.formula_engine import FormulaEngine
 from . import file_io, filter_engine
-from .pandas_model import PandasTableModel
+from .pandas_model import PandasTableModel, to_numeric_or_keep
 
 # 视图第 0 行是虚拟表头行；所有视图行 <-> 数据行换算共用此常量
 HEADER_ROWS = PandasTableModel.HEADER_ROWS
@@ -1956,7 +1956,7 @@ class MainWindow(QMainWindow):
             df = pd.DataFrame(norm[1:], columns=headers)
         else:
             df = pd.DataFrame(norm, columns=[_col_letter(i) for i in range(width)])
-        df = df.apply(pd.to_numeric, errors="ignore") if hasattr(df, "apply") else df
+        df = df.apply(to_numeric_or_keep) if hasattr(df, "apply") else df
         self.model.set_dataframe(df, mark_modified=True)
         self._mark_modified()
         self.update_statusbar(tr("已从剪贴板载入 {} 行 × {} 列").format(len(df), len(df.columns)))
