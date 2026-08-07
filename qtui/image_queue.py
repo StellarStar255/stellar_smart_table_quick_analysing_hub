@@ -311,9 +311,11 @@ class FloatingImageQueue(QWidget):
         self._copy_current()
 
     def _go_prev(self):
+        """上一张并自动复制"""
         if self.current_index > 0:
             self.current_index -= 1
             self._update_display()
+            self._copy_current()
 
     def _go_next(self):
         """下一张并自动复制"""
