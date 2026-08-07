@@ -32,7 +32,10 @@ a = Analysis(
         "certifi",
         # 图表预设的 import 写在预设代码字符串里，静态分析扫不到，必须显式声明
         "matplotlib", "matplotlib.pyplot", "matplotlib.backends.backend_agg",
-    ],
+    ] + (
+        # 图片队列自动模式的全局 Cmd+V 监听（仅 macOS）
+        ["Quartz"] if sys.platform == "darwin" else []
+    ),
     excludes=[
         # 只保留 PyQt6 一套 Qt 绑定（Anaconda 环境常同时装有 PyQt5）
         "PyQt5", "PySide2", "PySide6",
