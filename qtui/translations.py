@@ -89,6 +89,8 @@ TRANSLATIONS = {
     '共 {} 行 × {} 列': '{} rows × {} columns',
     '（已筛选，{} 个条件）': ' (filtered, {} criteria)',
     '新建空白表格': 'New blank table',
+    '关闭文件': 'Close File',
+    '已关闭 {}': 'Closed {}',
     '打开文件': 'Open File',
     '支持的文件 (*.xlsx *.xls *.csv *.tsv);;Excel (*.xlsx *.xls);;CSV (*.csv *.tsv);;所有文件 (*)': 'Supported Files (*.xlsx *.xls *.csv *.tsv);;Excel (*.xlsx *.xls);;CSV (*.csv *.tsv);;All Files (*)',
     '文件不存在:\n{}': 'File does not exist:\n{}',

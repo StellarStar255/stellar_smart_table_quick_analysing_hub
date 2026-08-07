@@ -669,6 +669,7 @@ class MainWindow(QMainWindow):
         self._rebuild_recent_menu()
         self._add_action(file_menu, tr("保存"), self.save_file, "Ctrl+S")
         self._add_action(file_menu, tr("保存为..."), self.save_as_copy, "Ctrl+Shift+S")
+        self._add_action(file_menu, tr("关闭文件"), self.close_file, "Ctrl+W")
         file_menu.addSeparator()
         self._add_action(file_menu, tr("新建Sheet..."), self.create_new_sheet)
         self._add_action(file_menu, tr("保存为新Sheet..."), self.save_as_new_sheet)
@@ -1021,6 +1022,21 @@ class MainWindow(QMainWindow):
         self._refresh_sheet_combo()
         self._update_title()
         self.update_statusbar(tr("新建空白表格"))
+
+    def close_file(self):
+        """关闭当前文件回到空白表格，程序保持运行。"""
+        if not self._check_save_before_discard():
+            return
+        name = os.path.basename(self.current_file) if self.current_file else None
+        self._auto_save_timer.stop()
+        if self._excel_file is not None:
+            try:
+                self._excel_file.close()  # 释放文件句柄，关闭后文件可被移动/覆盖
+            except Exception:
+                pass
+        self.new_file(confirm=False)
+        if name:
+            self.update_statusbar(tr("已关闭 {}").format(name))
 
     def open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
