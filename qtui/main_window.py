@@ -810,7 +810,8 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
         for text, slot in (("新建", self.new_file), ("打开", self.open_file_dialog),
-                           ("保存", self.save_file), ("保存为", self.save_as_copy)):
+                           ("保存", self.save_file), ("保存为", self.save_as_copy),
+                           ("关闭文件", self.close_file)):
             btn = QPushButton(tr(text))
             btn.clicked.connect(slot)
             tb.addWidget(btn)
