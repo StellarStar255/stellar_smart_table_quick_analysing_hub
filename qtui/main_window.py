@@ -718,6 +718,7 @@ class MainWindow(QMainWindow):
         self.image_columns = set()       # 标记为图片列的列名
         self._image_queue_win = None
         self._image_viewers = []
+        self._lossy_confirmed = set()   # 已确认过"保存会丢失X"的文件
         self._analysis_win = None
         self.recent_files, self.auto_save = file_io.load_recent_files()
 
@@ -1345,10 +1346,53 @@ class MainWindow(QMainWindow):
                 missing.append(name)
         return sheets, list(self.sheet_names), missing
 
+    def _dirty_sheets(self):
+        """本次保存必须写回的 sheet：改过的 + 新建的。其余在原工作簿里原样保留。"""
+        dirty = set(self._pinned_sheets)
+        if self.model.modified:
+            dirty.add(self.current_sheet or (self.sheet_names[0] if self.sheet_names else None))
+        return {n for n in dirty if n}
+
+    def _patch_source(self, path):
+        """能就地打补丁时返回作模板的原 xlsx 路径，否则 None（走整表重建）。"""
+        src = self.current_file
+        if not src or not os.path.exists(src) or self._excel_file is None:
+            return None
+        if not str(src).lower().endswith((".xlsx", ".xlsm")):
+            return None
+        if not str(path).lower().endswith((".xlsx", ".xlsm")):
+            return None
+        return src
+
+    def _confirm_lossy_save(self, src):
+        """原文件里有就地保存也保不住的东西时先让用户确认（每个文件问一次）。"""
+        if src in self._lossy_confirmed:
+            return True
+        try:
+            parts = file_io.xlsx_lossy_parts(src)
+        except Exception:
+            parts = []
+        self._lossy_confirmed.add(src)
+        if not parts:
+            return True
+        ret = QMessageBox.warning(
+            self, tr("保存"),
+            tr("这个文件里的以下内容，本程序保存后会丢失：\n\n{}\n\n"
+               "其余内容（透视表、公式、条件格式、数据验证、列宽、图表、图片）"
+               "会原样保留。\n\n继续保存？取消的话可以用「另存为」写到新文件。").format(
+                   "、".join(parts)),
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if ret != QMessageBox.StandardButton.Save:
+            self._lossy_confirmed.discard(src)
+            return False
+        return True
+
     def _do_save(self, path, switch_to=True):
         """同步等待后台保存完成（进度框模态），返回是否成功。"""
         ext = os.path.splitext(path)[1].lower()
         saved = [False]
+        kept_header = [0]      # 就地保存时原样保留下来的表头公式数
         dialog = LoadingProgressDialog(self, tr("保存中"), tr("正在保存 {} ...").format(os.path.basename(path)))
         dialog.set_indeterminate()
 
@@ -1383,21 +1427,44 @@ class MainWindow(QMainWindow):
                          if n != self.current_sheet and n in on_disk and source_file
                          and (n not in formulas_map or n not in colors_map)]
 
-            def work():
-                # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
-                for name in missing:
-                    dialog.report(tr("正在读取 {} ...").format(name))
-                    sheets[name] = file_io.read_sheet(excel_file, name)
-                for name in need_meta:
-                    if name not in formulas_map:
-                        formulas_map[name] = file_io.read_sheet_formulas(source_file, name)
-                    if name not in colors_map:
-                        colors_map[name] = file_io.read_sheet_colors(source_file, name)
-                file_io.save_workbook(
-                    path, sheets, order, formulas_map,
-                    progress_cb=lambda name, i, total: dialog.report(
-                        tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
-                    cell_colors=colors_map)
+            # 能在原工作簿上打补丁时就打补丁：透视表/条件格式/数据验证/列宽/
+            # 数字格式/图表等 pandas 重建会全丢，只有就地更新才能保住
+            dirty = self._dirty_sheets()
+            patch_src = self._patch_source(path)
+            if patch_src and (any(n not in sheets for n in dirty)
+                              or any(n not in on_disk and n not in sheets
+                                     for n in order)):
+                patch_src = None   # 要写回的数据不在手，退回整表重建更安全
+            if patch_src:
+                if not self._confirm_lossy_save(patch_src):
+                    return False
+                dirty_sheets = {n: sheets[n] for n in dirty}
+
+                def work():
+                    kept_header[0] = file_io.patch_workbook(
+                        patch_src, path, dirty_sheets, order, formulas_map,
+                        cell_colors=colors_map,
+                        progress_cb=lambda name, i, total: dialog.report(
+                            tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
+                    )["kept_header_formulas"]
+                    return True
+            else:
+
+                def work():
+                    # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
+                    for name in missing:
+                        dialog.report(tr("正在读取 {} ...").format(name))
+                        sheets[name] = file_io.read_sheet(excel_file, name)
+                    for name in need_meta:
+                        if name not in formulas_map:
+                            formulas_map[name] = file_io.read_sheet_formulas(source_file, name)
+                        if name not in colors_map:
+                            colors_map[name] = file_io.read_sheet_colors(source_file, name)
+                    file_io.save_workbook(
+                        path, sheets, order, formulas_map,
+                        progress_cb=lambda name, i, total: dialog.report(
+                            tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
+                        cell_colors=colors_map)
 
         def done(result):
             # run_in_background 失败时回调 None；成功且 work 返回 None 无法区分，
@@ -1426,6 +1493,9 @@ class MainWindow(QMainWindow):
             if self.active_filters and self.model.formulas:
                 msg += tr("；") + tr("筛选中输入的 {} 个公式已按静态值保存").format(
                     len(self.model.formulas))
+            if kept_header[0]:
+                msg += tr("；") + tr("{} 个表头公式已原样保留（改名请在 Excel 中改）").format(
+                    kept_header[0])
             self.update_statusbar(msg)
 
         inner = work

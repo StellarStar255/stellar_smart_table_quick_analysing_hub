@@ -5,6 +5,7 @@
 不涉及任何 GUI；主窗口通过后台线程调用这些函数。
 """
 
+import datetime
 import json
 import os
 import re
@@ -447,6 +448,168 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
+
+
+# openpyxl 读不回来、就地保存会丢的部件（图表/图片/条件格式/数据验证等
+# 它是能保留的，下面这些不行）。扫到就在保存前提示用户。
+_LOSSY_PARTS = (
+    ("xl/slicers/", "切片器"),
+    ("xl/slicerCaches/", "切片器"),
+    ("xl/timelines/", "日程表"),
+    ("xl/ctrlProps/", "窗体控件"),
+    ("xl/activeX/", "ActiveX 控件"),
+    ("xl/threadedComments/", "新版批注（讨论）"),
+    ("xl/richData/", "单元格内图片/富数据"),
+    ("customXml/", "自定义 XML"),
+    ("vbaProject.bin", "宏（VBA）"),
+)
+
+
+def xlsx_lossy_parts(file_path):
+    """扫描 xlsx，返回就地保存时会丢失的功能名（去重、保持顺序）。"""
+    import zipfile
+    found = []
+    try:
+        with zipfile.ZipFile(file_path) as z:
+            names = z.namelist()
+    except Exception:
+        return []
+    for part, label in _LOSSY_PARTS:
+        if label in found:
+            continue
+        if any(part in n for n in names):
+            found.append(label)
+    return found
+
+
+def _xl_value(v):
+    """numpy/pandas 标量 -> openpyxl 能写的 Python 类型；缺失值 -> None。"""
+    if v is None or (isinstance(v, float) and v != v):
+        return None
+    if isinstance(v, (str, bool, int, float)):
+        return v
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    if isinstance(v, np.datetime64):
+        return pd.Timestamp(v).to_pydatetime()
+    if isinstance(v, np.generic):
+        return v.item()
+    return v if isinstance(v, (datetime.datetime, datetime.date,
+                               datetime.time)) else str(v)
+
+
+def _fill_for(color, cache):
+    from openpyxl.styles import PatternFill
+    argb = "FF" + str(color).lstrip("#").upper()
+    fill = cache.get(argb)
+    if fill is None:
+        fill = PatternFill(start_color=argb, end_color=argb, fill_type="solid")
+        cache[argb] = fill
+    return fill
+
+
+def _write_sheet_values(ws, df, clear_stale_fills):
+    """把 DataFrame 整块覆盖到 sheet（第 1 行表头），并删掉多余的行列。
+
+    表头行原本是公式的单元格不覆盖，否则用户的公式会被写死成静态文本；
+    返回这样保留下来的表头公式个数。
+    clear_stale_fills=True 时顺手清掉数据区里的旧底色（用户清除颜色才生效）。
+    """
+    kept = 0
+    ncols = len(df.columns)
+    nrows = len(df.index)
+    for j, name in enumerate(df.columns):
+        cell = ws.cell(row=1, column=j + 1)
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            kept += 1
+            continue
+        cell.value = str(name)
+    for i, row in enumerate(df.itertuples(index=False, name=None)):
+        for j, v in enumerate(row):
+            # 不能用 ws.cell(..., value=...)：openpyxl 对 None 是跳过不写，
+            # 旧值会留在格子里，用户删掉的内容就删不掉
+            ws.cell(row=i + 2, column=j + 1).value = _xl_value(v)
+    if clear_stale_fills:
+        from openpyxl.styles import PatternFill
+        none_fill = PatternFill()
+        for row in ws.iter_rows(min_row=1, max_row=nrows + 1, max_col=ncols):
+            for cell in row:
+                if cell.fill is not None and cell.fill.fill_type is not None:
+                    cell.fill = none_fill
+    # 多余的行列真删掉（表变短/变窄时不留空壳）
+    if ws.max_row > nrows + 1:
+        ws.delete_rows(nrows + 2, ws.max_row - (nrows + 1))
+    if ws.max_column > ncols:
+        ws.delete_cols(ncols + 1, ws.max_column - ncols)
+    return kept
+
+
+def _apply_fills(ws, colors, cache):
+    for (row, col), color in colors.items():
+        excel_row = row + 2 if row >= 0 else 1   # -1 = 表头行
+        ws.cell(row=excel_row, column=col + 1).fill = _fill_for(color, cache)
+
+
+def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
+                   formulas=None, cell_colors=None, progress_cb=None):
+    """在原工作簿基础上就地更新数据后另存，保留 pandas 重建会丢掉的一切
+    （透视表、条件格式、数据验证、数字格式、列宽、合并单元格、图表、图片…）。
+
+    sheets: {sheet名: DataFrame}，只写这些 sheet；不在里面的 sheet 原样保留。
+    sheet_order: 保存后完整的 sheet 顺序；不在其中的 sheet 视为用户删除。
+    formulas / cell_colors: 与 save_workbook 同义，只对 sheets 里的 sheet 生效。
+    返回 {"kept_header_formulas": n}。
+    先写临时文件再原子替换，写一半失败不会损坏任何一个文件。
+    """
+    from openpyxl import load_workbook
+    order = list(sheet_order)
+    for i, name in enumerate(order):
+        err = check_sheet_name(name, order[:i])
+        if err:
+            raise ValueError(tr("Sheet 名 \"{}\" 不合法：{}").format(name, err))
+    formulas = formulas or {}
+    cell_colors = cell_colors or {}
+    # 原文件本来就没有自定义底色时，不必为"清除底色"去扫整个数据区
+    clear_stale_fills = _xlsx_has_custom_fills(src_path)
+    keep_vba = (str(src_path).lower().endswith((".xlsm", ".xltm"))
+                and str(dest_path).lower().endswith((".xlsm", ".xltm")))
+    wb = load_workbook(src_path, data_only=False, keep_vba=keep_vba)
+    kept_header_formulas = 0
+    fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(dest_path)[1] or ".xlsx",
+                                    dir=os.path.dirname(dest_path) or ".")
+    os.close(fd)
+    try:
+        for name in list(wb.sheetnames):
+            if name not in order:
+                del wb[name]                      # 应用里删掉的 sheet
+        fill_cache = {}
+        for i, name in enumerate(order):
+            if progress_cb:
+                progress_cb(name, i + 1, len(order))
+            df = sheets.get(name)
+            if df is None:
+                continue                          # 没改动过：整张原样保留
+            ws = wb[name] if name in wb.sheetnames else wb.create_sheet(title=name)
+            kept_header_formulas += _write_sheet_values(ws, df, clear_stale_fills)
+            for (row, col), formula in formulas.get(name, {}).items():
+                # +2: 跳过表头行且 openpyxl 从 1 开始计数
+                ws.cell(row=row + 2, column=col + 1, value=formula)
+            _apply_fills(ws, cell_colors.get(name, {}), fill_cache)
+        wb._sheets = [wb[n] for n in order if n in wb.sheetnames]
+        wb.properties.keywords = COORD_MARKER
+        wb.save(tmp_path)
+        wb.close()
+        _replace_file(tmp_path, dest_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    return {"kept_header_formulas": kept_header_formulas}
 
 
 def save_csv(file_path, df: pd.DataFrame, encoding=None):

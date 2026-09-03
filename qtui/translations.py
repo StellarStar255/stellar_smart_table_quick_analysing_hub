@@ -103,6 +103,13 @@ TRANSLATIONS = {
     '正在保存 {} ...': 'Saving {} ...',
     '保存失败，详情见终端输出': 'Save failed; see terminal output for details',
     '已保存: {}': 'Saved: {}',
+    '这个文件里的以下内容，本程序保存后会丢失：\n\n{}\n\n其余内容（透视表、公式、条件格式、数据验证、列宽、图表、图片）会原样保留。\n\n继续保存？取消的话可以用「另存为」写到新文件。':
+        'Saving with this app will drop the following from this file:\n\n{}\n\n'
+        'Everything else (pivot tables, formulas, conditional formatting, data '
+        'validation, column widths, charts, images) is kept as is.\n\n'
+        'Save anyway? Cancel to write to a new file with Save As.',
+    '{} 个表头公式已原样保留（改名请在 Excel 中改）':
+        '{} header formula(s) kept as is (rename them in Excel)',
     '导入CSV': 'Import CSV',
     'CSV (*.csv *.tsv);;所有文件 (*)': 'CSV (*.csv *.tsv);;All Files (*)',
     '导出CSV': 'Export CSV',
