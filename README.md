@@ -93,8 +93,10 @@ python smart_table_quick_analysing_hub_qt.py -h
 - `Ctrl+Y`: Redo
 - `Ctrl+C`: Copy
 - `Ctrl+V`: Paste
-- `Delete`: Delete selected rows
-- `Enter`: Edit cell
+- `Delete` / `Backspace`: Clear selected cells
+- Just type on a selected cell to overwrite it (Excel-style); arrow keys commit and move
+- `Enter`: Commit and move down (`Shift+Enter` moves up); `Tab` commits and moves right, and a following `Enter` returns to the column where you started tabbing
+- `F2` / double-click: Edit in place with the caret at the end; `Esc` cancels
 
 **Navigation** ✨New
 - `↑` / `↓`: Move up/down (auto page-turn at boundaries)
@@ -361,8 +363,10 @@ python smart_table_quick_analysing_hub_qt.py -h
 - `Ctrl+Y`: 重做
 - `Ctrl+C`: 复制
 - `Ctrl+V`: 粘贴
-- `Delete`: 删除选中行
-- `Enter`: 编辑单元格
+- `Delete` / `Backspace`: 清空选中单元格
+- 选中单元格后直接打字即覆盖输入（与 Excel 一致），方向键提交并移动
+- `Enter`: 提交并下移（`Shift+Enter` 上移）；`Tab` 提交并右移，之后按 `Enter` 回到开始 Tab 的那一列
+- `F2` / 双击: 光标编辑模式（光标在末尾），`Esc` 取消
 
 **导航操作** ✨新
 - `↑` / `↓`: 上下移动（到边界时自动翻页）

@@ -30,7 +30,9 @@ def _has_leading_zero_text(series) -> bool:
 
     转成数值会丢前导零——属于静默修改用户数据，这类列必须保持文本。
     """
-    if not pd.api.types.is_object_dtype(series.dtype):
+    # pandas 3 起文本列默认是 str dtype（不再是 object），两种都要认
+    if not (pd.api.types.is_object_dtype(series.dtype)
+            or pd.api.types.is_string_dtype(series.dtype)):
         return False
     text = series.dropna().astype(str).str.strip()
     if text.empty:

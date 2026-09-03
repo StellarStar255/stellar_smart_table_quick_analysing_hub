@@ -121,7 +121,28 @@ class _FastCellDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         editor = super().createEditor(parent, option, index)
         self.active_editor = editor
+        view = self.parent()
+        # 打字模式（直接敲字开始的编辑，Excel 的 Enter 模式）：方向键提交并移动；
+        # 光标模式（F2/双击）：方向键在文本内移动光标，且光标放到末尾而不是全选
+        typing = bool(getattr(view, "_typing_pending", False))
+        editor._typing_mode = typing
+        if not typing and isinstance(editor, QLineEdit):
+            QTimer.singleShot(0, lambda e=editor: self._caret_to_end(e))
         return editor
+
+    @staticmethod
+    def _caret_to_end(editor):
+        try:
+            if editor.isVisible():
+                editor.deselect()
+                editor.end(False)
+        except RuntimeError:
+            pass   # 编辑器已销毁
+
+    _ARROW_DELTAS = {
+        Qt.Key.Key_Down: (1, 0), Qt.Key.Key_Up: (-1, 0),
+        Qt.Key.Key_Left: (0, -1), Qt.Key.Key_Right: (0, 1),
+    }
 
     def destroyEditor(self, editor, index):
         if editor is self.active_editor:
@@ -129,6 +150,28 @@ class _FastCellDelegate(QStyledItemDelegate):
         super().destroyEditor(editor, index)
 
     def eventFilter(self, editor, event):
+        view = self.parent()
+        if (event.type() == QEvent.Type.KeyPress and editor is self.active_editor
+                and isinstance(editor, QLineEdit) and isinstance(view, _ExcelTableView)):
+            key = event.key()
+            mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                view.commit_and_move(editor, -1 if shift else 1, 0, enter=True)
+                return True
+            if key == Qt.Key.Key_Tab:
+                view.commit_and_move(editor, 0, 1, tab=True)
+                return True
+            if key == Qt.Key.Key_Backtab:
+                view.commit_and_move(editor, 0, -1, tab=True)
+                return True
+            if (key in self._ARROW_DELTAS and mods == Qt.KeyboardModifier.NoModifier
+                    and getattr(editor, "_typing_mode", False)
+                    and not editor.text().startswith("=")):
+                # 打字模式下方向键 = 提交并移动（公式输入除外：保留光标移动/点选）
+                dr, dc = self._ARROW_DELTAS[key]
+                view.commit_and_move(editor, dr, dc)
+                return True
         # 公式点选引用（Excel point mode）：正在输入公式且光标处可插入
         # 引用时，点击表格导致的失焦不提交编辑器——随后视图的
         # mousePressEvent 会把点中的单元格引用插入公式
@@ -220,10 +263,44 @@ class _ExcelTableView(QTableView):
     _fill_source = None    # 拖拽起始选区 (top, left, bottom, right)，视图行号
     _fill_target = None    # 拖拽预览区域（含源区），同上格式
 
+    _typing_pending = False   # 本次按键将以"打字模式"打开编辑器
+    _tab_origin_col = None    # 连续 Tab 的起点列：回车后回到该列（Excel 语义）
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # 悬停填充柄要变十字光标，需要无按键的 move 事件
         self.viewport().setMouseTracking(True)
+
+    # ---------- Excel 式提交与移动 ----------
+
+    def move_relative(self, dr, dc, enter=False, tab=False):
+        """当前格相对移动并滚动到可见。enter=True 时若之前连续按过 Tab，
+        回到起点列；tab=True 记录起点列。"""
+        m = self.model()
+        cur = self.currentIndex()
+        if m is None or not cur.isValid():
+            return
+        row, col = cur.row(), cur.column()
+        if enter and self._tab_origin_col is not None:
+            col = self._tab_origin_col
+            self._tab_origin_col = None
+        elif tab:
+            if self._tab_origin_col is None:
+                self._tab_origin_col = col
+        else:
+            self._tab_origin_col = None
+        row = min(max(row + dr, 0), m.rowCount() - 1)
+        col = min(max(col + dc, 0), m.columnCount() - 1)
+        target = m.index(row, col)
+        if target.isValid():
+            self.setCurrentIndex(target)
+            self.scrollTo(target)
+
+    def commit_and_move(self, editor, dr, dc, enter=False, tab=False):
+        """提交编辑器内容、关闭编辑器（不自动打开下一格的编辑器），再移动。"""
+        self.commitData(editor)
+        self.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+        self.move_relative(dr, dc, enter=enter, tab=tab)
 
     def _formula_editor(self):
         """正在编辑且内容以 = 开头的单元格编辑器；否则 None。"""
@@ -388,12 +465,38 @@ class _ExcelTableView(QTableView):
     # ---------- 鼠标事件分发（公式点选 / 填充柄 / 默认） ----------
 
     def keyPressEvent(self, event):
-        # Cmd/Ctrl+方向键：跳到表格边缘；加 Shift 扩展选区到边缘
-        # （Excel 语义；macOS 上 Cmd 映射为 Qt 的 ControlModifier）
         key = event.key()
         mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
         arrows = (Qt.Key.Key_Down, Qt.Key.Key_Up,
                   Qt.Key.Key_Left, Qt.Key.Key_Right)
+        editing = self.state() == QAbstractItemView.State.EditingState
+        if not editing:
+            # 非编辑状态：回车下移（Shift 上移）、Tab 右移（Shift+Tab 左移），
+            # 不打开编辑器——Qt 在 macOS 上默认回车会开编辑器，与 Excel 不符
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            plain = not (mods & ~Qt.KeyboardModifier.ShiftModifier)
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and plain:
+                self.move_relative(-1 if shift else 1, 0, enter=True)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Tab and plain:
+                self.move_relative(0, 1, tab=True)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Backtab:
+                self.move_relative(0, -1, tab=True)
+                event.accept()
+                return
+            if key in arrows or key in (Qt.Key.Key_Home, Qt.Key.Key_End,
+                                        Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                self._tab_origin_col = None
+            if key == Qt.Key.Key_F2 and plain and self.currentIndex().isValid():
+                # macOS 上 Qt 不把 F2 绑定为编辑键；Excel 语义：F2 进入光标编辑模式
+                self.edit(self.currentIndex())
+                event.accept()
+                return
+        # Cmd/Ctrl+方向键：跳到表格边缘；加 Shift 扩展选区到边缘
+        # （Excel 语义；macOS 上 Cmd 映射为 Qt 的 ControlModifier）
         if (key in arrows
                 and mods & Qt.KeyboardModifier.ControlModifier
                 and not mods & ~(Qt.KeyboardModifier.ControlModifier
@@ -449,9 +552,19 @@ class _ExcelTableView(QTableView):
                         tr("已清除 {} 个单元格").format(cleared))
                 event.accept()
                 return
-        super().keyPressEvent(event)
+        # 直接打字（无 Ctrl/Alt/Meta 的可打印字符）：以打字模式打开编辑器
+        self._typing_pending = (
+            not editing and bool(event.text()) and event.text().isprintable()
+            and not (mods & (Qt.KeyboardModifier.ControlModifier
+                             | Qt.KeyboardModifier.AltModifier
+                             | Qt.KeyboardModifier.MetaModifier)))
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self._typing_pending = False
 
     def mousePressEvent(self, event):
+        self._tab_origin_col = None
         editor = self._formula_editor()
         if editor is not None and event.button() == Qt.MouseButton.LeftButton:
             idx = self.indexAt(event.position().toPoint())
@@ -542,23 +655,14 @@ class _ExcelTableView(QTableView):
         super().mouseDoubleClickEvent(event)
 
     def closeEditor(self, editor, hint):
-        if hint == QAbstractItemDelegate.EndEditHint.SubmitModelCache:
-            super().closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
-            cur = self.currentIndex()
-            if cur.isValid():
-                nxt = self.model().index(cur.row() + 1, cur.column())
-                if nxt.isValid():
-                    self.setCurrentIndex(nxt)
-                    self.scrollTo(nxt)
-                    # 等旧编辑器完全关闭后再打开新编辑器
-                    QTimer.singleShot(0, self._edit_current)
-            return
+        # 回车/Tab 的移动由 commit_and_move 处理；Qt 自带的 EditNextItem /
+        # SubmitModelCache 提示会顺手在目标格再开一个编辑器（旧行为），
+        # 这会让随后的方向键落在编辑器里而不是移动单元格——统一按 NoHint 关闭
+        if hint in (QAbstractItemDelegate.EndEditHint.SubmitModelCache,
+                    QAbstractItemDelegate.EndEditHint.EditNextItem,
+                    QAbstractItemDelegate.EndEditHint.EditPreviousItem):
+            hint = QAbstractItemDelegate.EndEditHint.NoHint
         super().closeEditor(editor, hint)
-
-    def _edit_current(self):
-        idx = self.currentIndex()
-        if idx.isValid() and self.state() != QAbstractItemView.State.EditingState:
-            self.edit(idx)
 
 
 class MainWindow(QMainWindow):
@@ -605,10 +709,12 @@ class MainWindow(QMainWindow):
         self._cell_delegate = _FastCellDelegate(self.model, self.table)
         self.table.setItemDelegate(self._cell_delegate)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Excel 语义：选中后直接打字即覆盖式编辑（AnyKeyPressed），
+        # 双击 / F2 进入光标编辑；不用 SelectedClicked（慢速二次单击会误开编辑器）
         self.table.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
-            | QAbstractItemView.EditTrigger.SelectedClicked
-            | QAbstractItemView.EditTrigger.EditKeyPressed)
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.AnyKeyPressed)
         self.table.horizontalHeader().setDefaultSectionSize(140)
         # 列头单击仅选中整列，不触发排序——大表排序开销大且易误触，
         # 排序走工具栏/菜单/右键三个显式入口
