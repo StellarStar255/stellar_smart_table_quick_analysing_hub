@@ -679,3 +679,103 @@ class TestRemapFormulaRows:
 
     def test_non_formula_unchanged(self, engine):
         assert engine.remap_formula_rows('hello', {0: 1}) == 'hello'
+
+
+# ---------- 全面审查回归：区域空白、位置引用、运算符与文本函数 ----------
+
+class TestBlankCellsInRanges:
+    """区域里的空白单元格是空白，不是 0（COUNT/AVERAGE/MIN 才与 Excel 一致）"""
+
+    @pytest.fixture
+    def gaps(self):
+        return FormulaEngine(pd.DataFrame({'X': [10.0, None, None, 20.0]}))
+
+    def test_count_and_counta_skip_blanks(self, gaps):
+        assert gaps.evaluate('=COUNT(A2:A5)') == 2
+        assert gaps.evaluate('=COUNTA(A2:A5)') == 2
+
+    def test_average_min_ignore_blanks(self, gaps):
+        assert gaps.evaluate('=AVERAGE(A2:A5)') == 15
+        assert gaps.evaluate('=MIN(A2:A5)') == 10
+
+    def test_over_provisioned_range(self, gaps):
+        # 常见写法：区域远大于数据行数，越界行不能算成 0
+        assert gaps.evaluate('=AVERAGE(A2:A100)') == 15
+        assert gaps.evaluate('=COUNTIF(A2:A100, "<15")') == 1
+
+    def test_countif_blank_criteria(self, gaps):
+        assert gaps.evaluate('=COUNTIF(A2:A5, "")') == 2
+
+    def test_scalar_blank_ref_is_still_zero(self, gaps):
+        assert gaps.evaluate('=A3+1') == 1
+        assert gaps.evaluate('=A99+1') == 1
+
+    def test_range_result_single_cell_and_multi(self, gaps):
+        assert gaps.evaluate('=A2:A2') == 10
+        assert gaps.evaluate('=A2:A5') == '#VALUE!'
+
+    def test_reversed_range(self, gaps):
+        assert gaps.evaluate('=SUM(A5:A2)') == 30
+
+
+class TestPositionalColumnRefs:
+    def test_out_of_range_column_is_blank_not_named_column(self):
+        # 第二列恰好叫 "C"：=C2 是第三列（不存在），不能读到第二列
+        e = FormulaEngine(pd.DataFrame({'A': [1.0], 'C': [99.0]}))
+        assert e.evaluate('=C2') == 0
+        assert e.evaluate('=B2') == 99
+        assert e.extract_dependencies('=C2+B2') == {(0, 2), (0, 1)}
+
+    def test_range_dependencies_clipped_to_table(self):
+        e = FormulaEngine(pd.DataFrame({'A': [1.0, 2.0]}))
+        assert e.extract_dependencies('=SUM(A2:A100)') == {(0, 0), (1, 0)}
+        assert e.extract_dependencies('=SUM(A1:A3)') == {(-1, 0), (0, 0), (1, 0)}
+
+    def test_string_literal_is_not_a_reference(self):
+        e = FormulaEngine(pd.DataFrame({'A': [1.0, 2.0]}))
+        assert e.extract_dependencies('=CONCAT("A2", A3)') == {(1, 0)}
+
+
+class TestOperatorsAndText:
+    @pytest.fixture
+    def nums(self):
+        return FormulaEngine(pd.DataFrame({'X': [10.0, 2.5, 0.125]}))
+
+    def test_caret_is_power(self, nums):
+        assert nums.evaluate('=2^3') == 8
+        assert nums.evaluate('=A2^2') == 100
+
+    def test_round_half_up(self, nums):
+        assert nums.evaluate('=ROUND(A3, 0)') == 3
+        assert nums.evaluate('=ROUND(A4, 2)') == 0.13
+        assert nums.evaluate('=ROUND(-2.5, 0)') == -3
+        assert nums.evaluate('=ROUND(1234, -2)') == 1200
+        assert nums.evaluate('=ROUNDUP(1.21, 1)') == 1.3
+        assert nums.evaluate('=ROUNDDOWN(1.29, 1)') == 1.2
+
+    def test_text_functions_see_integers_without_decimal(self, nums):
+        assert nums.evaluate('=LEN(A2)') == 2
+        assert nums.evaluate('=LEFT(A2, 1)') == '1'
+        assert nums.evaluate('=RIGHT(A2, 1)') == '0'
+        assert nums.evaluate('=CONCAT(A2, "-", A3)') == '10-2.5'
+        assert nums.evaluate('=CONCAT(TRUE, "")') == 'TRUE'
+
+    def test_non_finite_cell_is_num_error(self):
+        e = FormulaEngine(pd.DataFrame({'X': [float('inf')]}))
+        assert e.evaluate('=A2+1') == '#NUM!'
+        assert e.evaluate('=SUM(A2:A2)') == '#NUM!'
+
+
+class TestSingleRowRangeRemap:
+    def test_single_row_range_follows_row(self):
+        e = FormulaEngine()
+        assert e.remap_formula_rows('=SUM(A2:C2)', {0: 3}) == '=SUM(A5:C5)'
+        # 多行区域保持不变
+        assert e.remap_formula_rows('=SUM(A2:A9)', {0: 3}) == '=SUM(A2:A9)'
+        # 绝对行不动
+        assert e.remap_formula_rows('=SUM(A$2:C$2)', {0: 3}) == '=SUM(A$2:C$2)'
+
+    def test_single_row_range_is_not_partial(self):
+        e = FormulaEngine()
+        assert not e.formula_has_partial_ranges('=SUM(A2:C2)', 10)
+        assert e.formula_has_partial_ranges('=SUM(A2:A3)', 10)

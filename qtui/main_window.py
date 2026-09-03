@@ -12,6 +12,7 @@ Qt 的 QTableView 是虚拟化渲染，因此旧版的行分页、列分页、�
 import csv
 import io
 import os
+import re
 from collections import OrderedDict
 
 import numpy as np
@@ -29,7 +30,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate,
     QStyle, QMenu, QCheckBox, QDialog,
     QDialogButtonBox, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QApplication, QFrame, QDockWidget, QLineEdit,
+    QApplication, QDockWidget, QLineEdit,
 )
 
 from core.formula_engine import FormulaEngine
@@ -38,6 +39,26 @@ from .pandas_model import PandasTableModel, to_numeric_or_keep
 
 # 视图第 0 行是虚拟表头行；所有视图行 <-> 数据行换算共用此常量
 HEADER_ROWS = PandasTableModel.HEADER_ROWS
+
+
+class _RectSelection:
+    """矩形选区的 (row, col) 成员判断，替代逐格集合（全选时省内存）。"""
+
+    __slots__ = ("r0", "r1", "c0", "c1")
+
+    def __init__(self, r0, r1, c0, c1):
+        self.r0, self.r1, self.c0, self.c1 = r0, r1, c0, c1
+
+    def __contains__(self, rc):
+        r, c = rc
+        return self.r0 <= r <= self.r1 and self.c0 <= c <= self.c1
+
+
+def _isna_scalar(v):
+    try:
+        return v is None or v != v
+    except Exception:
+        return False
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
 from .find_dialog import FindReplaceDialog
@@ -411,14 +432,17 @@ class _ExcelTableView(QTableView):
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier
                 and self.state() != QAbstractItemView.State.EditingState):
             sm = self.selectionModel()
-            indexes = sm.selectedIndexes() if sm is not None else []
-            if indexes:
-                cleared = 0
-                for idx in indexes:
-                    if idx.row() == 0:
-                        continue
-                    if self.model().setData(idx, ''):
-                        cleared += 1
+            ranges = [r for r in sm.selection() if r.isValid()] if sm is not None else []
+            if ranges:
+                model = self.model()
+                nrows = len(model.df)
+                cells = set()
+                for rg in ranges:
+                    # 视图行 -> 数据行；跳过表头行 0
+                    for r in range(max(rg.top(), 1), min(rg.bottom(), nrows) + 1):
+                        for c in range(rg.left(), rg.right() + 1):
+                            cells.add((r - 1, c))
+                cleared = model.clear_cells(cells) if cells else 0
                 win = self.window()
                 if cleared and hasattr(win, 'update_statusbar'):
                     win.update_statusbar(
@@ -550,6 +574,8 @@ class MainWindow(QMainWindow):
         self.sheet_names = []
         self.current_sheet = None
         self._sheet_cache = OrderedDict()  # LRU: sheet名 -> DataFrame
+        # 不可淘汰的 sheet：已修改或不存在于磁盘文件（淘汰后无处可读，保存会丢数据）
+        self._pinned_sheets = set()
         self.active_filters = []
         self.sheet_filters = {}          # sheet名 -> {'filters':…, 'original_df':…, 'idx_map':…}
         self._sheet_formulas = {}        # sheet名 -> {(row, col): "=..."}
@@ -633,6 +659,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._find_dialog = None
+        self._formula_clipboard = None   # 最近一次复制的公式矩阵（见 copy_selection）
+        self._preview_cell = None        # 内容预览框对应的视图坐标
 
         # ---------- 恢复上次的窗口布局（面板位置/大小、工具栏、窗口几何） ----------
         self._settings = QSettings("SmartTableHub", "SmartTableHubQt")
@@ -776,7 +804,8 @@ class MainWindow(QMainWindow):
     def _restart_app(self):
         import subprocess
         import sys as _sys
-        self.close()
+        if not self.close():   # 用户在"未保存"提示里取消
+            return
         if getattr(_sys, "frozen", False):
             args = [_sys.executable]
         else:
@@ -800,7 +829,10 @@ class MainWindow(QMainWindow):
         action = QAction(text, self)
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
-        action.triggered.connect(slot)
+        # triggered(bool) 会把 checked 透传给带可选参数的槽
+        # （insert_row(position=False) 崩溃、new_file(confirm=False) 跳过保存确认），
+        # 统一丢弃信号参数
+        action.triggered.connect(lambda *_a, _s=slot: _s())
         menu.addAction(action)
         return action
 
@@ -813,20 +845,20 @@ class MainWindow(QMainWindow):
                            ("保存", self.save_file), ("保存为", self.save_as_copy),
                            ("关闭文件", self.close_file)):
             btn = QPushButton(tr(text))
-            btn.clicked.connect(slot)
+            btn.clicked.connect(lambda *_a, _s=slot: _s())
             tb.addWidget(btn)
         tb.addSeparator()
         for text, slot in (("撤销", self.undo), ("重做", self.redo),
                            ("查找", self.open_find_dialog)):
             btn = QPushButton(tr(text))
-            btn.clicked.connect(slot)
+            btn.clicked.connect(lambda *_a, _s=slot: _s())
             tb.addWidget(btn)
         tb.addSeparator()
         for text, slot in (("插入行", self.insert_row), ("删除行", self.delete_selected_rows),
                            ("排序", self.sort_dialog), ("筛选", self.open_filter_dialog),
                            ("统计", self.show_statistics)):
             btn = QPushButton(tr(text))
-            btn.clicked.connect(slot)
+            btn.clicked.connect(lambda *_a, _s=slot: _s())
             tb.addWidget(btn)
         tb.addSeparator()
 
@@ -971,18 +1003,21 @@ class MainWindow(QMainWindow):
         """供分析窗口回调：把 DataFrame 存为新 sheet。"""
         if not isinstance(df, pd.DataFrame):
             raise TypeError("需要 DataFrame")
-        name = str(name)[:31] or tr("结果")
+        # 程序化入口：自动清洗成合法 sheet 名（非法字符→_，≤31 字符，不区分大小写去重）
+        name = re.sub(r'[\\/?*\[\]:]', '_', str(name)).strip()[:31] or tr("结果")
         if not self.sheet_names:
             self.sheet_names = ["Sheet1"]
             self.current_sheet = "Sheet1"
-            self._cache_sheet("Sheet1", self.model.df)
+            self._cache_sheet("Sheet1", self.model.df, pin=True)
         base = name
         i = 1
-        while name in self.sheet_names:
-            name = f"{base}_{i}"
+        existing = {n.lower() for n in self.sheet_names}
+        while name.lower() in existing:
+            suffix = f"_{i}"
+            name = base[:31 - len(suffix)] + suffix
             i += 1
         self.sheet_names.append(name)
-        self._cache_sheet(name, df.reset_index(drop=True))
+        self._cache_sheet(name, df.reset_index(drop=True), pin=True)
         self._refresh_sheet_combo()
         self._mark_modified()
         self.update_statusbar(tr("已添加 Sheet: {}（保存文件后写入文件）").format(name))
@@ -1010,6 +1045,7 @@ class MainWindow(QMainWindow):
         self.sheet_names = []
         self.current_sheet = None
         self._sheet_cache.clear()
+        self._pinned_sheets.clear()
         self._reset_filter_state()
         self.sheet_filters.clear()
         self._sheet_formulas.clear()
@@ -1074,7 +1110,8 @@ class MainWindow(QMainWindow):
 
         def done(result):
             if result is None:
-                QMessageBox.critical(self, tr("打开文件"), tr("加载失败:\n{}").format(path))
+                self._show_error(tr("打开文件"), tr("加载失败:\n{}").format(path),
+                                 dialog.last_error)
                 return
             kind, excel_file, sheets, active_sheet, df, formulas, colors = result
             self.current_file = path
@@ -1082,6 +1119,7 @@ class MainWindow(QMainWindow):
             self.sheet_names = sheets
             self.current_sheet = active_sheet if sheets else None
             self._sheet_cache.clear()
+            self._pinned_sheets.clear()
             self.sheet_filters.clear()
             self._sheet_formulas.clear()
             self._sheet_colors.clear()
@@ -1109,21 +1147,47 @@ class MainWindow(QMainWindow):
         dialog.run_in_background(work, done)
 
     def save_file(self):
+        """保存到当前文件。未命名或旧版 .xls（只能写出 xlsx）时转到另存为。
+        返回是否真正保存成功——"未保存修改"提示里选"保存"后取消/失败都不能丢数据。"""
         if not self.current_file:
-            self.save_as_copy()
-            return
-        self._do_save(self.current_file)
+            return self._save_as(switch_to=True)
+        if os.path.splitext(self.current_file)[1].lower() == ".xls":
+            QMessageBox.information(
+                self, tr("保存"), tr("旧版 .xls 格式不支持直接保存，将另存为 .xlsx"))
+            return self._save_as(switch_to=True)
+        return self._do_save(self.current_file)
 
     def save_as_copy(self):
+        return self._save_as(switch_to=False)
+
+    def _save_as(self, switch_to):
         default = ""
         if self.current_file:
             base, ext = os.path.splitext(self.current_file)
-            default = tr("{}_副本{}").format(base, ext or ".xlsx")
+            ext = ext.lower() if ext.lower() in (".xlsx", ".csv") else ".xlsx"
+            default = base + ext if switch_to else tr("{}_副本{}").format(base, ext)
         path, _ = QFileDialog.getSaveFileName(
             self, tr("保存为"), default, "Excel (*.xlsx);;CSV (*.csv)")
         if not path:
-            return
-        self._do_save(path, switch_to=False)
+            return False
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".xlsx", ".csv"):
+            path += ".xlsx"
+            ext = ".xlsx"
+        if ext == ".csv" and len(self.sheet_names) > 1:
+            ret = QMessageBox.question(
+                self, tr("保存为"),
+                tr("CSV 只能保存当前 Sheet，其他 {} 个 Sheet 不会写入。是否继续？").format(
+                    len(self.sheet_names) - 1))
+            if ret != QMessageBox.StandardButton.Yes:
+                return False
+        return self._do_save(path, switch_to=switch_to)
+
+    def _show_error(self, title, text, details=None):
+        box = QMessageBox(QMessageBox.Icon.Critical, title, text, parent=self)
+        if details:
+            box.setDetailedText(details)
+        box.exec()
 
     def _collect_all_sheets(self):
         """收集所有 sheet 的数据引用（当前 sheet 用筛选前数据）。
@@ -1148,7 +1212,9 @@ class MainWindow(QMainWindow):
         return sheets, list(self.sheet_names), missing
 
     def _do_save(self, path, switch_to=True):
+        """同步等待后台保存完成（进度框模态），返回是否成功。"""
         ext = os.path.splitext(path)[1].lower()
+        saved = [False]
         dialog = LoadingProgressDialog(self, tr("保存中"), tr("正在保存 {} ...").format(os.path.basename(path)))
         dialog.set_indeterminate()
 
@@ -1175,11 +1241,24 @@ class MainWindow(QMainWindow):
                 if current_colors:
                     colors_map["Sheet1"] = dict(current_colors)
 
+            # 从未切换到过的 sheet（含删除 sheet 时预载进缓存的）没有公式/颜色底账，
+            # 必须从原文件补读，否则它们的公式会被写成静态值、背景色丢失
+            source_file = self.current_file
+            on_disk = set(excel_file.sheet_names) if excel_file is not None else set()
+            need_meta = [n for n in order
+                         if n != self.current_sheet and n in on_disk and source_file
+                         and (n not in formulas_map or n not in colors_map)]
+
             def work():
                 # 未缓存 sheet 的读盘和写盘都在后台线程完成，UI 不冻结
                 for name in missing:
                     dialog.report(tr("正在读取 {} ...").format(name))
                     sheets[name] = file_io.read_sheet(excel_file, name)
+                for name in need_meta:
+                    if name not in formulas_map:
+                        formulas_map[name] = file_io.read_sheet_formulas(source_file, name)
+                    if name not in colors_map:
+                        colors_map[name] = file_io.read_sheet_colors(source_file, name)
                 file_io.save_workbook(
                     path, sheets, order, formulas_map,
                     progress_cb=lambda name, i, total: dialog.report(
@@ -1190,8 +1269,10 @@ class MainWindow(QMainWindow):
             # run_in_background 失败时回调 None；成功且 work 返回 None 无法区分，
             # 因此 work 内部约定返回 True
             if result is not True:
-                QMessageBox.critical(self, tr("保存"), tr("保存失败，详情见终端输出"))
+                self._show_error(tr("保存"), tr("保存失败:\n{}").format(path),
+                                 dialog.last_error)
                 return
+            saved[0] = True
             if switch_to or path == self.current_file:
                 self.current_file = path
                 if ext != ".csv":
@@ -1199,16 +1280,23 @@ class MainWindow(QMainWindow):
                     if self.current_sheet not in self.sheet_names:
                         self.current_sheet = self.sheet_names[0]
                     self._refresh_sheet_combo()
+                    # 全部 sheet 已落盘，可以重新参与缓存淘汰
+                    self._pinned_sheets.clear()
                 self.model.modified = False
                 self._update_title()
             self.recent_files = file_io.add_recent_file(self.recent_files, path)
             self._save_recent()
             self._rebuild_recent_menu()
             self._save_file_config()   # 记住当前 sheet，重开时恢复
-            self.update_statusbar(tr("已保存: {}").format(path))
+            msg = tr("已保存: {}").format(path)
+            if self.active_filters and self.model.formulas:
+                msg += tr("；") + tr("筛选中输入的 {} 个公式已按静态值保存").format(
+                    len(self.model.formulas))
+            self.update_statusbar(msg)
 
         inner = work
         dialog.run_in_background(lambda: (inner(), True)[1], done)
+        return saved[0]
 
     def import_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, tr("导入CSV"), "", tr("CSV (*.csv *.tsv);;所有文件 (*)"))
@@ -1231,12 +1319,12 @@ class MainWindow(QMainWindow):
     def _rebuild_recent_menu(self):
         self._recent_menu.clear()
         for path in self.recent_files:
-            action = QAction(path, self)
+            action = QAction(path, self._recent_menu)
             action.triggered.connect(lambda checked=False, p=path: self.load_file(p))
             self._recent_menu.addAction(action)
         if self.recent_files:
             self._recent_menu.addSeparator()
-            clear = QAction(tr("清除记录"), self)
+            clear = QAction(tr("清除记录"), self._recent_menu)
             clear.triggered.connect(self._clear_recent)
             self._recent_menu.addAction(clear)
 
@@ -1271,7 +1359,8 @@ class MainWindow(QMainWindow):
             self._auto_save_timer.stop()
 
     def _do_auto_save(self):
-        if self.model.modified and self.current_file:
+        if (self.model.modified and self.current_file
+                and not self.current_file.lower().endswith(".xls")):
             self._do_save(self.current_file)
 
     def _check_save_before_discard(self):
@@ -1285,7 +1374,8 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.StandardButton.Cancel:
             return False
         if ret == QMessageBox.StandardButton.Save:
-            self.save_file()
+            # 另存对话框被取消或保存失败时，不能继续丢弃数据
+            return bool(self.save_file())
         return True
 
     # ================= Sheet 管理 =================
@@ -1299,11 +1389,22 @@ class MainWindow(QMainWindow):
         self.sheet_combo.setEnabled(bool(self.sheet_names))
         self.sheet_combo.blockSignals(False)
 
-    def _cache_sheet(self, name, df):
+    def _cache_sheet(self, name, df, pin=False):
+        """缓存 sheet 数据。pin=True 表示该 sheet 只存在于内存（新建/已修改），
+        绝不能被淘汰——淘汰后保存时只能从原文件重读，用户的修改会静默丢失。"""
         self._sheet_cache[name] = df
         self._sheet_cache.move_to_end(name)
-        while len(self._sheet_cache) > MAX_SHEET_CACHE:
-            self._sheet_cache.popitem(last=False)
+        if pin:
+            self._pinned_sheets.add(name)
+        if len(self._sheet_cache) <= MAX_SHEET_CACHE:
+            return
+        on_disk = set(self._excel_file.sheet_names) if self._excel_file is not None else set()
+        for old in list(self._sheet_cache):
+            if len(self._sheet_cache) <= MAX_SHEET_CACHE:
+                break
+            if old in self._pinned_sheets or old not in on_disk:
+                continue   # 只能淘汰"未修改且可从文件重读"的 sheet
+            del self._sheet_cache[old]
 
     def _on_sheet_combo_changed(self, name):
         if not name or name == self.current_sheet:
@@ -1315,7 +1416,8 @@ class MainWindow(QMainWindow):
         dropped_view_formulas = 0
         if self.current_sheet:
             full = self.original_df if self.original_df is not None else self.model.df
-            self._cache_sheet(self.current_sheet, full)
+            # modified 是整个文档的标志：为 True 时当前 sheet 可能被改过，保守钉住
+            self._cache_sheet(self.current_sheet, full, pin=self.model.modified)
             self._sheet_formulas[self.current_sheet] = dict(self._live_formulas())
             # 背景色权威副本：筛选中为原始行坐标底账
             self._sheet_colors[self.current_sheet] = dict(
@@ -1342,15 +1444,19 @@ class MainWindow(QMainWindow):
             try:
                 df = file_io.read_sheet(self._excel_file, name)
                 self._cache_sheet(name, df)
-                if formulas is None and self.current_file:
-                    formulas = file_io.read_sheet_formulas(self.current_file, name)
-                if colors is None and self.current_file:
-                    colors = file_io.read_sheet_colors(self.current_file, name)
             except Exception as e:
                 QMessageBox.critical(self, tr("切换Sheet"), tr("读取 sheet 失败: {}").format(e))
+                self._refresh_sheet_combo()   # 下拉框回到实际停留的 sheet
                 return
         else:
             df = pd.DataFrame()
+        # 公式/背景色首次访问时从文件读（删除 sheet 时预载进缓存的 sheet 也需要）
+        on_disk = (self._excel_file is not None and name in self._excel_file.sheet_names)
+        if self.current_file and on_disk:
+            if formulas is None:
+                formulas = file_io.read_sheet_formulas(self.current_file, name)
+            if colors is None:
+                colors = file_io.read_sheet_colors(self.current_file, name)
         colors = colors or {}
 
         self.current_sheet = name
@@ -1364,6 +1470,7 @@ class MainWindow(QMainWindow):
             # 公式保持挂起（original_df 坐标），清除筛选时恢复
             self._suspended_formulas = dict(formulas) if formulas else None
             filtered, idx_map = filter_engine.apply_filters(df, self.active_filters)
+            self._report_filter_errors()
             self._filtered_idx_map = idx_map
             self.model.set_dataframe(filtered)
             # 颜色底账按原始坐标保存，映射到筛选后的显示行
@@ -1386,16 +1493,20 @@ class MainWindow(QMainWindow):
         else:
             self.update_statusbar()
 
+    def _valid_sheet_name(self, title, name):
+        """Excel 的 sheet 名限制在输入时就检查，而不是保存时才报错。"""
+        err = file_io.check_sheet_name(name, self.sheet_names)
+        if err:
+            QMessageBox.warning(self, title, err)
+            return False
+        return True
+
     def create_new_sheet(self):
         name, ok = QInputDialog.getText(self, tr("新建Sheet"), tr("Sheet 名称:"))
         if not ok or not name.strip():
             return
         name = name.strip()
-        if any(c in name for c in r'\/?*[]:'):
-            QMessageBox.warning(self, tr("新建Sheet"), tr(r"名称不能包含 \ / ? * [ ] :"))
-            return
-        if name in self.sheet_names:
-            QMessageBox.warning(self, tr("新建Sheet"), tr("Sheet '{}' 已存在").format(name))
+        if not self._valid_sheet_name(tr("新建Sheet"), name):
             return
         cols = [_col_letter(i) for i in range(10)]
         df = pd.DataFrame(np.full((DEFAULT_ROWS, len(cols)), np.nan), columns=cols)
@@ -1403,9 +1514,9 @@ class MainWindow(QMainWindow):
             # 当前是单表（CSV/空白），把现有数据变成 Sheet1
             self.sheet_names = ["Sheet1"]
             self.current_sheet = "Sheet1"
-            self._cache_sheet("Sheet1", self.model.df)
+            self._cache_sheet("Sheet1", self.model.df, pin=True)
         self.sheet_names.append(name)
-        self._cache_sheet(name, df)
+        self._cache_sheet(name, df, pin=True)
         self.switch_sheet(name)
         self._mark_modified()
 
@@ -1414,15 +1525,14 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
         name = name.strip()
-        if name in self.sheet_names:
-            QMessageBox.warning(self, tr("保存为新Sheet"), tr("Sheet '{}' 已存在").format(name))
+        if not self._valid_sheet_name(tr("保存为新Sheet"), name):
             return
         if not self.sheet_names:
             self.sheet_names = ["Sheet1"]
             self.current_sheet = "Sheet1"
-            self._cache_sheet("Sheet1", self.model.df)
+            self._cache_sheet("Sheet1", self.model.df, pin=True)
         self.sheet_names.append(name)
-        self._cache_sheet(name, self.model.df.copy())
+        self._cache_sheet(name, self.model.df.copy(), pin=True)
         self._mark_modified()
         self._refresh_sheet_combo()
         self.update_statusbar(tr("已添加 Sheet: {}（保存文件后生效）").format(name))
@@ -1464,8 +1574,10 @@ class MainWindow(QMainWindow):
         self.sheet_names = [n for n in self.sheet_names if n not in to_delete]
         for name in to_delete:
             self._sheet_cache.pop(name, None)
+            self._pinned_sheets.discard(name)
             self.sheet_filters.pop(name, None)
             self._sheet_formulas.pop(name, None)
+            self._sheet_colors.pop(name, None)
         if self.current_sheet in to_delete:
             self.switch_sheet(self.sheet_names[0])
         else:
@@ -1504,22 +1616,33 @@ class MainWindow(QMainWindow):
         # 筛选状态下把编辑同步回 original_df（视图行 0 是表头行，
         # 重命名联动由 columnRenamed 信号统一处理，这里跳过）
         if self.original_df is not None and self._filtered_idx_map:
-            for view_row in range(top_left.row(), bottom_right.row() + 1):
-                if view_row == 0:
-                    continue
-                row = view_row - HEADER_ROWS
-                if row >= len(self._filtered_idx_map):
-                    continue
-                orig_label = self._filtered_idx_map[row]
-                for col in range(top_left.column(), bottom_right.column() + 1):
-                    colname = self.model.df.columns[col]
-                    try:
-                        self.original_df.loc[orig_label, colname] = self.model.df.iat[row, col]
+            r0 = max(top_left.row(), HEADER_ROWS) - HEADER_ROWS
+            r1 = min(bottom_right.row() - HEADER_ROWS, len(self._filtered_idx_map) - 1)
+            if r1 < r0:
+                return
+            orig_labels = self._filtered_idx_map[r0:r1 + 1]
+            view_df = self.model.df
+            for col in range(top_left.column(), bottom_right.column() + 1):
+                colname = view_df.columns[col]
+                values = view_df.iloc[r0:r1 + 1, col].to_numpy()
+                if values.dtype == object:
+                    try:   # 全数值的 object 数组压成 float/int，避免 pandas 升型警告
+                        values = np.asarray(values.tolist())
                     except (ValueError, TypeError):
-                        self.original_df[colname] = self.original_df[colname].astype(object)
-                        self.original_df.loc[orig_label, colname] = self.model.df.iat[row, col]
-                    # 编辑覆盖了挂起的公式单元格 -> 该公式作废，保留新值
-                    if self._suspended_formulas:
+                        pass
+                target = self.original_df[colname]
+                # 文本写入数值列：先整列转 object（pandas 3 起不再隐式升型）
+                if values.dtype.kind in "OUS" and target.dtype != object:
+                    self.original_df[colname] = target.astype(object)
+                    values = values.astype(object)
+                try:
+                    self.original_df.loc[orig_labels, colname] = values
+                except (ValueError, TypeError):
+                    self.original_df[colname] = self.original_df[colname].astype(object)
+                    self.original_df.loc[orig_labels, colname] = values
+                # 编辑覆盖了挂起的公式单元格 -> 该公式作废，保留新值
+                if self._suspended_formulas:
+                    for orig_label in orig_labels:
                         self._suspended_formulas.pop((orig_label, col), None)
         self._mark_modified()
 
@@ -1702,12 +1825,21 @@ class MainWindow(QMainWindow):
             self.active_filters.append(dialog.result)
         self._reapply_filters()
 
+    def _report_filter_errors(self):
+        """筛选条件无法应用（如"大于 abc"）时明确提示，而不是标签挂着却没生效。"""
+        errs = filter_engine.last_errors
+        if errs:
+            detail = "; ".join(
+                "{} {} {}: {}".format(f.get("col"), f.get("condition"), f.get("value"), e)
+                for f, e in errs)
+            QMessageBox.warning(self, tr("筛选"),
+                                tr("以下筛选条件无法应用，已跳过：\n{}").format(detail))
+
     def _freeze_formulas(self, reason):
         """排序/筛选会打乱行位置，公式按位置引用会失效——先转为静态值。"""
         if self.model.formulas:
             n = len(self.model.formulas)
-            self.model.formulas.clear()
-            self.model._dependents.clear()
+            self.model.clear_formulas()   # 公式表与两个依赖索引一起清
             self._sheet_formulas.pop(self.current_sheet, None)
             self.update_statusbar(tr("{}后 {} 个公式已转为静态值").format(reason, n))
 
@@ -1737,12 +1869,12 @@ class MainWindow(QMainWindow):
         if self.original_df is None:
             self.original_df = self.model.df
             self._orig_cell_colors = dict(self.model.cell_colors)
-        self.model.formulas.clear()
-        self.model._dependents.clear()
+        self.model.clear_formulas()   # 公式表与两个依赖索引一起清
         if not self.active_filters:
             self.clear_all_filters()
             return
         filtered, idx_map = filter_engine.apply_filters(self.original_df, self.active_filters)
+        self._report_filter_errors()
         self._filtered_idx_map = idx_map
         # 背景色从原始行坐标映射到筛选后的显示行
         self.model.cell_colors = self._map_colors_to_view(
@@ -1823,16 +1955,30 @@ class MainWindow(QMainWindow):
             if hasattr(w, "copy"):
                 w.copy()
             return
-        indexes = self.table.selectionModel().selectedIndexes()
-        if not indexes:
+        sel_model = self.table.selectionModel()
+        ranges = [r for r in sel_model.selection() if r.isValid() and not r.isEmpty()]
+        if not ranges:
             return
-        rows = sorted({i.row() for i in indexes})
-        cols = sorted({i.column() for i in indexes})
         df = self.model.df
         matrix = []
         if with_headers is None:
             with_headers = self.copy_headers_cb.isChecked()
-        selected = {(i.row(), i.column()) for i in indexes}
+        if len(ranges) == 1:
+            # 单个矩形选区（含全选）：直接切片，避免为每格生成 QModelIndex
+            # ——百万行全选时逐格枚举会耗尽内存
+            rg = ranges[0]
+            r0, r1 = rg.top(), min(rg.bottom(), len(df))
+            c0, c1 = rg.left(), min(rg.right(), len(df.columns) - 1)
+            if r1 < r0 or c1 < c0:
+                return
+            rows = list(range(r0, r1 + 1))
+            cols = list(range(c0, c1 + 1))
+            selected = _RectSelection(r0, r1, c0, c1)
+        else:
+            indexes = sel_model.selectedIndexes()
+            rows = sorted({i.row() for i in indexes})
+            cols = sorted({i.column() for i in indexes})
+            selected = {(i.row(), i.column()) for i in indexes}
         # 选区含视图表头行（行 0）时它本身就是列名行：与"复制列名"选项
         # 合并，保证列名在剪贴板里最多出现一次。勾选选项输出全部列名；
         # 只选中部分表头单元格时，未选中的列留空占位
@@ -1845,15 +1991,21 @@ class MainWindow(QMainWindow):
                 for c in cols])
         header_line = 1 if (with_headers or header_selected) else 0
 
-        for r in rows:
-            row_vals = []
-            for c in cols:
-                if (r, c) in selected:
-                    v = df.iat[r - 1, c]
-                    row_vals.append("" if pd.isna(v) else str(v))
-                else:
-                    row_vals.append("")
-            matrix.append(row_vals)
+        if isinstance(selected, _RectSelection) and rows:
+            block = df.iloc[rows[0] - 1:rows[-1], cols[0]:cols[-1] + 1]
+            arr = block.to_numpy(dtype=object)
+            for row_arr in arr:
+                matrix.append(["" if _isna_scalar(v) else str(v) for v in row_arr])
+        else:
+            for r in rows:
+                row_vals = []
+                for c in cols:
+                    if (r, c) in selected:
+                        v = df.iat[r - 1, c]
+                        row_vals.append("" if pd.isna(v) else str(v))
+                    else:
+                        row_vals.append("")
+                matrix.append(row_vals)
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter="\t", quotechar='"',
                             quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
@@ -1865,7 +2017,13 @@ class MainWindow(QMainWindow):
         row_rank = {r: i for i, r in enumerate(rows)}
         col_rank = {c: i for i, c in enumerate(cols)}
         formula_cells = {}
-        for r, c in selected:
+        if isinstance(selected, _RectSelection):
+            # 公式通常远少于单元格：遍历公式表而不是选区
+            cells = ((dr + HEADER_ROWS, dc) for (dr, dc) in self.model.formulas
+                     if (dr + HEADER_ROWS, dc) in selected)
+        else:
+            cells = selected
+        for r, c in cells:
             if r == 0:
                 continue
             f = self.model.formulas.get((r - HEADER_ROWS, c))
@@ -1893,11 +2051,13 @@ class MainWindow(QMainWindow):
         if mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
-                if path.lower().endswith((".xlsx", ".xls", ".csv", ".tsv")):
+                if path and path.lower().endswith((".xlsx", ".xls", ".csv", ".tsv")):
                     self.load_file(path)
                     return
-            QMessageBox.information(self, tr("粘贴打开"), tr("仅支持 Excel / CSV 文件"))
-            return
+            if not mime.hasText():
+                QMessageBox.information(self, tr("粘贴打开"), tr("仅支持 Excel / CSV 文件"))
+                return
+            # 带 URL 但也有文本（如网页链接）：按普通文本粘贴
         text = QApplication.clipboard().text()
         if not text:
             return
@@ -1986,8 +2146,15 @@ class MainWindow(QMainWindow):
         keep_blank: 保留全空行。公式粘贴按行偏移对齐复制矩阵时必须保留，
         否则空行（如公式结果为空串）会让后续公式错位。
         """
-        first_line = text.splitlines()[0] if text.splitlines() else ""
-        delimiter = "\t" if ("\t" in first_line or "," not in first_line) else ","
+        lines = text.splitlines()
+        if "\t" in text:
+            delimiter = "\t"
+        else:
+            # 没有制表符时，只有多行且每行逗号字段数一致才当 CSV；
+            # 单个含逗号的值（如 "Smith, John"）与 Excel 一样保持为一格
+            counts = {len(next(csv.reader([ln]))) for ln in lines if ln.strip()}
+            delimiter = "," if (len(lines) > 1 and len(counts) == 1
+                                and counts.pop() > 1) else "\t"
         reader = csv.reader(io.StringIO(text), delimiter=delimiter)
         if keep_blank:
             return list(reader)
@@ -2035,7 +2202,7 @@ class MainWindow(QMainWindow):
             df = pd.DataFrame(norm[1:], columns=headers)
         else:
             df = pd.DataFrame(norm, columns=[_col_letter(i) for i in range(width)])
-        df = df.apply(to_numeric_or_keep) if hasattr(df, "apply") else df
+        df = df.apply(to_numeric_or_keep)
         self.model.set_dataframe(df, mark_modified=True)
         self._mark_modified()
         self.update_statusbar(tr("已从剪贴板载入 {} 行 × {} 列").format(len(df), len(df.columns)))
@@ -2112,6 +2279,10 @@ class MainWindow(QMainWindow):
     # ================= 单元格内容预览 =================
 
     def _on_current_cell_changed(self, current, previous):
+        # 400ms 延迟保存还没触发就切换单元格：先写回原单元格，否则编辑丢失
+        if self._preview_save_timer.isActive():
+            self._preview_save_timer.stop()
+            self._save_cell_preview()
         if current.isValid():
             self._preview_loading = True
             # EditRole：公式单元格显示公式本身，可直接编辑
@@ -2219,6 +2390,12 @@ class MainWindow(QMainWindow):
         if not paths:
             QMessageBox.information(self, tr("图片队列"), tr("没有找到可用的图片路径"))
             return
+        # 上一个队列窗口可能还开着（含其全局按键监听），先关掉再开新的
+        if self._image_queue_win is not None:
+            try:
+                self._image_queue_win.close()
+            except RuntimeError:
+                pass   # C++ 对象已销毁
         self._image_queue_win = FloatingImageQueue(paths, parent=self)
         self._image_queue_win.show()
 
@@ -2307,7 +2484,7 @@ class MainWindow(QMainWindow):
             menu.addAction(tr("在末尾新增一行"),
                            lambda: self.insert_row(len(self.model.df)))
             menu.addSeparator()
-        menu.addAction(tr("复制"), self.copy_selection)
+        menu.addAction(tr("复制"), lambda: self.copy_selection())
         menu.addAction(tr("不带列名复制"), lambda: self.copy_selection(with_headers=False))
         menu.addAction(tr("复制后转置"), self.copy_selection_transposed)
         menu.addAction(tr("粘贴"), self.paste_selection)
@@ -2471,9 +2648,17 @@ class MainWindow(QMainWindow):
             self.update_statusbar(tr("已将该行设为表头"))
 
     def _open_file_folder(self):
-        if self.current_file:
-            import subprocess
+        if not self.current_file:
+            return
+        import platform
+        import subprocess
+        system = platform.system()
+        if system == "Darwin":
             subprocess.Popen(["open", "-R", self.current_file])
+        elif system == "Windows":
+            subprocess.Popen(["explorer", "/select,", self.current_file])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(self.current_file)])
 
     # ================= 缩放 =================
 

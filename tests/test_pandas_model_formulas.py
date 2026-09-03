@@ -197,17 +197,18 @@ class TestCoordMarker:
     def test_error_formula_survives_app_save_reload(self, tmp_path):
         # finding 2 的完整闭环：本应用保存的错误公式重开后仍显示错误
         from qtui import file_io
-        df = pd.DataFrame({'X': [10.0, 0.0]})
+        # 公式放在 A4，引用 A2/A3（放在 A2 会自引用 -> 循环引用 #CIRC!）
+        df = pd.DataFrame({'X': [10.0, 0.0, 1.0]})
         path = str(tmp_path / 'c.xlsx')
         file_io.save_workbook(path, {'S': df}, ['S'],
-                              {'S': {(0, 0): '=A2/A3'}})  # 10/0 -> #DIV/0!
+                              {'S': {(2, 0): '=A2/A3'}})  # 10/0 -> #DIV/0!
         assert file_io.xlsx_has_coord_marker(path)
         loaded = file_io.read_sheet_formulas(path, 'S')
         m = PandasTableModel(pd.DataFrame())
         # 带标记 -> from_file=False -> 错误结果正常写入
         m.set_dataframe(df.copy(), formulas=loaded,
                         from_file=not file_io.xlsx_has_coord_marker(path))
-        assert m._df.iat[0, 0] == '#DIV/0!'
+        assert m._df.iat[2, 0] == '#DIV/0!'
 
 
 class TestLoadKeepsCachedOnError:
@@ -447,7 +448,8 @@ class TestReviewFindings:
         m = make_model()
         df = m._df.copy()
         df.iat[0, 1] = 42.0  # Excel 里的缓存计算值
-        m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A2:A4, B2:B4)'})
+        # 区域不含公式所在的 B2 本身（自引用是循环引用，另有测试）
+        m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A2:A4, B3:B4)'})
         assert m._df.iat[0, 1] == 42.0
 
     def test_insert_column_clears_undo(self):
@@ -478,3 +480,114 @@ class TestReviewFindings:
         v = m.structure_version
         m.setData(m.index(1, 0), '7')
         assert m.structure_version == v
+
+
+# ---------- 全面审查回归：依赖顺序、长链、显示与 dtype ----------
+
+class TestTopologicalRecalc:
+    def test_diamond_dependency_uses_fresh_values(self):
+        # B2 = A2*2, C2 = A2+B2：无论集合迭代顺序如何 C2 都用新的 B2
+        for _ in range(20):
+            m = PandasTableModel(pd.DataFrame({'A': [1.0], 'B': [0.0], 'C': [0.0]}))
+            m.setData(m.index(1, 2), '=A2+B2')
+            m.setData(m.index(1, 1), '=A2*2')
+            m.setData(m.index(1, 0), '5')
+            assert m._df.iat[0, 1] == 10
+            assert m._df.iat[0, 2] == 15
+
+    def test_evaluate_all_respects_dependency_order(self):
+        m = PandasTableModel(pd.DataFrame())
+        m.set_dataframe(pd.DataFrame({'A': [0.0, 0.0]}),
+                        formulas={(0, 0): '=A3+1', (1, 0): '=5'})
+        assert m._df.iat[0, 0] == 6
+
+    def test_remove_rows_recalcs_chained_formulas(self):
+        m = PandasTableModel(pd.DataFrame({'A': [10.0, 20.0, 30.0], 'B': [0.0] * 3, 'C': [0.0] * 3}))
+        m.setData(m.index(1, 2), '=B2*2')          # C2 先创建（字典顺序在前）
+        m.setData(m.index(1, 1), '=SUM(A2:A4)')    # B2 = 60, C2 = 120
+        assert m._df.iat[0, 2] == 120
+        m.remove_rows([1])                          # B2 = 40 -> C2 = 80
+        assert m._df.iat[0, 1] == 40
+        assert m._df.iat[0, 2] == 80
+
+    def test_long_chain_does_not_recurse(self):
+        n = 2000
+        m = PandasTableModel(pd.DataFrame({'A': [0.0] * n}))
+        formulas = {(i, 0): f'=A{i + 1}+1' for i in range(1, n)}
+        m.set_dataframe(pd.DataFrame({'A': [0.0] * n}), formulas=formulas)
+        m.setData(m.index(1, 0), '10')
+        assert m._df.iat[n - 1, 0] == 10 + n - 1
+
+    def test_self_reference_is_circular(self):
+        m = make_model()
+        m.setData(m.index(1, 0), '=A2+1')
+        assert m._df.iat[0, 0] == '#CIRC!'
+
+    def test_mutual_reference_is_circular(self):
+        m = make_model()
+        m.setData(m.index(1, 0), '=B2')
+        m.setData(m.index(1, 1), '=A2')
+        assert m._df.iat[0, 0] == '#CIRC!'
+        assert m._df.iat[0, 1] == '#CIRC!'
+        # 解除循环后恢复正常（列已退化为 object，输入保持文本）
+        m.setData(m.index(1, 1), '7')
+        assert m._df.iat[0, 0] == '7'
+
+    def test_range_result_does_not_break_display(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=A2:A4')
+        assert m._df.iat[0, 1] == '#VALUE!'
+        assert m.data(m.index(1, 1)) == '#VALUE!'
+
+
+class TestDisplayFormatting:
+    def test_datetime_column_display(self):
+        df = pd.DataFrame({'D': [pd.Timestamp('2026-01-15'),
+                                 pd.Timestamp('2026-01-15 08:30:00'), pd.NaT]})
+        m = PandasTableModel(df)
+        assert m.data(m.index(1, 0)) == '2026-01-15'
+        assert m.data(m.index(2, 0)) == '2026-01-15 08:30:00'
+        assert m.data(m.index(3, 0)) == ''
+
+    def test_huge_float_display(self):
+        m = PandasTableModel(pd.DataFrame({'A': [1e300, 12.0, float('nan')]}))
+        assert m.data(m.index(1, 0)) == '1e+300'
+        assert m.data(m.index(2, 0)) == '12'
+        assert m.data(m.index(3, 0)) == ''
+
+    def test_non_scalar_value_does_not_raise(self):
+        m = PandasTableModel(pd.DataFrame({'A': [[1, 2], None]}, dtype=object))
+        assert m.data(m.index(1, 0)) == '[1, 2]'
+        assert m.data(m.index(2, 0)) == ''
+
+
+class TestDtypeHandling:
+    def test_undo_restores_numeric_dtype(self):
+        m = make_model()
+        m.setData(m.index(1, 0), 'abc')
+        assert m._df.iloc[:, 0].dtype == object
+        m.undo()
+        assert pd.api.types.is_float_dtype(m._df.iloc[:, 0].dtype)
+        assert m._df.iat[0, 0] == 30.0
+
+    def test_sort_mixed_column_does_not_raise(self):
+        m = make_model()
+        m.setData(m.index(1, 0), '=1/0')            # 列变 object，含 '#DIV/0!'
+        m.sort(0, Qt.SortOrder.AscendingOrder)
+        values = list(m._df.iloc[:, 0])
+        assert values[:2] == [10.0, 20.0]
+        assert values[2] == '#DIV/0!'
+
+    def test_promote_header_keeps_leading_zeros(self):
+        df = pd.DataFrame({'A': ['id', '00123', '00456'], 'B': ['n', '1', '2']})
+        m = PandasTableModel(df)
+        m.promote_row_to_header(0)
+        assert list(m._df.columns) == ['id', 'n']
+        assert list(m._df['id']) == ['00123', '00456']
+        assert list(m._df['n']) == [1, 2]
+
+    def test_clear_formulas_clears_indexes(self):
+        m = make_model()
+        m.setData(m.index(1, 1), '=A2*2')
+        m.clear_formulas()
+        assert not m.formulas and not m._dependents and not m._formula_deps

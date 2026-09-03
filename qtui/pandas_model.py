@@ -6,7 +6,11 @@ PandasTableModel - 基于 QAbstractTableModel 的 pandas DataFrame 模型
 视图只请求可见单元格的数据，因此无论多少行都不需要分批渲染或列分页。
 """
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant, pyqtSignal
+import bisect
+import datetime
+from collections import deque
+
+from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 import pandas as pd
 import numpy as np
@@ -21,16 +25,60 @@ _ALIGN_RIGHT = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 _ALIGN_LEFT = int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 _HIGHLIGHT_BRUSH = QColor(74, 158, 219, 46)   # 当前行整行淡色高亮
 _FORMULA_BRUSH = QColor(FORMULA_TEXT_COLOR)
+def _has_leading_zero_text(series) -> bool:
+    """列中是否有 "007"、"02134" 这类带前导零的文本（工号/邮编/编码）。
+
+    转成数值会丢前导零——属于静默修改用户数据，这类列必须保持文本。
+    """
+    if not pd.api.types.is_object_dtype(series.dtype):
+        return False
+    text = series.dropna().astype(str).str.strip()
+    if text.empty:
+        return False
+    return bool(text.str.match(r'^[-+]?0\d').any())
+
+
 def to_numeric_or_keep(series):
     """整列可转数值才转，否则原样返回。
 
     等价旧版 pd.to_numeric(errors="ignore")——该参数 pandas 2.2 起废弃、
     3.x 移除（传入会抛 ValueError），统一用此实现兼容各版本。
+    含前导零文本的列不转（否则 "007" 变 7）。
     """
+    if _has_leading_zero_text(series):
+        return series
     try:
         return pd.to_numeric(series)
     except (ValueError, TypeError):
         return series
+
+
+def _format_cell(value) -> str:
+    """单元格值 -> 显示文本。必须对任何对象都不抛异常（data() 每帧调用）。"""
+    if type(value) is str:      # 最常见情况直接返回
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value != value:
+            return ""
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return repr(float(value))   # 1e+300 而不是 301 位整数（np.float64 也走这里）
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return str(value)
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        return str(value)
+    if isinstance(value, np.floating):
+        return _format_cell(float(value))
+    if isinstance(value, datetime.datetime):   # 含 pd.Timestamp
+        if (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+            return value.date().isoformat()
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    return str(value)
 
 
 _HEADER_ROW_BRUSH = QColor(230, 126, 34)  # 表头行底色（橙色）
@@ -99,15 +147,23 @@ class PandasTableModel(QAbstractTableModel):
         info = self._col_arrays.get(col)
         if info is None:
             series = self._df.iloc[:, col]
-            info = (series.to_numpy(), pd.api.types.is_numeric_dtype(series.dtype))
+            dtype = series.dtype
+            if pd.api.types.is_datetime64_any_dtype(dtype) or pd.api.types.is_timedelta64_dtype(dtype):
+                # to_numpy() 给出 numpy.datetime64，str() 是 "2026-01-15T00:00:00.000000000"；
+                # 取对象数组（Timestamp/NaT）交给 _format_cell 格式化
+                arr = series.astype(object).to_numpy()
+            else:
+                arr = series.to_numpy()
+            info = (arr, pd.api.types.is_numeric_dtype(dtype))
             self._col_arrays[col] = info
         return info
 
-    def _cell_value(self, row, col):
-        return self._col_info(col)[0][row]
-
-    def _invalidate_values(self):
-        self._col_arrays.clear()
+    def _invalidate_values(self, col=None):
+        """使显示缓存失效；单格写入只需失效所在列，避免每次编辑重建整表缓存。"""
+        if col is None:
+            self._col_arrays.clear()
+        else:
+            self._col_arrays.pop(col, None)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
@@ -121,14 +177,7 @@ class PandasTableModel(QAbstractTableModel):
                 formula = self.formulas.get((row, index.column()))
                 if formula:
                     return formula
-            value = self._col_info(index.column())[0][row]
-            if type(value) is str:      # 最常见情况直接返回
-                return value
-            if pd.isna(value):
-                return ""
-            if isinstance(value, float) and value.is_integer():
-                return str(int(value))
-            return str(value)
+            return _format_cell(self._col_info(index.column())[0][row])
         if role == Qt.ItemDataRole.BackgroundRole:
             color = self.cell_colors.get((row, index.column()))
             if color:
@@ -211,6 +260,7 @@ class PandasTableModel(QAbstractTableModel):
         row, col = index.row() - self.HEADER_ROWS, index.column()
         key = (row, col)
         old = self._df.iat[row, col]
+        old_dtype = self._df.iloc[:, col].dtype
         old_formula = self.formulas.get(key)
         text = str(value)
 
@@ -235,17 +285,110 @@ class PandasTableModel(QAbstractTableModel):
                 self._unregister_deps(key)
             self._set_cell(row, col, new)
 
-        self._push_undo((row, col, old, self._df.iat[row, col], old_formula, new_formula))
+        self._push_undo((row, col, old, self._df.iat[row, col], old_formula, new_formula,
+                         old_dtype))
         self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole])
         self._recalc_dependents(key)
         self.modified = True
         return True
 
+    def clear_cells(self, cells):
+        """批量清空数据单元格（Delete/Backspace）。
+
+        cells 为数据坐标 (row, col) 的可迭代对象。按列向量化写入：
+        只发一次 dataChanged、只记一条撤销记录（整片清空一次撤销即可恢复），
+        百万格级别的选区也不会逐格触发视图刷新与依赖重算。返回清空的单元格数。
+        """
+        nrows, ncols = len(self._df), len(self._df.columns)
+        by_col = {}
+        for row, col in cells:
+            if 0 <= row < nrows and 0 <= col < ncols:
+                by_col.setdefault(col, []).append(row)
+        entries = []
+        for col, rows in by_col.items():
+            rows = np.array(sorted(set(rows)), dtype=np.intp)
+            series = self._df.iloc[:, col]
+            old_vals = series.to_numpy(dtype=object)[rows]
+            formulas = {r: f for (r, c), f in self.formulas.items()
+                        if c == col and r in set(rows.tolist())}
+            blank = pd.isna(old_vals) | (old_vals == "")
+            if formulas:
+                blank &= ~np.isin(rows, list(formulas))
+            rows, old_vals = rows[~blank], old_vals[~blank]
+            if len(rows) == 0:
+                continue
+            entries.append((col, rows, old_vals, series.dtype, formulas))
+        if not entries:
+            return 0
+        self._apply_clear_entries(entries)
+        self._push_undo(("__batch__", entries))
+        self._after_batch(entries)
+        return int(sum(len(e[1]) for e in entries))
+
+    def _apply_clear_entries(self, entries):
+        for col, rows, _old, _dtype, formulas in entries:
+            for r in formulas:
+                self.formulas.pop((r, col), None)
+                self._unregister_deps((r, col))
+            series = self._df.iloc[:, col]
+            if pd.api.types.is_integer_dtype(series.dtype) or pd.api.types.is_bool_dtype(series.dtype):
+                self._df.isetitem(col, series.astype(float))   # 整数列放不下 NaN
+            self._df.iloc[rows, col] = np.nan
+            self._invalidate_values(col)
+
+    def _restore_clear_entries(self, entries):
+        for col, rows, old_vals, old_dtype, formulas in reversed(entries):
+            # 让 numpy 推断出紧凑 dtype（全 float/int 时不再是 object），
+            # 避免 pandas 对 object 数组写入数值列的弃用警告；混合类型则先整列转 object
+            try:
+                vals = np.asarray(old_vals.tolist())
+            except (ValueError, TypeError):
+                vals = old_vals
+            if vals.dtype == object and self._df.iloc[:, col].dtype != object:
+                self._column_to_object(col)
+            try:
+                self._df.iloc[rows, col] = vals
+            except (ValueError, TypeError):
+                self._column_to_object(col)
+                self._df.iloc[rows, col] = old_vals
+            self._invalidate_values(col)
+            self._restore_dtype(col, old_dtype)
+            for r, f in formulas.items():
+                self._apply_formula_state(r, col, f)
+
+    def _after_batch(self, entries):
+        keys = set()
+        for col, rows, *_ in entries:
+            keys.update((int(r), col) for r in rows)
+        self._emit_cells_changed(keys)
+        # 只重算真正被公式引用的单元格
+        for key in keys & self._dependents.keys():
+            self._recalc_dependents(key)
+        self.modified = True
+
+    def _emit_cells_changed(self, keys):
+        rows = [r for r, _ in keys]
+        cols = [c for _, c in keys]
+        self.dataChanged.emit(
+            self.index(min(rows) + self.HEADER_ROWS, min(cols)),
+            self.index(max(rows) + self.HEADER_ROWS, max(cols)),
+            [Qt.ItemDataRole.DisplayRole])
+
+    def _apply_cell_record(self, record, forward):
+        """回放一条单元格编辑记录（forward=False 撤销 / True 重做），不动撤销栈。"""
+        row, col, old, new, old_formula, new_formula, old_dtype = record
+        if forward:
+            self._apply_formula_state(row, col, new_formula)
+            self._set_cell(row, col, new)
+        else:
+            self._apply_formula_state(row, col, old_formula)
+            self._set_cell(row, col, old)
+            self._restore_dtype(col, old_dtype)
+
     # ---------- 公式 ----------
 
     def _evaluate(self, formula):
-        # 引擎的 `df or self._df` 写法不接受显式传入 DataFrame，
-        # 统一用 set_dataframe 注入
+        # 结构操作会替换 self._df 对象，求值前统一把当前表注入引擎
         self._engine.set_dataframe(self._df)
         return self._engine.evaluate(formula)
 
@@ -254,20 +397,15 @@ class PandasTableModel(QAbstractTableModel):
         return self._engine.shift_formula(formula, row_delta, col_delta)
 
     def _register_deps(self, formula_cell):
-        """登记公式对其他单元格的依赖（引擎返回列名，转为列位置）。"""
+        """登记公式对其他单元格的依赖（引擎按位置返回 (row, col)，区域已裁剪到表格范围）。"""
         self._unregister_deps(formula_cell)
         formula = self.formulas.get(formula_cell)
         if not formula:
             return
-        col_pos = {str(c): i for i, c in enumerate(self._df.columns)}
         self._engine.set_dataframe(self._df)
-        keys = set()
-        for row, col_name in self._engine.extract_dependencies(formula):
-            col = col_pos.get(str(col_name))
-            if col is not None:
-                key = (row, col)
-                self._dependents.setdefault(key, set()).add(formula_cell)
-                keys.add(key)
+        keys = self._engine.extract_dependencies(formula)
+        for key in keys:
+            self._dependents.setdefault(key, set()).add(formula_cell)
         if keys:
             self._formula_deps[formula_cell] = keys
 
@@ -285,24 +423,67 @@ class PandasTableModel(QAbstractTableModel):
         for key in list(self.formulas):
             self._register_deps(key)
 
-    def _recalc_dependents(self, changed_cell, _visited=None):
-        """被引用单元格变化后，重算依赖它的公式（防环）。"""
-        visited = _visited if _visited is not None else set()
-        for fcell in list(self._dependents.get(changed_cell, ())):
-            if fcell in visited:
-                continue
-            visited.add(fcell)
-            formula = self.formulas.get(fcell)
-            if not formula:
-                continue
-            result = self._evaluate(formula)
-            self._set_cell(fcell[0], fcell[1], result)
-            idx = self.index(fcell[0] + self.HEADER_ROWS, fcell[1])
-            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
-            self._recalc_dependents(fcell, visited)
+    def _dependent_closure(self, changed_cell):
+        """依赖 changed_cell 的全部公式单元格（传递闭包，迭代 BFS）。"""
+        closure = set()
+        queue = deque([changed_cell])
+        while queue:
+            cell = queue.popleft()
+            for fcell in self._dependents.get(cell, ()):
+                if fcell not in closure and fcell in self.formulas:
+                    closure.add(fcell)
+                    queue.append(fcell)
+        return closure
+
+    def _evaluation_order(self, cells):
+        """对公式单元格集合做拓扑排序（被依赖者在前）。返回 (有序列表, 环上单元格集合)。
+
+        Kahn 算法，只看集合内部的边；自引用/互引用的单元格入度永远不为零，
+        留在环集合里。依赖顺序错误会让 B2=A2*2、C2=A2+B2 这类菱形依赖
+        用旧 B2 算 C2（集合迭代顺序随机，错误不可复现）。
+        """
+        cells = set(cells)
+        indeg = {}
+        for cell in cells:
+            indeg[cell] = sum(1 for dep in self._formula_deps.get(cell, ()) if dep in cells)
+        queue = deque(sorted(c for c in cells if indeg[c] == 0))
+        order = []
+        while queue:
+            cell = queue.popleft()
+            order.append(cell)
+            for fcell in self._dependents.get(cell, ()):
+                if fcell in cells:
+                    indeg[fcell] -= 1
+                    if indeg[fcell] == 0:
+                        queue.append(fcell)
+        return order, cells.difference(order)
+
+    def _emit_cell_changed(self, row, col):
+        idx = self.index(row + self.HEADER_ROWS, col)
+        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
+
+    def _recalc_dependents(self, changed_cell):
+        """被引用单元格变化后，按依赖顺序重算所有（传递）依赖它的公式。
+
+        迭代实现：千行以上的连锁公式（=A2+1 填充到底）递归会栈溢出。
+        环上的公式写入 #CIRC!。
+        """
+        closure = self._dependent_closure(changed_cell)
+        if not closure:
+            return
+        order, cyclic = self._evaluation_order(closure)
+        for fcell in order:
+            self._set_cell(fcell[0], fcell[1], self._evaluate(self.formulas[fcell]))
+            self._emit_cell_changed(*fcell)
+        for fcell in cyclic:
+            self._set_cell(fcell[0], fcell[1], "#CIRC!")
+            self._emit_cell_changed(*fcell)
 
     def evaluate_all_formulas(self, keep_cached_on_error=False):
-        """重算全部公式并写入 df（载入公式后调用）。
+        """按依赖顺序重算全部公式并写入 df（载入公式/结构变更后调用）。
+
+        先重建依赖索引再拓扑排序求值——按字典插入顺序求值会让引用了
+        其他公式的公式读到过期值（例如删行后 C2=B2*2 用旧的 B2）。
 
         #NAME?/#ERROR 表示引擎无法求值（不支持的函数/语法），保留 df 中
         来自 Excel 的缓存计算值不覆盖；其余错误（#DIV/0!、#N/A、#REF! 等）
@@ -313,21 +494,33 @@ class PandasTableModel(QAbstractTableModel):
         Excel 的计算结果，任何错误都不覆盖它（旧版应用保存的公式坐标
         偏一行，会算出 #VALUE! 等假错误，覆盖等于损坏用户数据）。
         """
-        for key, formula in self.formulas.items():
-            result = self._evaluate(formula)
+        self._rebuild_all_deps()
+        if not self.formulas:
+            return
+        order, cyclic = self._evaluation_order(self.formulas)
+        for key in order:
+            result = self._evaluate(self.formulas[key])
             if keep_cached_on_error:
                 if not FormulaEngine.is_error(result):
                     self._set_cell(key[0], key[1], result)
             elif result not in ("#NAME?", "#ERROR"):
                 self._set_cell(key[0], key[1], result)
-        self._rebuild_all_deps()
+        if not keep_cached_on_error:
+            for key in cyclic:
+                self._set_cell(key[0], key[1], "#CIRC!")
+
+    def clear_formulas(self):
+        """丢弃全部公式（df 中保留当前计算值），依赖索引一并清空。"""
+        self.formulas.clear()
+        self._dependents.clear()
+        self._formula_deps.clear()
 
     def _coerce(self, value, col):
         """尽量保持列的数值类型；无法转换时整列转为 object。"""
         text = str(value)
         if text == "":
             return np.nan
-        dtype = self._df.dtypes.iloc[col]
+        dtype = self._df.iloc[:, col].dtype   # 不用 df.dtypes：每次构造整表 Series
         if pd.api.types.is_numeric_dtype(dtype):
             try:
                 num = float(text)
@@ -336,23 +529,36 @@ class PandasTableModel(QAbstractTableModel):
                 return num
             except ValueError:
                 # 数值列写入文本：整列退化为 object
-                colname = self._df.columns[col]
-                self._df[colname] = self._df[colname].astype(object)
+                self._column_to_object(col)
                 return text
         return text
 
+    def _column_to_object(self, col):
+        # 按位置改列（isetitem），列名重复时 df[name] 会同时改到多列
+        self._df.isetitem(col, self._df.iloc[:, col].astype(object))
+
     def _set_cell(self, row, col, value):
-        self._invalidate_values()
+        self._invalidate_values(col)
         # 字符串写入数值列时先把整列转为 object，避免 pandas 弃用警告
-        if isinstance(value, str) and self._df.dtypes.iloc[col] != object:
-            colname = self._df.columns[col]
-            self._df[colname] = self._df[colname].astype(object)
+        if isinstance(value, str) and self._df.iloc[:, col].dtype != object:
+            self._column_to_object(col)
         try:
             self._df.iat[row, col] = value
         except (ValueError, TypeError):
-            colname = self._df.columns[col]
-            self._df[colname] = self._df[colname].astype(object)
+            self._column_to_object(col)
             self._df.iat[row, col] = value
+
+    def _restore_dtype(self, col, dtype):
+        """撤销后尝试把列恢复到编辑前的 dtype（文本写入曾把数值列退化为 object）。"""
+        series = self._df.iloc[:, col]
+        if series.dtype == dtype or dtype == object:
+            return
+        try:
+            restored = series.astype(dtype)
+        except (ValueError, TypeError):
+            return
+        self._df.isetitem(col, restored)
+        self._invalidate_values(col)
 
     # ---------- 撤销 / 重做 ----------
 
@@ -379,9 +585,13 @@ class PandasTableModel(QAbstractTableModel):
             self.cellColorsChanged.emit(
                 [(r, c, old) for r, c, old, _new in record[1]])
             return True
-        row, col, old, new, old_formula, new_formula = record
-        self._apply_formula_state(row, col, old_formula)
-        self._set_cell(row, col, old)
+        if record[0] == "__batch__":
+            self._restore_clear_entries(record[1])
+            self._redo_stack.append(record)
+            self._after_batch(record[1])
+            return True
+        row, col = record[0], record[1]
+        self._apply_cell_record(record, forward=False)
         self._redo_stack.append(record)
         idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
@@ -406,9 +616,13 @@ class PandasTableModel(QAbstractTableModel):
             self.cellColorsChanged.emit(
                 [(r, c, new) for r, c, _old, new in record[1]])
             return True
-        row, col, old, new, old_formula, new_formula = record
-        self._apply_formula_state(row, col, new_formula)
-        self._set_cell(row, col, new)
+        if record[0] == "__batch__":
+            self._apply_clear_entries(record[1])
+            self._undo_stack.append(record)
+            self._after_batch(record[1])
+            return True
+        row, col = record[0], record[1]
+        self._apply_cell_record(record, forward=True)
         self._undo_stack.append(record)
         idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
@@ -600,13 +814,14 @@ class PandasTableModel(QAbstractTableModel):
         sorted_rows = sorted(rows)
         sorted_cols = sorted(cols)
 
+        # 二分计数：删 2 万行时线性扫描是 O(删除数 × 键数) 的热点
         def remap(d):
             out = {}
             for (r, c), v in d.items():
                 if r in rows or c in cols:
                     continue
-                r -= sum(1 for x in sorted_rows if x < r)
-                c -= sum(1 for x in sorted_cols if x < c)
+                r -= bisect.bisect_left(sorted_rows, r)
+                c -= bisect.bisect_left(sorted_cols, c)
                 out[(r, c)] = v
             return out
         self.formulas = remap(self.formulas)
@@ -616,7 +831,7 @@ class PandasTableModel(QAbstractTableModel):
             def mapper(i):
                 if i in deleted:
                     return None
-                return i - sum(1 for x in sorted_del if x < i)
+                return i - bisect.bisect_left(sorted_del, i)
             return mapper
 
         row_map = make_map(rows, sorted_rows) if rows else None
@@ -655,12 +870,16 @@ class PandasTableModel(QAbstractTableModel):
         self._invalidate_values()
         self._df.columns = names
         # 原样载入的文件所有列都是文本，提升表头后重新推断数值列
+        # （带前导零的编码列保持文本，不丢零）
         self._df = self._df.apply(to_numeric_or_keep)
         if self._df.dtypes.eq(object).all():
-            for c in self._df.columns:
-                converted = pd.to_numeric(self._df[c], errors="coerce")
-                if converted.notna().sum() >= self._df[c].notna().sum():
-                    self._df[c] = converted
+            for i in range(len(self._df.columns)):
+                series = self._df.iloc[:, i]
+                if _has_leading_zero_text(series):
+                    continue
+                converted = pd.to_numeric(series, errors="coerce")
+                if converted.notna().sum() >= series.notna().sum():
+                    self._df.isetitem(i, converted)
         self.endResetModel()
         self.modified = True
         return True
@@ -706,8 +925,16 @@ class PandasTableModel(QAbstractTableModel):
     def sort(self, column, order=Qt.SortOrder.AscendingOrder):
         if column < 0 or column >= len(self._df.columns):
             return
-        colname = self._df.columns[column]
-        positions = self._df[colname].sort_values(
+        series = self._df.iloc[:, column]
+        # 数值列按数值排；混合列（公式写入 #DIV/0! 后整列 object）数值在前、
+        # 文本在后（同 Excel）——直接 sort_values 会在 str/float 比较时抛 TypeError
+        keys = pd.to_numeric(series, errors="coerce")
+        if keys.notna().sum() < series.notna().sum():
+            keys = pd.Series(
+                [None if pd.isna(v) else ((0, n) if n == n else (1, str(v)))
+                 for v, n in zip(series.tolist(), keys.tolist())],
+                index=series.index, dtype=object)
+        positions = keys.sort_values(
             ascending=(order == Qt.SortOrder.AscendingOrder),
             kind="mergesort",
             na_position="last",

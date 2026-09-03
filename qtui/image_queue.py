@@ -7,8 +7,10 @@ PyQt6 版图片队列浮窗 - 对应 Tkinter 版 ui/image_queue.py。
 """
 
 import os
+import sys
 import threading
 import time
+import traceback
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
@@ -18,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.image_viewer import ImageViewer, copy_image_to_clipboard
+from qtui.image_utils import load_image
 from qtui.i18n import tr
 
 # macOS 全局按键监控（自动模式）：Quartz CGEventTap 在后台线程运行
@@ -26,11 +29,13 @@ try:
         CGEventTapCreate, CGEventTapEnable,
         kCGSessionEventTap, kCGHeadInsertEventTap,
         kCGEventKeyDown,
+        kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput,
         CGEventGetIntegerValueField, kCGKeyboardEventKeycode,
         CGEventGetFlags, kCGEventFlagMaskCommand,
-        CFMachPortCreateRunLoopSource,
-        CFRunLoopGetCurrent, CFRunLoopAddSource, CFRunLoopRun, CFRunLoopStop,
-        kCFRunLoopCommonModes,
+        CFMachPortCreateRunLoopSource, CFMachPortInvalidate,
+        CFRunLoopGetCurrent, CFRunLoopAddSource, CFRunLoopRemoveSource,
+        CFRunLoopRunInMode, CFRunLoopStop,
+        kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
     )
     QUARTZ_AVAILABLE = True
 except ImportError:
@@ -39,6 +44,25 @@ except ImportError:
 _VK_ANSI_V = 9  # macOS 'V' 键码
 _PREVIEW_MAX_W = 260
 _PREVIEW_MAX_H = 200
+# Cmd+V 之后等目标应用读完剪贴板再换下一张（tap 在目标应用之前收到按键，
+# 立即换剪贴板会让 Electron 类应用粘到"下一张"而跳过一张）
+_ADVANCE_DELAY_MS = 150
+
+
+def _request_input_monitoring_prompt():
+    """尽量触发系统的权限弹窗（辅助功能 / 输入监控），失败静默。"""
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt)
+        AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        return
+    except Exception:
+        pass
+    try:
+        from Quartz import CGRequestListenEventAccess
+        CGRequestListenEventAccess()
+    except Exception:
+        pass
 
 
 class _ThumbnailLabel(QLabel):
@@ -66,9 +90,11 @@ class FloatingImageQueue(QWidget):
         self._last_auto_advance_time = 0
         self._viewers = []  # 保持打开的查看器引用
 
-        # 自动模式相关
+        # 自动模式相关（tap 线程与 GUI 线程之间用锁 + 停止标志协调）
         self._auto_thread = None
         self._tap_runloop_ref = None
+        self._tap_lock = threading.Lock()
+        self._tap_token = None   # 当前有效 tap 线程的标识；置 None 即请求停止
 
         self.setWindowFlags(Qt.WindowType.Window
                             | Qt.WindowType.WindowStaysOnTopHint)
@@ -180,17 +206,32 @@ class FloatingImageQueue(QWidget):
             self.auto_check.setChecked(False)
             return
         self._stop_auto_monitor()
-        self._auto_thread = threading.Thread(target=self._run_cmdv_tap, daemon=True)
+        token = object()
+        with self._tap_lock:
+            self._tap_token = token
+        self._auto_thread = threading.Thread(
+            target=self._run_cmdv_tap, args=(token,), daemon=True)
         self._auto_thread.start()
 
-    def _run_cmdv_tap(self):
+    def _run_cmdv_tap(self, token):
         """后台线程：CGEventTap 监控全局 Cmd+V，通过信号通知主线程"""
+        tap_holder = []
 
         def tap_callback(proxy, event_type, event, refcon):
-            keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-            flags = CGEventGetFlags(event)
-            if keycode == _VK_ANSI_V and (flags & kCGEventFlagMaskCommand):
-                self._cmd_v_detected.emit()
+            # 回调里绝不能抛异常（会让 tap 失效且无提示）
+            try:
+                # 系统因回调超时/用户输入而禁用了 tap：重新启用，否则自动模式静默失效
+                if event_type in (kCGEventTapDisabledByTimeout,
+                                  kCGEventTapDisabledByUserInput):
+                    if tap_holder:
+                        CGEventTapEnable(tap_holder[0], True)
+                    return event
+                keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                flags = CGEventGetFlags(event)
+                if keycode == _VK_ANSI_V and (flags & kCGEventFlagMaskCommand):
+                    self._cmd_v_detected.emit()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
             return event
 
         # kCGEventTapOptionListenOnly = 1（只监听，不拦截）
@@ -204,33 +245,65 @@ class FloatingImageQueue(QWidget):
         )
 
         if not tap:
-            self._tap_no_permission.emit()
+            with self._tap_lock:
+                if self._tap_token is token:
+                    self._tap_no_permission.emit()
             return
+        tap_holder.append(tap)
 
-        self._tap_runloop_ref = CFRunLoopGetCurrent()
+        runloop = CFRunLoopGetCurrent()
         source = CFMachPortCreateRunLoopSource(None, tap, 0)
-        CFRunLoopAddSource(self._tap_runloop_ref, source, kCFRunLoopCommonModes)
+        CFRunLoopAddSource(runloop, source, kCFRunLoopCommonModes)
         CGEventTapEnable(tap, True)
-        CFRunLoopRun()  # 阻塞直到 CFRunLoopStop
-
-    def _stop_auto_monitor(self):
-        if self._tap_runloop_ref is not None:
+        try:
+            with self._tap_lock:
+                # 创建 tap 期间用户已取消（如系统正在弹权限框）：不进入 run loop
+                if self._tap_token is not token:
+                    return
+                self._tap_runloop_ref = runloop
+            # 分片运行 run loop 并检查标识：即使 CFRunLoopStop 在 run 之前到达
+            # （此时 stop 是空操作）也能在下一片结束时退出，不会永久阻塞
+            while True:
+                with self._tap_lock:
+                    if self._tap_token is not token:
+                        break
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, False)
+        finally:
+            # 显式拆除：禁用 tap、移除源、失效端口（不依赖 pyobjc 的释放时机）
             try:
-                CFRunLoopStop(self._tap_runloop_ref)
+                CGEventTapEnable(tap, False)
+                CFRunLoopRemoveSource(runloop, source, kCFRunLoopCommonModes)
+                CFMachPortInvalidate(tap)
             except Exception:
                 pass
+            with self._tap_lock:
+                if self._tap_runloop_ref is runloop:
+                    self._tap_runloop_ref = None
+
+    def _stop_auto_monitor(self):
+        with self._tap_lock:
+            self._tap_token = None
+            runloop = self._tap_runloop_ref
             self._tap_runloop_ref = None
-        if self._auto_thread is not None and self._auto_thread.is_alive():
-            self._auto_thread.join(timeout=1.0)
+        if runloop is not None:
+            try:
+                CFRunLoopStop(runloop)
+            except Exception:
+                pass
+        thread = self._auto_thread
         self._auto_thread = None
+        if thread is not None and thread.is_alive():
+            # run loop 收到 stop 后很快退出；tap 尚未建好时线程会自行检查停止标志
+            thread.join(timeout=0.3)
 
     def _on_no_permission(self):
         self.auto_check.setChecked(False)
+        _request_input_monitoring_prompt()
         QMessageBox.information(
             self, tr("需要权限"),
-            tr("自动模式需要「辅助功能」权限\n"
-               "请在 系统设置 → 隐私与安全性 → 辅助功能 中\n"
-               "添加运行此程序的终端或 Python")
+            tr("自动模式需要监听全局按键的权限\n"
+               "请在 系统设置 → 隐私与安全性 → 「输入监控」或「辅助功能」中\n"
+               "勾选本程序（或运行它的终端 / Python），然后重新勾选自动模式")
         )
 
     def _auto_advance(self):
@@ -242,13 +315,24 @@ class FloatingImageQueue(QWidget):
         if now - self._last_auto_advance_time < 0.5:
             return
         self._last_auto_advance_time = now
-        self._go_next()
+        # 稍等目标应用取走剪贴板内容再换下一张
+        QTimer.singleShot(_ADVANCE_DELAY_MS, self._go_next)
 
     # ---- 显示更新 ----
 
     def _update_display(self):
         total = len(self.image_paths)
-        idx = self.current_index
+        if total == 0:
+            self.progress_edit.setText("0")
+            self.total_label.setText(" / 0")
+            self.filename_label.setText("")
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText(tr("(无图片)"))
+            for btn in (self.prev_btn, self.copy_btn, self.next_btn):
+                btn.setEnabled(False)
+            return
+        idx = max(0, min(self.current_index, total - 1))
+        self.current_index = idx
 
         self.progress_edit.setText(str(idx + 1))
         self.total_label.setText(f" / {total}")
@@ -271,18 +355,21 @@ class FloatingImageQueue(QWidget):
                 pass
 
     def _update_preview(self, path):
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
+        # 解码时直接缩到预览尺寸并应用 EXIF 方向（大图不再全量解码）
+        image = load_image(path, (_PREVIEW_MAX_W, _PREVIEW_MAX_H))
+        if image.isNull():
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText(tr("(无法预览)"))
             return
-        scaled = pixmap.scaled(
-            _PREVIEW_MAX_W, _PREVIEW_MAX_H,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        pixmap = QPixmap.fromImage(image)
+        if pixmap.width() > _PREVIEW_MAX_W or pixmap.height() > _PREVIEW_MAX_H:
+            pixmap = pixmap.scaled(
+                _PREVIEW_MAX_W, _PREVIEW_MAX_H,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         self.preview_label.setText("")
-        self.preview_label.setPixmap(scaled)
+        self.preview_label.setPixmap(pixmap)
 
     # ---- 操作 ----
 
@@ -299,12 +386,15 @@ class FloatingImageQueue(QWidget):
         QTimer.singleShot(1500, lambda: self.status_label.setText(""))
 
     def _jump_to_index(self):
+        total = len(self.image_paths)
+        if total == 0:
+            self._update_display()
+            return
         try:
             num = int(self.progress_edit.text())
         except ValueError:
             self._update_display()  # 恢复为当前值
             return
-        total = len(self.image_paths)
         num = max(1, min(num, total))
         self.current_index = num - 1
         self._update_display()
@@ -328,7 +418,10 @@ class FloatingImageQueue(QWidget):
         if not self.image_paths:
             return
         viewer = ImageViewer(self.image_paths[self.current_index])
+        viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         viewer.show()
+        # 只保留仍打开的查看器引用，关闭的随 WA_DeleteOnClose 释放
+        self._viewers = [v for v in self._viewers if v.isVisible()]
         self._viewers.append(viewer)
 
     def closeEvent(self, event):

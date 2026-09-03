@@ -8,7 +8,7 @@ import pandas as pd
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit,
-    QPushButton, QListWidget, QListWidgetItem, QTabWidget, QWidget,
+    QListWidget, QListWidgetItem, QTabWidget, QWidget,
     QCheckBox, QDialogButtonBox, QMessageBox,
 )
 
@@ -132,6 +132,9 @@ class FilterDialog(QDialog):
         self.value_edit.setEnabled(cond not in ("为空", "不为空"))
 
     def _prefill(self, f):
+        col_idx = self.col_combo.findText(str(f.get("col", "")))
+        if col_idx >= 0 and col_idx != self.col_combo.currentIndex():
+            self.col_combo.setCurrentIndex(col_idx)   # 触发值列表重载
         if f["condition"] == "值在列表中":
             self.tabs.setCurrentIndex(0)
             values = set(f["value"])

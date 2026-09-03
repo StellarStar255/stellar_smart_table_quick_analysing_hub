@@ -10,9 +10,10 @@ import io
 import json
 import keyword
 import os
+import sys
+import threading
 import time
 import traceback
-import contextlib
 from datetime import datetime
 
 import pandas as pd
@@ -495,6 +496,60 @@ class CodeEditor(QPlainTextEdit):
 # 后台执行线程
 # ---------------------------------------------------------------------------
 
+class _Cancelled(BaseException):
+    """用户点击"停止"后在工作线程内抛出，中断用户代码。"""
+
+
+class _StreamRouter:
+    """按线程分流 stdout/stderr：工作线程的输出进缓冲区，其它线程照常输出。
+
+    contextlib.redirect_stdout 是进程全局替换，会把主线程（例如加载/保存
+    线程的报错）在分析运行期间打印的内容一并吞进分析输出里。
+    """
+
+    _lock = threading.Lock()
+
+    def __init__(self, original):
+        self._original = original
+        self._targets = {}
+
+    def _target(self):
+        return self._targets.get(threading.get_ident(), self._original)
+
+    def write(self, text):
+        target = self._target()
+        if target is not None:
+            return target.write(text)
+        return len(text)
+
+    def flush(self):
+        target = self._target()
+        if target is not None and hasattr(target, "flush"):
+            target.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+    @classmethod
+    def capture(cls, attr, buf):
+        """把当前线程的 sys.<attr> 输出接到 buf；返回撤销函数。"""
+        ident = threading.get_ident()
+        with cls._lock:
+            stream = getattr(sys, attr)
+            if not isinstance(stream, cls):
+                stream = cls(stream)
+                setattr(sys, attr, stream)
+            stream._targets[ident] = buf
+
+        def restore():
+            with cls._lock:
+                stream._targets.pop(ident, None)
+                # 没有其它线程在用时还原原始流
+                if not stream._targets and getattr(sys, attr) is stream:
+                    setattr(sys, attr, stream._original)
+        return restore
+
+
 class CodeRunWorker(QThread):
     """在后台线程执行用户代码，结果通过信号回传主线程。"""
 
@@ -505,6 +560,17 @@ class CodeRunWorker(QThread):
         self._code = code
         self._df = df
         self._current_file = current_file
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        """请求停止：用户代码下一次执行到任何一行时抛出 _Cancelled。"""
+        self._cancel.set()
+
+    def _tracer(self, frame, event, arg):
+        # 只在工作线程生效（sys.settrace 是线程局部的）
+        if self._cancel.is_set():
+            raise _Cancelled()
+        return self._tracer
 
     def run(self):
         buf = io.StringIO()
@@ -539,6 +605,11 @@ class CodeRunWorker(QThread):
             fig.savefig(filename, dpi=150, bbox_inches="tight")
             figure_files.append(filename)
             print(tr("✓ 图表已保存: {}").format(filename))
+            # 保存即关闭，避免每次运行都在 pyplot 里累积图形（内存持续增长）
+            _close_figure(fig)
+
+        def _exit(code=None):
+            raise SystemExit(code)
 
         namespace = {
             "df": self._df,
@@ -546,15 +617,33 @@ class CodeRunWorker(QThread):
             "np": np,
             "save_as_sheet": save_as_sheet,
             "save_figure": save_figure,
+            "exit": _exit,
+            "quit": _exit,
             "__builtins__": builtins,
         }
 
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            try:
-                exec(self._code, namespace)
-            except Exception:
-                buf.write("\n" + tr("[执行错误]") + "\n")
-                buf.write(traceback.format_exc())
+        restore_out = _StreamRouter.capture("stdout", buf)
+        restore_err = _StreamRouter.capture("stderr", buf)
+        sys.settrace(self._tracer)
+        try:
+            exec(self._code, namespace)
+        except _Cancelled:
+            buf.write("\n" + tr("[已停止] 用户中断了代码执行") + "\n")
+        except KeyboardInterrupt:
+            buf.write("\n" + tr("[已停止] 代码被 KeyboardInterrupt 中断") + "\n")
+        except SystemExit as e:
+            # 用户脚本里常见的 exit()/sys.exit()：只结束本次运行，绝不能退出整个程序
+            code = e.code
+            suffix = "" if code in (None, 0) else tr("（退出码 {}）").format(code)
+            buf.write("\n" + tr("[执行结束] 代码调用了 exit()/sys.exit()") + suffix + "\n")
+        except BaseException:
+            buf.write("\n" + tr("[执行错误]") + "\n")
+            buf.write(traceback.format_exc())
+        finally:
+            sys.settrace(None)
+            restore_out()
+            restore_err()
+            _close_all_figures()
 
         # 扫描命名空间中的 DataFrame 变量
         for name, value in namespace.items():
@@ -564,6 +653,24 @@ class CodeRunWorker(QThread):
                 result_dfs[name] = value
 
         self.done.emit(buf.getvalue(), result_dfs, sheet_requests, figure_files)
+
+
+def _close_figure(fig):
+    plt = sys.modules.get("matplotlib.pyplot")
+    if plt is not None:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+
+def _close_all_figures():
+    plt = sys.modules.get("matplotlib.pyplot")
+    if plt is not None:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +733,12 @@ class PythonAnalysisWindow(QMainWindow):
         self.run_action.setToolTip(tr("运行代码（F5 或 Ctrl+Enter）"))
         self.run_action.triggered.connect(self.run_code)
         toolbar.addAction(self.run_action)
+
+        self.stop_action = QAction(tr("■ 停止"), self)
+        self.stop_action.setToolTip(tr("中断正在运行的代码"))
+        self.stop_action.setEnabled(False)
+        self.stop_action.triggered.connect(self.stop_code)
+        toolbar.addAction(self.stop_action)
 
         clear_action = QAction(tr("清空输出"), self)
         clear_action.triggered.connect(lambda: self.output_edit.clear())
@@ -836,14 +949,24 @@ class PythonAnalysisWindow(QMainWindow):
         self.output_edit.clear()
         self.output_edit.setPlainText(tr("正在运行...\n"))
         self.run_action.setEnabled(False)
+        self.stop_action.setEnabled(True)
         self._run_started = time.perf_counter()
 
         self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None), self)
         self._worker.done.connect(self._on_run_done)
         self._worker.start()
 
+    def stop_code(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._status(tr("正在停止..."))
+
     def _on_run_done(self, output, result_dfs, sheet_requests, figure_files):
         self.run_action.setEnabled(True)
+        self.stop_action.setEnabled(False)
+        if figure_files:
+            output = (output or "") + "\n" + tr("已保存图表:") + "\n" + "\n".join(
+                "  " + f for f in figure_files) + "\n"
         self.output_edit.setPlainText(output if output else tr("✓ 代码执行完成（无输出）\n"))
         sb = self.output_edit.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -873,7 +996,8 @@ class PythonAnalysisWindow(QMainWindow):
 
         worker = self._worker
         self._worker = None
-        worker.deleteLater()
+        if worker is not None:
+            worker.deleteLater()
 
     def _status(self, msg):
         try:
@@ -926,8 +1050,15 @@ class PythonAnalysisWindow(QMainWindow):
     # ---------------- 关闭 ----------------
 
     def closeEvent(self, event):
-        # 等待后台线程结束，避免崩溃
+        # 正在运行的代码先请求停止并等待；仍停不下来就不关窗口——
+        # 挂在主窗口下的 QThread 若在运行中被销毁会直接崩溃整个程序
         if self._worker is not None and self._worker.isRunning():
-            self._worker.done.disconnect()
+            self._worker.cancel()
             self._worker.wait(3000)
+            if self._worker.isRunning():
+                QMessageBox.warning(
+                    self, tr("提示"),
+                    tr("代码仍在运行，无法关闭窗口。\n请等待其结束，或点击「停止」后再试。"))
+                event.ignore()
+                return
         super().closeEvent(event)

@@ -6,13 +6,14 @@ ImageViewer: 独立图片查看窗口，QGraphicsView 实现缩放和拖拽。
 copy_image_to_clipboard: 跨平台复制图片到剪贴板。
 """
 
+import mimetypes
 import os
 import platform
 import subprocess
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import (
-    QAction, QImage, QKeySequence, QPainter, QPixmap, QShortcut,
+    QAction, QKeySequence, QPainter, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.i18n import tr
+from qtui.image_utils import load_image
 
 
 def copy_image_to_clipboard(image_path):
@@ -30,28 +32,34 @@ def copy_image_to_clipboard(image_path):
     system = platform.system()
     try:
         if system == 'Darwin':
-            # 复制文件引用（POSIX file），粘贴到飞书/微信时是图片文件本身
-            script = f'set the clipboard to (POSIX file "{image_path}")'
-            subprocess.run(['osascript', '-e', script],
+            # 复制文件引用（POSIX file），粘贴到飞书/微信时是图片文件本身。
+            # 路径作为参数传入而不是拼进脚本文本，文件名含引号/反斜杠也安全。
+            script = 'on run argv\nset the clipboard to (POSIX file (item 1 of argv))\nend run'
+            subprocess.run(['osascript', '-e', script, image_path],
                            check=True, capture_output=True, timeout=10)
             return True
         elif system == 'Windows':
+            # PowerShell 单引号字符串不做插值，只需把 ' 写成 ''
+            ps_path = image_path.replace("'", "''")
             script = f'''
             Add-Type -AssemblyName System.Windows.Forms
-            $image = [System.Drawing.Image]::FromFile("{image_path}")
+            $image = [System.Drawing.Image]::FromFile('{ps_path}')
             [System.Windows.Forms.Clipboard]::SetImage($image)
             '''
-            subprocess.run(['powershell', '-Command', script],
+            subprocess.run(['powershell', '-NoProfile', '-Command', script],
                            check=True, capture_output=True, timeout=10)
             return True
         else:
+            mime = mimetypes.guess_type(image_path)[0]
+            if not mime or not mime.startswith('image/'):
+                mime = 'image/png'
             subprocess.run(['xclip', '-selection', 'clipboard',
-                            '-t', 'image/png', '-i', image_path],
+                            '-t', mime, '-i', image_path],
                            check=True, capture_output=True, timeout=10)
             return True
     except Exception:
-        # 系统工具失败时退回 Qt 剪贴板（粘贴为位图数据）
-        image = QImage(image_path)
+        # 系统工具失败时退回 Qt 剪贴板（粘贴为位图数据，已应用 EXIF 方向）
+        image = load_image(image_path)
         if image.isNull():
             return False
         clipboard = QApplication.clipboard()
@@ -88,7 +96,8 @@ class ImageViewer(QMainWindow):
         self.image_path = image_path
         self.setWindowTitle(os.path.basename(image_path))
 
-        self._pixmap = QPixmap(image_path) if os.path.exists(image_path) else QPixmap()
+        self._pixmap = (QPixmap.fromImage(load_image(image_path))
+                        if os.path.exists(image_path) else QPixmap())
         self._fitted = False
 
         if self._pixmap.isNull():

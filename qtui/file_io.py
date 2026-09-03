@@ -7,15 +7,29 @@
 
 import json
 import os
-import shutil
+import re
+import stat
 import tempfile
 
+import numpy as np
 import pandas as pd
+
+from qtui.i18n import tr
 
 RECENT_FILES_PATH = os.path.expanduser("~/.smart_table_hub/recent_files.json")
 MAX_RECENT_FILES = 10
 
-CSV_ENCODINGS = ("utf-8", "gbk", "gb2312", "latin1")
+# 尝试顺序：utf-8-sig 兼容有/无 BOM 的 utf-8；gb18030 是 gbk 的超集但几乎
+# 对任何字节对都不报错，必须排在 big5 之后；latin1 对任何字节都不报错，
+# 只能放最后兜底。
+CSV_ENCODINGS = ("utf-8-sig", "gbk", "big5", "gb18030", "utf-16", "latin1")
+
+# 新建 CSV 的默认编码：带 BOM 的 utf-8，Windows 上的 Excel 才能正确识别中文
+DEFAULT_CSV_ENCODING = "utf-8-sig"
+
+# Excel 对 sheet 名的限制
+SHEET_NAME_MAX_LEN = 31
+_SHEET_NAME_BAD_CHARS = set('\\/?*[]:')
 
 
 # ---------- 加载 ----------
@@ -34,9 +48,15 @@ def load_workbook_lazy(file_path):
 
 
 def read_sheet(excel_file: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
-    """读取单个 sheet，并对重复表头去重（与旧版行为一致）。"""
-    df = excel_file.parse(sheet_name)
-    df.columns = _dedupe_headers([str(c) for c in df.columns])
+    """读取单个 sheet。
+
+    先按单元格原始类型读入（dtype=object），再让 pandas 只推断整列同类型的
+    列：数字列仍是 float64/int64、日期列仍是 datetime64，而 Excel 里以文本
+    格式存放的 "007"（工号/邮编/编码）保持字符串，不会被静默改成 7。
+    重复表头 pandas 已自动改名（A、A.1 …）。
+    """
+    df = excel_file.parse(sheet_name, dtype=object).infer_objects()
+    df.columns = [str(c) for c in df.columns]
     return df
 
 
@@ -57,36 +77,150 @@ def _read_full_ragged_csv(file_path, enc, sep):
         return None
     from core.formula_engine import FormulaEngine
     names = [FormulaEngine.col_index_to_letter(i) for i in range(width)]
-    return pd.read_csv(file_path, encoding=enc, sep=sep, header=None,
-                       names=names, skip_blank_lines=False)
+    kwargs = dict(encoding=enc, sep=sep, header=None, names=names,
+                  skip_blank_lines=False)
+    df = pd.read_csv(file_path, **kwargs)
+    return _preserve_leading_zeros(df, file_path, kwargs)
+
+
+def _sniff_bom(file_path):
+    """按文件头 BOM 判断编码；无 BOM 返回 None。"""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return None
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    return None
+
+
+def _csv_may_have_leading_zeros(file_path, sep):
+    """字节级预扫：文件里是否出现"分隔符/引号/换行 + 0 + 数字"的字段开头。
+
+    绝大多数 CSV 没有前导零字段，预扫（memchr 速度）比二次解析便宜得多；
+    只有命中时才对数值列做逐列核对。
+    """
+    sep_b = sep.encode("ascii", "replace") if sep else b","
+    pat = re.compile(rb'[' + re.escape(sep_b) + rb'"\n]-?0[0-9]')
+    try:
+        with open(file_path, "rb") as f:
+            first = f.read(3)
+            if first[:1] == b"0" and first[1:2].isdigit():
+                return True
+            if first[:1] == b"-" and first[1:2] == b"0" and first[2:3].isdigit():
+                return True
+            f.seek(0)
+            tail = b""
+            while True:
+                chunk = f.read(1 << 22)
+                if not chunk:
+                    return False
+                buf = tail + chunk
+                if pat.search(buf):
+                    return True
+                tail = buf[-4:]
+    except OSError:
+        return True
+
+
+def _preserve_leading_zeros(df, file_path, read_kwargs):
+    """把被 pandas 推断成数字、但原文带前导零的列（邮编/工号/编码）还原为文本。
+
+    做法：只对"整数值"列（int 列，或非空值全为整数的 float 列）用 dtype=str
+    重读，比较原文长度与数字位数——原文更长即存在前导零（或 + 号），整列
+    保持原文。不改动其它列，pandas 的快速推断路径保持不变。
+    """
+    if df is None or len(df) == 0 or len(df.columns) == 0:
+        return df
+    enc = read_kwargs.get("encoding") or ""
+    if not enc.lower().startswith("utf-16"):
+        if not _csv_may_have_leading_zeros(file_path, read_kwargs.get("sep") or ","):
+            return df
+    cand = []
+    for i in range(len(df.columns)):
+        s = df.iloc[:, i]
+        if pd.api.types.is_bool_dtype(s):
+            continue
+        if pd.api.types.is_integer_dtype(s):
+            cand.append(i)
+        elif pd.api.types.is_float_dtype(s):
+            v = s.to_numpy()
+            nn = v[~np.isnan(v)]
+            if len(nn) and np.all(nn == np.floor(nn)):
+                cand.append(i)
+    if not cand:
+        return df
+    try:
+        raw = pd.read_csv(file_path, usecols=cand, dtype=str, **read_kwargs)
+    except Exception:
+        return df
+    if len(raw) != len(df):
+        return df
+    for pos, i in enumerate(cand):
+        rs = raw.iloc[:, pos]
+        mask = rs.notna().to_numpy()
+        if not mask.any():
+            continue
+        texts = rs.to_numpy()[mask].astype(str)
+        lens = np.char.str_len(np.char.strip(texts))
+        v = df.iloc[:, i].to_numpy()[mask].astype(np.float64)
+        av = np.abs(v)
+        digits = np.where(av < 1, 1, np.floor(np.log10(np.maximum(av, 1)) + 1e-9) + 1)
+        digits = digits + (v < 0)
+        if (lens > digits).any():
+            df.isetitem(i, rs.to_numpy())
+    return df
 
 
 def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
-    """按 utf-8 → gbk → gb2312 → latin1 顺序尝试读取 CSV/TSV。
+    """按 BOM → utf-8 → gbk → big5 → gb18030 → utf-16 → latin1 顺序尝试读取 CSV/TSV。
 
     列数不一致（前言元数据行比数据行窄）导致解析失败时，改为整文件
     原样载入（首行也作为数据、列名用位置字母），由用户决定表头。
+    空文件返回空 DataFrame。检测到的编码记录在 df.attrs["source_encoding"]，
+    保存时可按原编码写回。
     """
     last_err = None
     sep = delimiter
     if sep is None:
         sep = "\t" if file_path.lower().endswith((".tsv", ".txt")) else ","
-    for enc in CSV_ENCODINGS:
+    bom_enc = _sniff_bom(file_path)
+    encodings = (bom_enc,) if bom_enc else CSV_ENCODINGS
+    for enc in encodings:
+        kwargs = dict(encoding=enc, sep=sep)
         try:
-            return pd.read_csv(file_path, encoding=enc, sep=sep)
+            df = pd.read_csv(file_path, **kwargs)
+            df = _preserve_leading_zeros(df, file_path, kwargs)
         except UnicodeDecodeError as e:
             last_err = e
             continue
+        except UnicodeError as e:  # utf-16 缺 BOM 等
+            last_err = e
+            continue
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame()
         except pd.errors.ParserError as e:
             last_err = e
             try:
                 df = _read_full_ragged_csv(file_path, enc, sep)
-                if df is not None:
-                    return df
-            except (UnicodeDecodeError, pd.errors.ParserError) as e2:
+            except (UnicodeDecodeError, UnicodeError, pd.errors.ParserError) as e2:
                 last_err = e2
-            continue
+                continue
+            if df is None:
+                df = pd.DataFrame()
+        df.attrs["source_encoding"] = _source_encoding_name(file_path, enc)
+        return df
     raise last_err
+
+
+def _source_encoding_name(file_path, enc):
+    """utf-8-sig 能解码无 BOM 的 utf-8；记录时区分有无 BOM，保存才能原样写回。"""
+    if enc == "utf-8-sig" and _sniff_bom(file_path) != "utf-8-sig":
+        return "utf-8"
+    return enc
 
 
 def _xlsx_has_formulas(file_path):
@@ -225,6 +359,42 @@ def xlsx_has_coord_marker(file_path) -> bool:
         return False
 
 
+def check_sheet_name(name, existing_names=()):
+    """校验 sheet 名是否符合 Excel 规则；合法返回 None，否则返回错误说明。
+
+    规则：非空、不超过 31 个字符、不含 \\ / ? * [ ] :、
+    与 existing_names 不重名（Excel 不区分大小写）。
+    """
+    if name is None or not str(name).strip():
+        return tr("Sheet 名不能为空")
+    name = str(name)
+    if len(name) > SHEET_NAME_MAX_LEN:
+        return tr("Sheet 名不能超过 {} 个字符").format(SHEET_NAME_MAX_LEN)
+    bad = [c for c in name if c in _SHEET_NAME_BAD_CHARS]
+    if bad:
+        return tr("Sheet 名不能包含字符: {}").format(" ".join(sorted(set(bad))))
+    lowered = name.lower()
+    for other in existing_names:
+        if str(other).lower() == lowered:
+            return tr("已存在同名 Sheet: {}").format(other)
+    return None
+
+
+def _replace_file(tmp_path, file_path):
+    """用临时文件原子替换目标；保留目标原有权限位（新文件用 0644）。"""
+    try:
+        mode = stat.S_IMODE(os.stat(file_path).st_mode)
+    except OSError:
+        mode = 0o644
+    try:
+        os.chmod(tmp_path, mode)
+    except OSError:
+        pass
+    # os.replace 在 POSIX 与 Windows 上都是原子替换；失败时直接报错，
+    # 绝不退化成"先清空目标再拷贝"的非原子写法
+    os.replace(tmp_path, file_path)
+
+
 def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                   progress_cb=None, cell_colors=None):
     """把 {sheet名: DataFrame} 全量写入 xlsx。
@@ -235,10 +405,16 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
     写成真实的单元格填充（Excel 中同样可见）。
     progress_cb: 可选 (sheet名, 序号从1起, 总数) -> None，逐 sheet 汇报进度。
     先写临时文件再原子替换，避免写一半损坏原文件（与旧版后台保存策略一致）。
+    sheet 名不合法（过长/非法字符/重名）时抛 ValueError，而不是静默截断
+    导致两个 sheet 互相覆盖。
     """
     from openpyxl.styles import PatternFill
     order = sheet_order or list(sheets.keys())
     order = [n for n in order if n in sheets]
+    for i, name in enumerate(order):
+        err = check_sheet_name(name, order[:i])
+        if err:
+            raise ValueError(tr("Sheet 名 \"{}\" 不合法：{}").format(name, err))
     formulas = formulas or {}
     cell_colors = cell_colors or {}
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(file_path) or ".")
@@ -249,12 +425,11 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
             for i, name in enumerate(order):
                 if progress_cb:
                     progress_cb(name, i + 1, len(order))
-                safe_name = name[:31]
-                sheets[name].to_excel(writer, sheet_name=safe_name, index=False)
+                sheets[name].to_excel(writer, sheet_name=name, index=False)
                 for (row, col), formula in formulas.get(name, {}).items():
                     # +2: 跳过表头行且 openpyxl 从 1 开始计数
-                    writer.sheets[safe_name].cell(row=row + 2, column=col + 1,
-                                                  value=formula)
+                    writer.sheets[name].cell(row=row + 2, column=col + 1,
+                                             value=formula)
                 for (row, col), color in cell_colors.get(name, {}).items():
                     argb = "FF" + str(color).lstrip("#").upper()
                     fill = fill_cache.get(argb)
@@ -263,19 +438,34 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                                            fill_type="solid")
                         fill_cache[argb] = fill
                     excel_row = row + 2 if row >= 0 else 1   # -1 = 表头行
-                    writer.sheets[safe_name].cell(
+                    writer.sheets[name].cell(
                         row=excel_row, column=col + 1).fill = fill
             # 坐标版本标记：本应用保存的文件加载时公式结果可放心写入
             writer.book.properties.keywords = COORD_MARKER
-        shutil.move(tmp_path, file_path)
+        _replace_file(tmp_path, file_path)
     except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
 
 
-def save_csv(file_path, df: pd.DataFrame):
-    df.to_csv(file_path, index=False, encoding="utf-8")
+def save_csv(file_path, df: pd.DataFrame, encoding=None):
+    """写 CSV：先写同目录临时文件再原子替换，写一半失败不会损坏原文件。
+
+    encoding 未指定时依次取：df.attrs["source_encoding"]（读取时记录的
+    原文件编码，按原样写回）→ utf-8-sig（新文件；带 BOM，Windows Excel
+    才能正确显示中文）。
+    """
+    enc = encoding or df.attrs.get("source_encoding") or DEFAULT_CSV_ENCODING
+    fd, tmp_path = tempfile.mkstemp(suffix=".csv", dir=os.path.dirname(file_path) or ".")
+    os.close(fd)
+    try:
+        df.to_csv(tmp_path, index=False, encoding=enc)
+        _replace_file(tmp_path, file_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 # ---------- 最近文件 ----------

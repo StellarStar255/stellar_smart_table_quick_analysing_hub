@@ -94,13 +94,15 @@ class TestReviewFindings:
         apply_filter(win, FILTER_X_GT_15,
                      {'col': 'X', 'condition': '小于', 'value': '100'})
         assert win.model.formulas == {}
-        assert '静态值' in win.statusBar().currentMessage()
+        msg = win.statusBar().currentMessage()
+        assert '静态值' in msg or 'static value' in msg   # 状态栏文案随界面语言
 
     def test_clear_filters_notifies_frozen_view_formulas(self, win):
         apply_filter(win, FILTER_X_GT_15)
         win.model.setData(win.model.index(1, 1), '=A2*2')
         win.clear_all_filters()
-        assert '静态值' in win.statusBar().currentMessage()
+        msg = win.statusBar().currentMessage()
+        assert '静态值' in msg or 'static value' in msg   # 状态栏文案随界面语言
 
     def _copy_cell(self, win, row, col):
         idx = win.model.index(row, col)

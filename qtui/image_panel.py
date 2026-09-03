@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.i18n import tr
+from qtui.image_utils import load_image
 
 STRIP_BEFORE, STRIP_AFTER = 10, 12      # 胶片条向前/向后渲染的行数
 THUMB_CACHE_LIMIT = 300
@@ -43,11 +44,8 @@ class _ImageLoader(QRunnable):
         self._signals = signals
 
     def run(self):
-        img = QImage(self._path)
-        if not img.isNull() and (img.width() > self._size.width()
-                                 or img.height() > self._size.height()):
-            img = img.scaled(self._size, Qt.AspectRatioMode.KeepAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
+        # 解码时直接缩放并应用 EXIF 方向（见 image_utils.load_image）
+        img = load_image(self._path, self._size)
         self._signals.loaded.emit(self._path, img)
 
 
@@ -479,6 +477,8 @@ class ImagePreviewPanel(QWidget):
                     else Qt.TransformationMode.FastTransformation)
             cell.img_label.setPixmap(pix.scaled(
                 size, Qt.AspectRatioMode.KeepAspectRatio, mode))
+        elif cell.path in self._thumb_cache:
+            cell.img_label.setText(tr("加载失败"))
         else:
             cell.img_label.setText("…")
 
@@ -493,6 +493,7 @@ class ImagePreviewPanel(QWidget):
     def _on_thumb_loaded(self, path, img):
         self._thumb_inflight.discard(path)
         if img.isNull():
+            self._thumb_cache[path] = None   # 记住失败，不再反复重试解码
             for cell in self._entries:
                 if cell.path == path:
                     cell.img_label.setText(tr("加载失败"))

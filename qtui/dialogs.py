@@ -6,6 +6,7 @@ LoadingProgressDialog: 对应 Tkinter 版 ui/dialogs.py 的同名类。
 原版通过手动 pump 事件循环保持动画；Qt 版用 QThread + 信号，天然线程安全。
 """
 
+import sys
 import traceback
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -28,7 +29,6 @@ class _Worker(QThread):
     def run(self):
         # 纯 Python 密集任务（如 openpyxl 写盘）会长时间占住 GIL，
         # 把主线程 UI 一起拖卡；缩短切换间隔让 UI 线程更容易抢到 GIL。
-        import sys
         old_interval = sys.getswitchinterval()
         sys.setswitchinterval(0.001)
         try:
@@ -38,17 +38,22 @@ class _Worker(QThread):
             self.failed.emit(traceback.format_exc())
         finally:
             sys.setswitchinterval(old_interval)
+            # 释放闭包引用（保存任务的闭包会持有所有 sheet 的 DataFrame）
+            self._func = None
 
 
 class LoadingProgressDialog(QDialog):
     """模态加载对话框，支持确定/不确定两种进度模式。
 
-    API 与 Tkinter 版保持一致:
-        update(progress, message=None)
+    后台任务运行期间不可通过 Esc/关闭按钮关闭（否则任务仍在跑，
+    用户却可以继续操作，完成回调会覆盖用户此时的状态）。
+
+    API:
+        set_progress(progress, message=None)
         set_indeterminate(message=None)
         set_determinate(progress=0, message=None)
         run_in_background(func, callback=None)
-        close()
+        last_error: 后台任务抛异常时的 traceback 文本（成功为 None）
     """
 
     def __init__(self, parent=None, title=None, message=None):
@@ -62,6 +67,8 @@ class LoadingProgressDialog(QDialog):
             | Qt.WindowType.WindowTitleHint
         )
         self.setFixedWidth(360)
+        # exec() 结束后释放 C++ 对象；否则每次加载/保存都在主窗口下残留一个子对象
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -77,10 +84,28 @@ class LoadingProgressDialog(QDialog):
         layout.addWidget(self._bar)
 
         self._worker = None
+        self.last_error = None
 
-    # ---------- 与 Tkinter 版一致的 API ----------
+    # ---------- 阻止任务运行期间被关闭 ----------
 
-    def update(self, progress, message=None):
+    def _busy(self):
+        return self._worker is not None and self._worker.isRunning()
+
+    def reject(self):
+        # QDialog 默认把 Esc 映射到 reject()
+        if self._busy():
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._busy():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    # ---------- 进度 API ----------
+
+    def set_progress(self, progress, message=None):
         self._bar.setRange(0, 100)
         self._bar.setValue(int(progress))
         if message is not None:
@@ -104,20 +129,29 @@ class LoadingProgressDialog(QDialog):
             self._worker.progressed.emit(message)
 
     def run_in_background(self, func, callback=None):
-        """后台线程执行 func，完成后在主线程回调 callback(result)。"""
+        """后台线程执行 func，完成后在主线程回调 callback(result)。
+
+        func 抛异常时 callback 收到 None，traceback 存于 self.last_error。
+        """
         self._worker = _Worker(func, self)
         self._worker.progressed.connect(self._label.setText)
 
-        def _done(result):
+        def _finish():
+            # 信号在线程 run() 返回前发出，等它真正结束再允许关闭
+            self._worker.wait(5000)
             self.close()
+
+        def _done(result):
+            _finish()
             if callback:
                 callback(result)
 
         def _fail(tb):
-            self.close()
+            self.last_error = tb
+            print(tb, file=sys.stderr)
+            _finish()
             if callback:
                 callback(None)
-            print(tb)
 
         self._worker.finished_ok.connect(_done)
         self._worker.failed.connect(_fail)

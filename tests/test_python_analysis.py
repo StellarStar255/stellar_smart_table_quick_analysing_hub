@@ -234,3 +234,56 @@ class TestCodeEditor:
         w_small = ed.line_number_width()
         ed.setPlainText("\n" * 120)
         assert ed.line_number_width() > w_small
+
+
+class TestUserCodeCannotKillApp:
+    """exit()/sys.exit()/KeyboardInterrupt 只结束本次运行，不能退出整个程序"""
+
+    def test_sys_exit_is_captured(self):
+        output, _, sheets, _ = run_worker("import sys\nprint('a')\nsys.exit(3)", pd.DataFrame())
+        assert 'a' in output and 'exit' in output and '3' in output
+
+    def test_builtin_exit_and_quit_are_captured(self):
+        for code in ("exit()", "quit()", "exit"):
+            output, _, _, _ = run_worker(code, pd.DataFrame())
+            assert 'exit' in output or output == "", code
+
+    def test_keyboard_interrupt_is_captured(self):
+        output, _, _, _ = run_worker("raise KeyboardInterrupt", pd.DataFrame())
+        assert 'KeyboardInterrupt' in output
+
+    def test_cancel_stops_infinite_loop(self):
+        import time
+        worker = CodeRunWorker("while True:\n    pass", pd.DataFrame(), None)
+        worker.start()
+        time.sleep(0.2)
+        assert worker.isRunning()
+        worker.cancel()
+        assert worker.wait(3000)
+        assert not worker.isRunning()
+
+    def test_figures_closed_after_run(self, tmp_path):
+        import matplotlib.pyplot as plt
+        path = str(tmp_path / 'f.png').replace('\\', '\\\\')
+        for _ in range(3):
+            run_worker("import matplotlib.pyplot as plt\nfig, ax = plt.subplots()\n"
+                       f"save_figure(fig, '{path}')", pd.DataFrame())
+        assert plt.get_fignums() == []
+        assert os.path.exists(str(tmp_path / 'f.png'))
+
+    def test_main_thread_prints_not_captured(self, capsys):
+        import threading
+        from qtui.python_analysis import _StreamRouter
+        buf = __import__('io').StringIO()
+        restore = _StreamRouter.capture("stdout", buf)
+        try:
+            print("from-main")
+            t = threading.Thread(target=lambda: print("from-thread"))
+            t.start()
+            t.join()
+        finally:
+            restore()
+        # 只有登记了的线程（这里是主线程）被捕获；别的线程照常输出
+        assert buf.getvalue() == "from-main\n"
+        assert "from-thread" in capsys.readouterr().out
+        assert not isinstance(sys.stdout, _StreamRouter)   # 用完还原

@@ -46,9 +46,14 @@ def _urlopen(request, timeout):
 
 
 def _parse_version(text):
-    """'v1.2.3' -> (1, 2, 3)；无法解析返回 None。"""
-    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", str(text).strip())
-    return tuple(int(x) for x in m.groups()) if m else None
+    """'v1.2.3' -> (1, 2, 3)；接受 2～4 段（'v1.5' -> (1, 5, 0)）；无法解析返回 None。"""
+    m = re.match(r"v?(\d+(?:\.\d+){1,3})(?!\d)", str(text).strip())
+    if not m:
+        return None
+    parts = [int(x) for x in m.group(1).split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
 
 
 def _platform_asset_pattern():
@@ -86,17 +91,37 @@ class UpdateChecker(QThread):
 
 
 class Downloader(QThread):
+    """下载安装包；给了 release 时顺带在本线程完成 SHA256 校验（不卡 UI）。
+
+    校验结果存于 checksum_status：
+        "ok"          哈希一致
+        "mismatch"    哈希不一致（传输损坏，上层重下）
+        "absent"      Release 没有 SHA256SUMS.txt 或其中没有本文件的条目
+        "unavailable" 取校验文件时网络失败（与 absent 区分：不能借此跳过校验）
+        None          未要求校验
+    """
     progress = pyqtSignal(int, int)  # received, total
     done = pyqtSignal(str)           # 本地文件路径
     failed = pyqtSignal(str)
 
-    def __init__(self, url, dest, parent=None):
+    def __init__(self, url, dest, parent=None, release=None, asset_name=None):
         super().__init__(parent)
         self.url, self.dest = url, dest
+        self._release = release
+        self._asset_name = asset_name
         self._cancelled = False
+        self.checksum_status = None
+        self.checksum_error = ""
 
     def cancel(self):
         self._cancelled = True
+
+    def _remove_partial(self):
+        try:
+            if os.path.exists(self.dest):
+                os.unlink(self.dest)
+        except OSError:
+            pass
 
     def run(self):
         try:
@@ -107,21 +132,36 @@ class Downloader(QThread):
                 received = 0
                 while True:
                     if self._cancelled:
-                        return
+                        break
                     chunk = resp.read(1024 * 256)
                     if not chunk:
                         break
                     fh.write(chunk)
                     received += len(chunk)
                     self.progress.emit(received, total)
+            if self._cancelled:
+                self._remove_partial()   # 半截文件不留在临时目录
+                return
             # 弱网下连接提前断开时 read() 只返回 EOF 不报错，
             # 按 Content-Length 预检出截断，让上层走自动重试
             if total and received < total:
                 raise IOError(
                     tr("下载不完整（{}/{} 字节）").format(received, total))
+            if self._release is not None:
+                self._verify()
             self.done.emit(self.dest)
         except Exception as exc:
+            self._remove_partial()
             self.failed.emit(str(exc))
+
+    def _verify(self):
+        status, expected = _fetch_checksum(self._release, self._asset_name)
+        if status != "ok":
+            self.checksum_status = status
+            self.checksum_error = expected or ""
+            return
+        actual = _sha256(self.dest)
+        self.checksum_status = "ok" if actual == expected else "mismatch"
 
 
 def _sha256(path):
@@ -133,20 +173,27 @@ def _sha256(path):
 
 
 def _fetch_checksum(release, asset_name):
-    """从 Release 的 SHA256SUMS.txt 中取出指定文件的哈希；取不到返回 None。"""
+    """从 Release 的 SHA256SUMS.txt 中取出指定文件的哈希。
+
+    返回 (状态, 值)：("ok", 哈希) / ("absent", None) 没有校验文件或没有该
+    文件的条目 / ("unavailable", 错误信息) 网络失败——后者不能当作"没有
+    校验文件"而放行安装。
+    """
     for asset in release.get("assets", []):
         if asset["name"] == "SHA256SUMS.txt":
             try:
                 req = urllib.request.Request(
                     asset["browser_download_url"], headers=_HEADERS)
                 with _urlopen(req, timeout=15) as resp:
-                    for line in resp.read().decode("utf-8").splitlines():
-                        parts = line.split()
-                        if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
-                            return parts[0].lower()
-            except Exception:
-                return None
-    return None
+                    text = resp.read().decode("utf-8")
+            except Exception as exc:
+                return "unavailable", str(exc)
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
+                    return "ok", parts[0].lower()
+            return "absent", None
+    return "absent", None
 
 
 # ================= 安装（分平台） =================
@@ -164,40 +211,90 @@ def _install_macos(installer_path):
         subprocess.Popen(["open", installer_path])
         return True
 
+    log_dir = os.path.expanduser("~/.smart_table_hub")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "update_error.log")
     script = os.path.join(tempfile.gettempdir(), "smart_table_hub_update.sh")
     with open(script, "w", encoding="utf-8") as fh:
         fh.write(f"""#!/bin/bash
-# Smart Table Hub 自动升级脚本
+# Smart Table Hub 自动升级脚本：先把新版复制到 TARGET.new，成功后再交换，
+# 任何一步失败都保留旧版本并弹窗告知（日志见 {log_path}）。
 DMG="{installer_path}"
 TARGET="{app_bundle}"
+LOG="{log_path}"
 PID={os.getpid()}
+exec >>"$LOG" 2>&1
+echo "==== $(date) update start: $DMG -> $TARGET"
 while kill -0 "$PID" 2>/dev/null; do sleep 0.5; done
+
+fail() {{
+    echo "FAILED: $1"
+    [ -n "$MOUNT" ] && hdiutil detach "$MOUNT" -quiet
+    rm -rf "$TARGET.new"
+    osascript -e "display alert \\"{APP_NAME}\\" message \\"升级失败：$1\\n详情见 $LOG\\n原版本未受影响。\\" as critical" || true
+    [ -d "$TARGET" ] && open "$TARGET"
+    rm -f "$0"
+    exit 1
+}}
+
 MOUNT=$(hdiutil attach -nobrowse -readonly "$DMG" | tail -1 | awk -F'\\t' '{{print $NF}}')
-[ -z "$MOUNT" ] && exit 1
+[ -z "$MOUNT" ] && fail "无法挂载升级包"
 NEW_APP=$(ls -d "$MOUNT"/*.app 2>/dev/null | head -1)
-if [ -n "$NEW_APP" ]; then
-    rm -rf "$TARGET"
-    ditto "$NEW_APP" "$TARGET"
-    xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null
+[ -z "$NEW_APP" ] && fail "升级包内没有应用"
+rm -rf "$TARGET.new"
+ditto "$NEW_APP" "$TARGET.new" || fail "复制新版本失败（磁盘空间或权限不足）"
+xattr -dr com.apple.quarantine "$TARGET.new" 2>/dev/null
+rm -rf "$TARGET.old"
+if [ -d "$TARGET" ]; then
+    mv "$TARGET" "$TARGET.old" || fail "无法移走旧版本（权限不足）"
 fi
+if ! mv "$TARGET.new" "$TARGET"; then
+    [ -d "$TARGET.old" ] && mv "$TARGET.old" "$TARGET"
+    fail "无法放置新版本"
+fi
+rm -rf "$TARGET.old"
 hdiutil detach "$MOUNT" -quiet
 rm -f "$DMG"
+echo "OK"
 open "$TARGET"
 rm -f "$0"
 """)
     os.chmod(script, 0o755)
-    subprocess.Popen(["/bin/bash", script],
-                     start_new_session=True,
+    subprocess.Popen(["/bin/bash", script], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
 
 
 def _install_windows(installer_path):
-    """静默运行 Inno Setup 安装器；安装器会关闭旧程序并在结束后重启。"""
+    """静默运行 Inno Setup 安装器；安装器会关闭旧程序并在结束后重启。
+
+    安装器退出后由一个后台批处理把安装包从临时目录删掉（安装器运行期间
+    文件被占用删不掉，批处理每 10 秒重试，最多约 30 分钟后放弃）。
+    """
     subprocess.Popen(
         [installer_path, "/SILENT", "/CLOSEAPPLICATIONS",
          "/RESTARTAPPLICATIONS", "/NORESTART"],
         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    try:
+        cleaner = os.path.join(tempfile.gettempdir(), "smart_table_hub_cleanup.bat")
+        with open(cleaner, "w", encoding="utf-8") as fh:
+            fh.write(f"""@echo off
+set /a tries=0
+:retry
+timeout /t 10 /nobreak >nul
+del /q "{installer_path}" 2>nul
+if not exist "{installer_path}" goto done
+set /a tries+=1
+if %tries% lss 180 goto retry
+:done
+del /q "%~f0"
+""")
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                 | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.Popen(["cmd", "/c", cleaner], creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
     return True
 
 
@@ -302,7 +399,8 @@ class UpdateManager:
         dialog.setAutoClose(False)
         dialog.setMinimumDuration(0)
 
-        self._downloader = Downloader(asset["browser_download_url"], dest)
+        self._downloader = Downloader(asset["browser_download_url"], dest,
+                                      release=release, asset_name=asset["name"])
         self._downloader.progress.connect(
             lambda got, total: dialog.setValue(
                 int(got * 100 / total) if total else 0))
@@ -326,22 +424,32 @@ class UpdateManager:
                 self._MAX_DOWNLOAD_ATTEMPTS - 1, msg))
 
     def _verify_and_install(self, release, asset, path, attempt=1):
-        expected = _fetch_checksum(release, asset["name"])
-        if expected:
-            actual = _sha256(path)
-            if actual != expected:
-                os.unlink(path)
-                if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
-                    # 校验失败大概率是传输损坏，自动重新下载
-                    self._download_and_install(release, asset, attempt + 1)
-                    return
-                QMessageBox.critical(
-                    self.window, tr("校验失败"),
-                    tr("升级包 SHA256 校验失败（已自动重试 {} 次），已取消安装。\n"
-                       "请前往官方 Release 页面手动下载。").format(
-                        self._MAX_DOWNLOAD_ATTEMPTS - 1))
+        # 校验已在下载线程完成（取校验文件 + 对几百 MB 做 SHA256 都不占 UI 线程）
+        status = self._downloader.checksum_status if self._downloader else None
+        if status == "mismatch":
+            os.unlink(path)
+            if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+                # 校验失败大概率是传输损坏，自动重新下载
+                self._download_and_install(release, asset, attempt + 1)
                 return
-        else:
+            QMessageBox.critical(
+                self.window, tr("校验失败"),
+                tr("升级包 SHA256 校验失败（已自动重试 {} 次），已取消安装。\n"
+                   "请前往官方 Release 页面手动下载。").format(
+                    self._MAX_DOWNLOAD_ATTEMPTS - 1))
+            return
+        if status == "unavailable":
+            # 网络取不到校验文件 ≠ 没有校验文件：不能放行未校验的安装包
+            os.unlink(path)
+            if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+                self._download_and_install(release, asset, attempt + 1)
+                return
+            QMessageBox.critical(
+                self.window, tr("无法校验"),
+                tr("无法获取升级包的校验文件（网络错误），已取消安装：\n{}").format(
+                    self._downloader.checksum_error if self._downloader else ""))
+            return
+        if status != "ok":
             box = QMessageBox(self.window)
             box.setIcon(QMessageBox.Icon.Warning)
             box.setWindowTitle(tr("无法校验"))
