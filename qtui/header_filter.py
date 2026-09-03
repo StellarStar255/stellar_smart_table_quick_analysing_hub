@@ -126,6 +126,7 @@ class ColumnFilterPopup(QDialog):
                          | Qt.WindowType.FramelessWindowHint)
         self.result = None
         self.sort_ascending = None
+        self._target_pos = None
         self._truncated = len(value_counts) > MAX_VALUES
         self._values = value_counts[:MAX_VALUES]
 
@@ -300,16 +301,36 @@ class ColumnFilterPopup(QDialog):
         self.accept()
 
     def popup_at(self, global_pos):
-        """在给定屏幕坐标下方弹出，超出屏幕时贴边。"""
-        screen = self.screen()
+        """在给定屏幕坐标下方弹出，超出屏幕时向上翻。"""
+        # adjustSize 会按"列表想显示全部值"来算高度，值多时能撑到上千像素，
+        # 于是超出屏幕后被推到别处——这里把尺寸夹在可控范围内
         self.adjustSize()
-        pos = QPoint(global_pos)
-        if screen is not None:
-            avail = screen.availableGeometry()
-            pos.setX(min(pos.x(), avail.right() - self.width() - 4))
-            pos.setX(max(pos.x(), avail.left() + 4))
-            if pos.y() + self.height() > avail.bottom():
-                pos.setY(max(avail.top() + 4, avail.bottom() - self.height() - 4))
-        self.move(pos)
+        self.resize(min(max(self.width(), 280), 400),
+                    min(max(self.height(), 320), 480))
+        self._target_pos = self._clamp_to_screen(global_pos)
+        # QDialog 默认会把自己居中到父窗口（WA_Moved 未设时），加上部分窗口
+        # 管理器还会自作主张摆位——显式设 WA_Moved，并在 show 之后再摆一次
+        self.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
+        self.move(self._target_pos)
         self.search_edit.setFocus()
         return self.exec()
+
+    def _clamp_to_screen(self, global_pos):
+        pos = QPoint(global_pos)
+        screen = self.screen()
+        if screen is None:
+            return pos
+        avail = screen.availableGeometry()
+        pos.setX(min(pos.x(), avail.right() - self.width() - 4))
+        pos.setX(max(pos.x(), avail.left() + 4))
+        if pos.y() + self.height() > avail.bottom():
+            # 下方放不下就往上翻（贴着箭头上沿），别飘到屏幕中间
+            above = global_pos.y() - self.height() - 24
+            pos.setY(above if above >= avail.top() + 4
+                     else max(avail.top() + 4, avail.bottom() - self.height() - 4))
+        return pos
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._target_pos is not None and self.pos() != self._target_pos:
+            self.move(self._target_pos)      # 压过窗口管理器的摆位

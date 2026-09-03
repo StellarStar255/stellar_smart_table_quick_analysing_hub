@@ -160,6 +160,11 @@ class PandasTableModel(QAbstractTableModel):
             self._col_arrays[col] = info
         return info
 
+    @property
+    def engine(self):
+        """公式引擎（宿主重写挂起公式的引用时要用）。"""
+        return self._engine
+
     def _invalidate_values(self, col=None):
         """使显示缓存失效；单格写入只需失效所在列，避免每次编辑重建整表缓存。"""
         if col is None:

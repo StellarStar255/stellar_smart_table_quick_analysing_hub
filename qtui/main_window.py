@@ -9,6 +9,7 @@ Qt 的 QTableView 是虚拟化渲染，因此旧版的行分页、列分页、�
 虚拟滚动条等全部性能补丁在这里都不需要了。
 """
 
+import bisect
 import csv
 import io
 import os
@@ -19,7 +20,8 @@ import numpy as np
 import pandas as pd
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QSettings, QEvent, QRect, QItemSelection, QItemSelectionModel,
+    Qt, QTimer, QSettings, QEvent, QPoint, QRect, QItemSelection,
+    QItemSelectionModel,
 )
 from PyQt6.QtGui import (
     QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
@@ -1864,10 +1866,58 @@ class MainWindow(QMainWindow):
     # ---------- 行列操作 ----------
 
     def _require_no_filter(self):
+        """行的增删在筛选下没法安全映射位置（列可以，见 _sync_original_columns）。"""
         if self.active_filters:
-            QMessageBox.information(self, tr("提示"), tr("筛选状态下不支持增删行/列，请先清除筛选"))
+            QMessageBox.information(self, tr("提示"),
+                                    tr("筛选状态下不支持增删行，请先清除筛选"))
             return False
         return True
+
+    def _shift_original_ledgers(self, col_map):
+        """把原坐标底账（挂起公式、原始底色）的列号按 col_map 重排。
+
+        col_map: 旧列号 -> 新列号，返回 None 表示该列已删除。
+        """
+        def remap(d):
+            out = {}
+            for (r, c), v in d.items():
+                nc = c if c < 0 else col_map(c)
+                if nc is None:
+                    continue
+                out[(r, nc)] = v
+            return out
+        if self._orig_cell_colors:
+            self._orig_cell_colors = remap(self._orig_cell_colors)
+        if self._suspended_formulas:
+            shifted = remap(self._suspended_formulas)
+            engine = self.model.engine
+            self._suspended_formulas = {
+                key: engine.adjust_formula_refs(f, None, col_map)
+                for key, f in shifted.items()
+            }
+
+    def _sync_original_columns(self, insert_pos=None, name=None, removed=None):
+        """筛选中做的列增删同步到 original_df（列与行筛选无关，可以安全同步）。
+
+        removed: 已删除的列号列表（按删除前的列位置）。
+        """
+        if self.original_df is None:
+            return
+        if insert_pos is not None:
+            self.original_df.insert(insert_pos, name, np.nan)
+            self._shift_original_ledgers(
+                lambda c: c + 1 if c >= insert_pos else c)
+        if removed:
+            dropped = sorted(removed)
+            names = [self.original_df.columns[c] for c in dropped]
+            self.original_df = self.original_df.drop(columns=names)
+            deleted = set(dropped)
+
+            def col_map(c):
+                if c in deleted:
+                    return None
+                return c - bisect.bisect_left(dropped, c)
+            self._shift_original_ledgers(col_map)
 
     def _current_row(self):
         """当前数据行（0 基）；视图第 0 行是表头行。"""
@@ -1888,14 +1938,11 @@ class MainWindow(QMainWindow):
         self._mark_modified()
 
     def insert_column(self, position=None):
-        if not self._require_no_filter():
-            return
         name, ok = QInputDialog.getText(self, tr("插入列"), tr("列名（留空自动命名）:"))
         if not ok:
             return
         pos = position if position is not None else self._current_col()
-        self.model.insert_column(pos, name.strip() or None)
-        self._mark_modified()
+        self._insert_col_at(pos, name.strip() or None)
 
     def delete_selected_rows(self):
         if not self._require_no_filter():
@@ -1912,9 +1959,24 @@ class MainWindow(QMainWindow):
         self._mark_modified()
         self.update_statusbar()
 
+    def _remove_columns(self, cols):
+        """删除列并同步 original_df；该列上的筛选条件一并撤掉。"""
+        names = {str(self.model.df.columns[c]) for c in cols}
+        self.model.remove_columns(cols)
+        self._sync_original_columns(removed=cols)
+        dropped_filters = [f for f in self.active_filters if f.get("col") in names]
+        if dropped_filters:
+            self.active_filters = [f for f in self.active_filters
+                                   if f.get("col") not in names]
+            if self.active_filters:
+                self._reapply_filters()
+            else:
+                self.clear_all_filters()
+        else:
+            self._rebuild_filter_bar()   # 漏斗标记跟着列位置变
+        self._mark_modified()
+
     def delete_selected_columns(self):
-        if not self._require_no_filter():
-            return
         cols = sorted({i.column() for i in self.table.selectionModel().selectedIndexes()})
         if not cols:
             return
@@ -1925,8 +1987,7 @@ class MainWindow(QMainWindow):
                 ", ".join(names[:5]) + ("..." if len(names) > 5 else "")))
         if ret != QMessageBox.StandardButton.Yes:
             return
-        self.model.remove_columns(cols)
-        self._mark_modified()
+        self._remove_columns(cols)
         self.update_statusbar()
 
     def _rename_column_at(self, col_idx):
@@ -2057,9 +2118,10 @@ class MainWindow(QMainWindow):
             self, colname, counts,
             checked=set(existing["value"]) if existing else None,
             has_filter=has_filter)
+        # 贴着该列列头的左下角弹出（和 Excel 一样挂在列头下面）
         header = self.table.horizontalHeader()
-        rect = header.arrow_rect_at(col_idx)
-        popup.popup_at(header.mapToGlobal(rect.bottomLeft()))
+        anchor = QPoint(header.sectionViewportPosition(col_idx), header.height())
+        popup.popup_at(header.viewport().mapToGlobal(anchor))
         if popup.sort_ascending is not None:
             self._sort_by(col_idx, popup.sort_ascending)
             return
@@ -2841,10 +2903,11 @@ class MainWindow(QMainWindow):
         self._formula_clipboard = None
         self.update_statusbar(tr("已转置复制 {} 行 × {} 列").format(len(rows), len(cols)))
 
-    def _insert_col_at(self, pos):
-        if not self._require_no_filter():
-            return
-        self.model.insert_column(pos)
+    def _insert_col_at(self, pos, name=None):
+        """插入列。筛选状态下也允许：列与行筛选无关，同步给 original_df 即可。"""
+        self.model.insert_column(pos, name)
+        self._sync_original_columns(insert_pos=pos,
+                                    name=self.model.df.columns[pos])
         self._mark_modified()
 
     def _show_col_menu(self, pos):
@@ -2877,13 +2940,10 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
 
     def _delete_col_at(self, col):
-        if not self._require_no_filter():
-            return
         colname = str(self.model.df.columns[col])
         ret = QMessageBox.question(self, tr("删除列"), tr("确定删除列 '{}'？").format(colname))
         if ret == QMessageBox.StandardButton.Yes:
-            self.model.remove_columns([col])
-            self._mark_modified()
+            self._remove_columns([col])
 
     def _show_row_menu(self, pos):
         row = self.table.verticalHeader().logicalIndexAt(pos)
