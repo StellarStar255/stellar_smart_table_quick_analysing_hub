@@ -271,6 +271,25 @@ class _ExcelTableView(QTableView):
         # 悬停填充柄要变十字光标，需要无按键的 move 事件
         self.viewport().setMouseTracking(True)
 
+    # ---------- 滚动 ----------
+
+    def wheelEvent(self, event):
+        """Shift + 滚轮 = 横向滚动（部分平台 Qt 不会自动把纵向增量转成横向）。"""
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            bar = self.horizontalScrollBar()
+            pixel = event.pixelDelta()
+            delta = pixel.x() or pixel.y()          # 触控板/像素级滚动
+            if not delta:
+                angle = event.angleDelta()
+                steps = (angle.x() or angle.y()) / 120.0
+                lines = QApplication.wheelScrollLines() or 3
+                delta = int(round(steps * lines * max(bar.singleStep(), 1)))
+            if delta:
+                bar.setValue(bar.value() - delta)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
     # ---------- Excel 式提交与移动 ----------
 
     def move_relative(self, dr, dc, enter=False, tab=False):
