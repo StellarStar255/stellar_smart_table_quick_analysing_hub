@@ -54,6 +54,15 @@ class _RectSelection:
         return self.r0 <= r <= self.r1 and self.c0 <= c <= self.c1
 
 
+def _widget_alive(w):
+    """底层 C++ 对象是否还在（窗口被销毁后访问会抛 RuntimeError）。"""
+    try:
+        w.isVisible()
+        return True
+    except RuntimeError:
+        return False
+
+
 def _isna_scalar(v):
     try:
         return v is None or v != v
@@ -2474,16 +2483,35 @@ class MainWindow(QMainWindow):
             col = self.table.currentIndex().column()
             self.jump_to_cell(row, max(0, col))
 
-    def open_image_viewer(self, path):
+    def open_image_viewer(self, path, new_window=None):
+        """默认复用同一个查看器窗口（换图 + 置顶），Cmd/Ctrl+双击才另开一个用于对比。"""
         try:
             from .image_viewer import ImageViewer
         except Exception as e:
             QMessageBox.critical(self, tr("图片查看"), tr("图片查看器加载失败: {}").format(e))
             return
-        viewer = ImageViewer(path, parent=self)
+        if new_window is None:
+            new_window = bool(QApplication.keyboardModifiers()
+                              & Qt.KeyboardModifier.ControlModifier)
+        # 关掉的窗口不再留在列表里，顺手释放它持有的大图
+        alive = []
+        for v in self._image_viewers:
+            if not _widget_alive(v):
+                continue
+            if v.isVisible():
+                alive.append(v)
+            else:
+                v.deleteLater()
+        self._image_viewers = alive
+        if not new_window and alive:
+            viewer = alive[-1]
+            viewer.set_image(path)
+        else:
+            viewer = ImageViewer(path, parent=self)
+            self._image_viewers.append(viewer)
         viewer.show()
-        self._image_viewers.append(viewer)
-        self._image_viewers = [v for v in self._image_viewers if v.isVisible()]
+        viewer.raise_()
+        viewer.activateWindow()
 
     def _open_image_queue(self, colname=None):
         """图片队列复制：把图片列的图片按行逐个复制到剪贴板。"""

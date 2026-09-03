@@ -417,12 +417,26 @@ class FloatingImageQueue(QWidget):
     def _open_viewer(self):
         if not self.image_paths:
             return
-        viewer = ImageViewer(self.image_paths[self.current_index])
-        viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        viewer.show()
+        path = self.image_paths[self.current_index]
         # 只保留仍打开的查看器引用，关闭的随 WA_DeleteOnClose 释放
-        self._viewers = [v for v in self._viewers if v.isVisible()]
-        self._viewers.append(viewer)
+        alive = []
+        for v in self._viewers:
+            try:
+                if v.isVisible():
+                    alive.append(v)
+            except RuntimeError:
+                pass          # 窗口已销毁
+        self._viewers = alive
+        if alive:             # 复用已打开的查看器，反复点开不再堆窗口
+            viewer = alive[-1]
+            viewer.set_image(path)
+        else:
+            viewer = ImageViewer(path)
+            viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            self._viewers.append(viewer)
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
 
     def closeEvent(self, event):
         self._stop_auto_monitor()

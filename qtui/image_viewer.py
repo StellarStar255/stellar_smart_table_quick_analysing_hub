@@ -93,32 +93,48 @@ class ImageViewer(QMainWindow):
 
     def __init__(self, image_path, parent=None):
         super().__init__(parent)
+        self.view = None
+        self._item = None
+        self._fitted = False
+        self.set_image(image_path, initial=True)
+        self._setup_shortcuts()
+
+    def set_image(self, image_path, initial=False):
+        """在同一窗口换一张图。默认双击复用窗口，避免堆出一排查看器。"""
         self.image_path = image_path
         self.setWindowTitle(os.path.basename(image_path))
-
         self._pixmap = (QPixmap.fromImage(load_image(image_path))
                         if os.path.exists(image_path) else QPixmap())
-        self._fitted = False
 
         if self._pixmap.isNull():
             # 图片缺失或损坏时显示提示，不崩溃
             label = QLabel(tr("无法加载图片:\n{}").format(image_path))
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setWordWrap(True)
-            self.setCentralWidget(label)
+            self.setCentralWidget(label)   # 旧的中央控件由 Qt 释放
             self.view = None
-            self.resize(400, 200)
-        else:
-            self.scene = QGraphicsScene(self)
-            self._item = QGraphicsPixmapItem(self._pixmap)
-            self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-            self.scene.addItem(self._item)
-            self.view = _ZoomableView(self.scene, self)
-            self.view.setBackgroundBrush(Qt.GlobalColor.darkGray)
-            self.setCentralWidget(self.view)
-            self._init_size()
+            self._item = None
+            if initial:
+                self.resize(400, 200)
+            return
 
-        self._setup_shortcuts()
+        self.scene = QGraphicsScene(self)
+        self._item = QGraphicsPixmapItem(self._pixmap)
+        self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.scene.addItem(self._item)
+        self.view = _ZoomableView(self.scene, self)
+        self.view.setBackgroundBrush(Qt.GlobalColor.darkGray)
+        self.setCentralWidget(self.view)
+        if initial:
+            self._init_size()          # 首次由 showEvent 适配
+        else:
+            # 换图时窗口大小/位置保持不变，等布局生效后再适配缩放
+            self._fitted = True
+            QTimer.singleShot(0, self._fit)
+
+    def _fit(self):
+        if self.view is not None and self._item is not None:
+            self.view.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def _init_size(self):
         """窗口大小取屏幕 80% 与图片尺寸的较小者"""
@@ -142,7 +158,7 @@ class ImageViewer(QMainWindow):
         super().showEvent(event)
         # 打开时适配窗口
         if not self._fitted and self.view is not None:
-            self.view.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+            self._fit()
             self._fitted = True
 
     def contextMenuEvent(self, event):
@@ -163,7 +179,9 @@ class ImageViewer(QMainWindow):
         if copy_image_to_clipboard(self.image_path):
             name = os.path.basename(self.image_path)
             self.setWindowTitle(tr("{} (已复制)").format(name))
-            QTimer.singleShot(1500, lambda: self.setWindowTitle(name))
+            # 换图后恢复的是当前图片名，不是复制时那张
+            QTimer.singleShot(1500, lambda: self.setWindowTitle(
+                os.path.basename(self.image_path)))
         else:
             QMessageBox.warning(self, tr("错误"), tr("复制图片失败"))
 
