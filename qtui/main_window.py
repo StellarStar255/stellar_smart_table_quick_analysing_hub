@@ -1053,6 +1053,7 @@ class MainWindow(QMainWindow):
         self.image_panel = ImagePreviewPanel()
         self.image_panel.rowActivated.connect(self._on_image_row_activated)
         self.image_panel.openImageRequested.connect(self.open_image_viewer)
+        self.image_panel.copyImageRequested.connect(self.copy_image_to_clipboard)
         self.image_dock.setWidget(self.image_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.image_dock)
         self.image_dock.hide()
@@ -2582,6 +2583,21 @@ class MainWindow(QMainWindow):
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
+
+    def copy_image_to_clipboard(self, path):
+        """右键预览图直接复制到剪贴板，不必先打开查看器。"""
+        try:
+            from .image_viewer import copy_image_to_clipboard
+        except Exception as e:
+            QMessageBox.critical(self, tr("复制图片"), tr("图片查看器加载失败: {}").format(e))
+            return
+        if not path or not os.path.exists(path):
+            self.update_statusbar(tr("图片不存在:\n{}").format(path).replace("\n", " "))
+            return
+        if copy_image_to_clipboard(path):
+            self.update_statusbar(tr("已复制图片: {}").format(os.path.basename(path)))
+        else:
+            QMessageBox.warning(self, tr("复制图片"), tr("复制图片失败"))
 
     def _open_image_queue(self, colname=None):
         """图片队列复制：把图片列的图片按行逐个复制到剪贴板。"""

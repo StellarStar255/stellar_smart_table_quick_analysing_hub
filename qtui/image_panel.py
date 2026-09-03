@@ -4,7 +4,7 @@
 
 - 上方固定区域始终大图显示当前行的图片，切换时轻微淡入（无形变）
 - 下方横向胶片条显示邻近行的小缩略图（恒定尺寸），选中项蓝框、
-  平滑滚动居中；点击跳行、双击打开查看器
+  平滑滚动居中；点击跳行、双击打开查看器、右键直接复制图片
 - 缩略图与大图都在后台线程加载（QImage 可跨线程），双级缓存
 """
 
@@ -18,7 +18,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QScrollArea, QFrame,
-    QGraphicsOpacityEffect, QSizePolicy,
+    QGraphicsOpacityEffect, QSizePolicy, QMenu,
 )
 
 from qtui.i18n import tr
@@ -53,6 +53,7 @@ class _MainImageView(QLabel):
     """主图区域：保存原始 pixmap，随面板尺寸自适应缩放，切换时淡入。"""
 
     doubleClicked = pyqtSignal(str)
+    menuRequested = pyqtSignal(str, object)   # (路径, 全局坐标)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -107,12 +108,17 @@ class _MainImageView(QLabel):
             self.doubleClicked.emit(self.path)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):
+        if self.path:
+            self.menuRequested.emit(self.path, event.globalPos())
+
 
 class _StripCell(QFrame):
     """胶片条单元：恒定尺寸缩略图 + 行号。"""
 
     clicked = pyqtSignal(int)
     doubleClicked = pyqtSignal(str)
+    menuRequested = pyqtSignal(str, object)   # (路径, 全局坐标)
 
     def __init__(self, row, path, thumb_size, parent=None):
         super().__init__(parent)
@@ -149,12 +155,19 @@ class _StripCell(QFrame):
             self.doubleClicked.emit(self.path)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):
+        if self.path:
+            # 右键也顺便把当前行切过去，和左键点击一致
+            self.clicked.emit(self.row)
+            self.menuRequested.emit(self.path, event.globalPos())
+
 
 class ImagePreviewPanel(QWidget):
     """右侧图片预览面板（主图 + 胶片条）。"""
 
     rowActivated = pyqtSignal(int)
     openImageRequested = pyqtSignal(str)
+    copyImageRequested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -201,6 +214,7 @@ class ImagePreviewPanel(QWidget):
         # ---- 主图 ----
         self.main_view = _MainImageView()
         self.main_view.doubleClicked.connect(self.openImageRequested.emit)
+        self.main_view.menuRequested.connect(self._show_image_menu)
         layout.addWidget(self.main_view, 1)
         self._main_caption = QLabel("")
         self._main_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -381,6 +395,13 @@ class ImagePreviewPanel(QWidget):
             e.deleteLater()
         self._entries = []
 
+    def _show_image_menu(self, path, global_pos):
+        """主图/缩略图的右键菜单：不用打开查看器就能复制。"""
+        menu = QMenu(self)
+        menu.addAction(tr("复制图片"), lambda: self.copyImageRequested.emit(path))
+        menu.addAction(tr("打开大图"), lambda: self.openImageRequested.emit(path))
+        menu.exec(global_pos)
+
     def _strip_range(self):
         center = self._current_row if self._current_row >= 0 else 0
         start = max(0, center - STRIP_BEFORE)
@@ -392,6 +413,7 @@ class ImagePreviewPanel(QWidget):
         cell = _StripCell(row, path, self._thumb_size())
         cell.clicked.connect(self.rowActivated.emit)
         cell.doubleClicked.connect(self.openImageRequested.emit)
+        cell.menuRequested.connect(self._show_image_menu)
         cell.set_focused(row == self._current_row)
         self._set_cell_pixmap(cell)
         if path and path not in self._thumb_cache:
