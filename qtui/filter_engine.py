@@ -34,8 +34,8 @@ def _is_numeric_column(series: pd.Series) -> bool:
     return pd.to_numeric(non_null, errors='coerce').notna().all()
 
 
-def _display_text(series: pd.Series) -> pd.Series:
-    """与表格显示一致的文本：整数值的浮点不带 .0（10.0 显示为 10）。"""
+def display_text(series: pd.Series) -> pd.Series:
+    """与表格显示一致的文本：整数值的浮点不带 .0（10.0 显示为 10）；缺失值为空串。"""
     def fmt(v):
         if isinstance(v, float):
             if v != v:
@@ -44,6 +44,30 @@ def _display_text(series: pd.Series) -> pd.Series:
                 return str(int(v))
         return '' if v is None else str(v)
     return series.map(fmt)
+
+
+_display_text = display_text     # 旧名保留
+
+
+def value_counts(series: pd.Series):
+    """列里的去重值及出现次数，按显示文本给出：[(文本, 次数), ...]。
+
+    数值列按数值排序（"10" 排在 "9" 后面），其余按文本排序；空值归为 ""。
+    """
+    texts = display_text(series)
+    counts = texts.value_counts()
+    items = list(counts.items())
+    if _is_numeric_column(series):
+        def key(item):
+            try:
+                return (0, float(item[0]), "")
+            except ValueError:
+                return (1, 0.0, item[0])     # 空串/非数值排在数值后面
+    else:
+        def key(item):
+            return (item[0] == "", item[0])  # 空白排最后
+    items.sort(key=key)
+    return items
 
 
 def _equals_mask(series: pd.Series, value) -> pd.Series:
@@ -55,7 +79,7 @@ def _equals_mask(series: pd.Series, value) -> pd.Series:
             target = None
         if target is not None:
             return pd.to_numeric(series, errors='coerce') == target
-    return _display_text(series) == str(value)
+    return display_text(series) == str(value)
 
 
 def _to_float(value, condition):
@@ -99,7 +123,9 @@ def apply_filters(original_df: pd.DataFrame, active_filters: list):
             elif condition == '小于':
                 filtered_df = filtered_df[pd.to_numeric(series, errors='coerce') < _to_float(value, condition)]
             elif condition == '值在列表中':
-                filtered_df = filtered_df[series.astype(str).isin(value)]
+                # 按"显示文本"匹配，与列头筛选弹层里勾选的文本一致
+                # （10.0 显示为 10，空值显示为空串）
+                filtered_df = filtered_df[display_text(series).isin(list(value))]
             elif condition == '开头是':
                 filtered_df = filtered_df[series.astype(str).str.startswith(str(value), na=False)]
             elif condition == '结尾是':

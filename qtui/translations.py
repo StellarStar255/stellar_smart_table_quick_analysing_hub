@@ -103,6 +103,12 @@ TRANSLATIONS = {
     '正在保存 {} ...': 'Saving {} ...',
     '保存失败，详情见终端输出': 'Save failed; see terminal output for details',
     '已保存: {}': 'Saved: {}',
+    '全选 ({})': 'Select All ({})',
+    '反选': 'Invert',
+    '更多条件...': 'More conditions...',
+    '值太多，仅列出前 {} 个': 'Too many values; showing the first {}',
+    '清除筛选': 'Clear Filter',
+    '确定': 'OK',
     '已复制图片: {}': 'Image copied: {}',
     '打开大图': 'Open full size',
     '这个文件里的以下内容，本程序保存后会丢失：\n\n{}\n\n其余内容（透视表、公式、条件格式、数据验证、列宽、图表、图片）会原样保留。\n\n继续保存？取消的话可以用「另存为」写到新文件。':

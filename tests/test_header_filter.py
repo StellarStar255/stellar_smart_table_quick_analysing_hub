@@ -1,0 +1,204 @@
+"""Excel 式列头筛选：箭头点击区、值勾选弹层、应用到 active_filters。"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import pandas as pd
+import pytest
+from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent
+from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtWidgets import QApplication
+
+_app = QApplication.instance() or QApplication([])
+
+from qtui import filter_engine
+from qtui.header_filter import BLANK_LABEL, ColumnFilterPopup, FilterHeaderView
+from qtui.main_window import MainWindow
+
+
+@pytest.fixture
+def win():
+    w = MainWindow()
+    df = pd.DataFrame({
+        "城市": ["北京", "上海", "北京", "广州", None],
+        "数量": [10.0, 9.0, 100.0, 10.0, 2.0],
+    })
+    w.model.set_dataframe(df)
+    w.resize(700, 400)
+    w.show()
+    _app.processEvents()
+    yield w
+    w.model.modified = False
+    w.close()
+
+
+class TestValueCounts:
+    def test_counts_use_display_text_and_blank(self):
+        s = pd.Series(["a", "b", "a", None])
+        assert filter_engine.value_counts(s) == [("a", 2), ("b", 1), ("", 1)]
+
+    def test_numeric_column_sorts_numerically(self):
+        s = pd.Series([10.0, 9.0, 100.0, 9.0])
+        assert filter_engine.value_counts(s) == [("9", 2), ("10", 1), ("100", 1)]
+
+    def test_in_list_filter_matches_display_text(self):
+        df = pd.DataFrame({"n": [10.0, 9.5, np.nan]})
+        out, _ = filter_engine.apply_filters(
+            df, [{"col": "n", "condition": "值在列表中", "value": ["10", ""]}])
+        assert len(out) == 2          # 10.0 按 "10" 匹配，NaN 按 "" 匹配
+
+
+class TestHeaderArrow:
+    def test_arrow_click_emits_filter_signal(self, win):
+        header = win.table.horizontalHeader()
+        assert isinstance(header, FilterHeaderView)
+        got = []
+        header.filterClicked.disconnect()      # 别真弹出筛选层
+        header.filterClicked.connect(got.append)
+        rect = header.arrow_rect_at(1)
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress,
+                         QPointF(rect.center()), QPointF(rect.center()),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        header.mousePressEvent(ev)
+        assert got == [1]
+
+    def test_click_away_from_arrow_does_not_open_filter(self, win):
+        header = win.table.horizontalHeader()
+        got = []
+        header.filterClicked.disconnect()
+        header.filterClicked.connect(got.append)
+        pos = QPointF(header.sectionViewportPosition(1) + 4, header.height() / 2)
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos,
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        header.mousePressEvent(ev)
+        assert got == []
+
+    def test_filtered_columns_get_the_funnel(self, win):
+        win.active_filters = [{"col": "数量", "condition": "值在列表中",
+                               "value": ["10"]}]
+        win._update_filter_indicators()
+        assert win.table.horizontalHeader()._filtered_cols == {1}
+
+
+class TestPopup:
+    def _popup(self, counts, **kw):
+        return ColumnFilterPopup(None, "城市", counts, **kw)
+
+    def test_all_checked_means_clear(self):
+        p = self._popup([("a", 1), ("b", 2)])
+        p._accept()
+        assert p.result == "clear"
+
+    def test_partial_selection_returns_values(self):
+        p = self._popup([("a", 1), ("b", 2)])
+        p.value_list.item(1).setCheckState(Qt.CheckState.Unchecked)
+        p._accept()
+        assert p.result == ["a"]
+
+    def test_existing_filter_prechecks_only_its_values(self):
+        p = self._popup([("a", 1), ("b", 2)], checked={"b"}, has_filter=True)
+        states = [p.value_list.item(i).checkState() for i in range(2)]
+        assert states == [Qt.CheckState.Unchecked, Qt.CheckState.Checked]
+        assert p.clear_btn.isEnabled()
+
+    def test_search_checks_only_matches(self):
+        p = self._popup([("apple", 1), ("banana", 2), ("grape", 3)])
+        p.search_edit.setText("ap")
+        checked = p.checked_values()
+        assert checked == ["apple", "grape"]        # 香蕉不含 ap，被取消勾选
+        assert p.value_list.item(1).isHidden()
+        p.search_edit.setText("")                   # 清空搜索恢复初始勾选
+        assert p.checked_values() == ["apple", "banana", "grape"]
+
+    def test_invert_flips_visible_items(self):
+        p = self._popup([("a", 1), ("b", 2)])
+        p.value_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+        p._invert()
+        assert p.checked_values() == ["a"]
+
+    def test_blank_value_is_labelled(self):
+        p = self._popup([("", 3)])
+        assert BLANK_LABEL in p.value_list.item(0).text()
+        assert p.value_list.item(0).data(Qt.ItemDataRole.UserRole) == ""
+
+    def test_nothing_checked_clears_when_filter_exists(self):
+        p = self._popup([("a", 1)], checked={"a"}, has_filter=True)
+        p.value_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+        p._accept()
+        assert p.result == "clear"
+
+    def test_more_conditions_hands_off_to_dialog(self):
+        p = self._popup([("a", 1)])
+        p._advanced()
+        assert p.result == "advanced"
+
+    def test_sort_buttons_report_order(self):
+        p = self._popup([("a", 1)])
+        p._sort(False)
+        assert p.sort_ascending is False and p.result is None
+
+
+class TestApplyThroughWindow:
+    def _run_popup(self, win, monkeypatch, action):
+        """拦住弹层的 exec，直接在弹层上执行 action 后返回。"""
+        def fake_popup_at(self, _pos):
+            action(self)
+            return 1
+        monkeypatch.setattr(ColumnFilterPopup, "popup_at", fake_popup_at)
+
+    def test_selecting_values_filters_rows(self, win, monkeypatch):
+        # 值按显示文本排序：上海 / 北京 / 广州 / (空白)
+        self._run_popup(win, monkeypatch, lambda p: (
+            p.value_list.item(0).setCheckState(Qt.CheckState.Unchecked),
+            p.value_list.item(2).setCheckState(Qt.CheckState.Unchecked),
+            p.value_list.item(3).setCheckState(Qt.CheckState.Unchecked),
+            p._accept()))
+        win.open_column_filter(0)
+        assert win.active_filters == [
+            {"col": "城市", "condition": "值在列表中", "value": ["北京"]}]
+        assert list(win.model.df["城市"]) == ["北京", "北京"]
+        assert win.table.horizontalHeader()._filtered_cols == {0}
+
+    def test_clear_from_popup_removes_column_filter(self, win, monkeypatch):
+        win.active_filters = [{"col": "城市", "condition": "值在列表中",
+                               "value": ["北京"]}]
+        win._reapply_filters()
+        assert len(win.model.df) == 2
+        self._run_popup(win, monkeypatch, lambda p: p._clear())
+        win.open_column_filter(0)
+        assert win.active_filters == []
+        assert len(win.model.df) == 5
+        assert win.table.horizontalHeader()._filtered_cols == set()
+
+    def test_refiltering_same_column_replaces_not_stacks(self, win, monkeypatch):
+        win.active_filters = [{"col": "城市", "condition": "值在列表中",
+                               "value": ["北京"]}]
+        win._reapply_filters()
+        # 打开时只有北京被勾上；改成只勾上海
+        self._run_popup(win, monkeypatch, lambda p: (
+            p.value_list.item(1).setCheckState(Qt.CheckState.Unchecked),
+            p.value_list.item(0).setCheckState(Qt.CheckState.Checked),
+            p._accept()))
+        win.open_column_filter(0)
+        assert len(win.active_filters) == 1
+        assert win.active_filters[0]["value"] == ["上海"]
+
+    def test_advanced_opens_condition_dialog(self, win, monkeypatch):
+        opened = []
+        monkeypatch.setattr(type(win), "open_filter_dialog",
+                            lambda self, preset_col=None, edit_index=None:
+                            opened.append(preset_col))
+        self._run_popup(win, monkeypatch, lambda p: p._advanced())
+        win.open_column_filter(0)
+        assert opened == ["城市"]
+        assert win.active_filters == []
+
+    def test_sort_from_popup_sorts_column(self, win, monkeypatch):
+        self._run_popup(win, monkeypatch, lambda p: p._sort(True))
+        win.open_column_filter(1)
+        assert list(win.model.df["数量"]) == [2.0, 9.0, 10.0, 10.0, 100.0]
+        assert win.active_filters == []

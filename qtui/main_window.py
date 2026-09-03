@@ -70,6 +70,7 @@ def _isna_scalar(v):
         return False
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
+from .header_filter import ColumnFilterPopup, FilterHeaderView
 from .find_dialog import FindReplaceDialog
 from .image_panel import ImagePreviewPanel
 from qtui.i18n import tr
@@ -744,6 +745,9 @@ class MainWindow(QMainWindow):
             QAbstractItemView.EditTrigger.DoubleClicked
             | QAbstractItemView.EditTrigger.EditKeyPressed
             | QAbstractItemView.EditTrigger.AnyKeyPressed)
+        self.filter_header = FilterHeaderView(self.table)
+        self.table.setHorizontalHeader(self.filter_header)
+        self.filter_header.filterClicked.connect(self.open_column_filter)
         self.table.horizontalHeader().setDefaultSectionSize(140)
         # 列头单击仅选中整列，不触发排序——大表排序开销大且易误触，
         # 排序走工具栏/菜单/右键三个显式入口
@@ -2030,6 +2034,59 @@ class MainWindow(QMainWindow):
             self.active_filters.append(dialog.result)
         self._reapply_filters()
 
+    def _column_value_filter(self, colname):
+        """该列当前的"值在列表中"筛选，没有则 None。"""
+        for f in self.active_filters:
+            if f.get("col") == colname and f.get("condition") == "值在列表中":
+                return f
+        return None
+
+    def open_column_filter(self, col_idx):
+        """列头箭头：Excel 式筛选弹层（升序/降序 + 值勾选）。"""
+        df = self.model.df
+        if not (0 <= col_idx < len(df.columns)):
+            return
+        colname = str(df.columns[col_idx])
+        base_df = self.original_df if self.original_df is not None else df
+        if colname not in base_df.columns:
+            return
+        counts = filter_engine.value_counts(base_df[colname])
+        existing = self._column_value_filter(colname)
+        has_filter = any(f.get("col") == colname for f in self.active_filters)
+        popup = ColumnFilterPopup(
+            self, colname, counts,
+            checked=set(existing["value"]) if existing else None,
+            has_filter=has_filter)
+        header = self.table.horizontalHeader()
+        rect = header.arrow_rect_at(col_idx)
+        popup.popup_at(header.mapToGlobal(rect.bottomLeft()))
+        if popup.sort_ascending is not None:
+            self._sort_by(col_idx, popup.sort_ascending)
+            return
+        if popup.result is None:
+            return
+        if popup.result == "advanced":
+            self.open_filter_dialog(preset_col=colname)
+            return
+        # 该列旧的筛选条件一律替换，弹层显示的就是这列的全部筛选
+        self.active_filters = [f for f in self.active_filters
+                               if f.get("col") != colname]
+        if popup.result != "clear":
+            self.active_filters.append(
+                {"col": colname, "condition": "值在列表中", "value": popup.result})
+        if self.active_filters:
+            self._reapply_filters()
+        else:
+            self.clear_all_filters()
+
+    def _update_filter_indicators(self):
+        """把已筛选的列画成漏斗。"""
+        if not hasattr(self, "filter_header"):
+            return
+        cols = {f.get("col") for f in self.active_filters}
+        self.filter_header.set_filtered_columns(
+            i for i, c in enumerate(self.model.df.columns) if str(c) in cols)
+
     def _report_filter_errors(self):
         """筛选条件无法应用（如"大于 abc"）时明确提示，而不是标签挂着却没生效。"""
         errs = filter_engine.last_errors
@@ -2127,6 +2184,7 @@ class MainWindow(QMainWindow):
             self.update_statusbar()
 
     def _rebuild_filter_bar(self):
+        self._update_filter_indicators()
         while self.filter_bar_layout.count():
             item = self.filter_bar_layout.takeAt(0)
             if item.widget():

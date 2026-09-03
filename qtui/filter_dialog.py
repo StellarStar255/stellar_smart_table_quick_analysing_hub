@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QDialogButtonBox, QMessageBox,
 )
 
-from .filter_engine import CONDITIONS
+from .filter_engine import CONDITIONS, display_text
 from qtui.i18n import tr
 
 MAX_UNIQUE_VALUES = 500
@@ -102,8 +102,9 @@ class FilterDialog(QDialog):
         self.value_list.clear()
         if col not in [str(c) for c in self._df.columns]:
             return
-        series = self._df[col].astype(str)
-        uniques = series.dropna().unique()
+        # 与列头筛选弹层、引擎的匹配口径一致：都用"显示文本"
+        series = display_text(self._df[col])
+        uniques = series.unique()
         truncated = len(uniques) > MAX_UNIQUE_VALUES
         for v in sorted(uniques)[:MAX_UNIQUE_VALUES]:
             item = QListWidgetItem(v)
