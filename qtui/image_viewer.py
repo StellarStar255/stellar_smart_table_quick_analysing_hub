@@ -11,7 +11,7 @@ import os
 import platform
 import subprocess
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QKeySequence, QPainter, QPixmap, QShortcut,
 )
@@ -87,9 +87,17 @@ class _ZoomableView(QGraphicsView):
         factor = 1.1 if delta > 0 else 1 / 1.1
         self.scale(factor, factor)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            event.ignore()      # 交给查看器窗口翻页，不当成横向滚动
+            return
+        super().keyPressEvent(event)
+
 
 class ImageViewer(QMainWindow):
-    """独立的图片查看器窗口，支持缩放和拖拽"""
+    """独立的图片查看器窗口，支持缩放和拖拽；←/→ 请求翻到上一张/下一张"""
+
+    navigateRequested = pyqtSignal(int)   # -1 上一张 / +1 下一张，由宿主决定去哪
 
     def __init__(self, image_path, parent=None):
         super().__init__(parent)
@@ -153,6 +161,18 @@ class ImageViewer(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.close)
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close)  # macOS 上即 Cmd+W
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self._copy_image)
+
+
+    def keyPressEvent(self, event):
+        # 方向键翻页：按图片列顺序走，不用回表格再双击。用 keyPressEvent 而不是
+        # QShortcut——快捷键要求窗口处于激活态，且会被 QGraphicsView 抢走方向键
+        if event.key() == Qt.Key.Key_Left:
+            self.navigateRequested.emit(-1)
+            return
+        if event.key() == Qt.Key.Key_Right:
+            self.navigateRequested.emit(1)
+            return
+        super().keyPressEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

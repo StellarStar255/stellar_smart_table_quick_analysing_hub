@@ -2754,10 +2754,23 @@ class MainWindow(QMainWindow):
             viewer.set_image(path)
         else:
             viewer = ImageViewer(path, parent=self)
+            viewer.navigateRequested.connect(
+                lambda step, v=viewer: self._viewer_navigate(v, step))
             self._image_viewers.append(viewer)
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
+
+    def _viewer_navigate(self, viewer, step):
+        """查看器里按 ←/→：按图片列顺序换到上一张/下一张，表格当前行跟着走。"""
+        found = self.image_panel.neighbor_with_image(step)
+        if not found:
+            return                        # 到头了：什么都不做
+        row, path = found
+        col = self.table.currentIndex().column()
+        self.jump_to_cell(row, max(0, col))
+        self.image_panel.set_current_row(row)
+        viewer.set_image(path)
 
     def copy_image_to_clipboard(self, path):
         """右键预览图直接复制到剪贴板，不必先打开查看器。"""

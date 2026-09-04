@@ -337,6 +337,23 @@ class ImagePreviewPanel(QWidget):
                     return p
         return None
 
+    def neighbor_with_image(self, step):
+        """从当前行往 step 方向（-1 上 / +1 下）找下一张有图的行。
+
+        返回 (行号, 路径)；到头了或没有图片列返回 None。查看器 ←/→ 翻页用。
+        """
+        if self._df is None or self._image_col not in self._df.columns or not step:
+            return None
+        col_idx = list(self._df.columns).index(self._image_col)
+        row = self._current_row + step
+        n = len(self._df)
+        while 0 <= row < n:
+            path = self._resolve_path(self._df.iat[row, col_idx])
+            if path:
+                return row, path
+            row += step
+        return None
+
     def _current_path(self):
         if (self._df is None or self._image_col not in self._df.columns
                 or not 0 <= self._current_row < len(self._df)):
