@@ -150,3 +150,260 @@ class TestDownloaderCleanup:
         d.done.connect(done.append)
         d.run()
         assert done and d.checksum_status == "mismatch"
+
+
+class _FakeThread:
+    """假的下载线程：只记录被要求 cancel/wait，不真的开线程。"""
+
+    def __init__(self):
+        self.running = True
+        self.cancelled = False
+        self.waited = False
+        self.deleted = False
+        self.checksum_status = None
+        self.checksum_error = ""
+
+    def isRunning(self):
+        return self.running
+
+    def cancel(self):
+        self.cancelled = True
+
+    def wait(self, ms=None):
+        self.waited = True
+        self.running = False
+        return True
+
+    def deleteLater(self):
+        self.deleted = True
+
+
+class TestDownloaderLifetime:
+    """线程生命周期与取消语义。"""
+
+    def _manager(self):
+        mgr = updater.UpdateManager.__new__(updater.UpdateManager)
+        mgr.window = None
+        mgr._checker = None
+        mgr._downloader = None
+        mgr._pending = []
+        mgr._user_cancelled = False
+        return mgr
+
+    def test_running_downloader_is_cancelled_and_waited(self):
+        mgr = self._manager()
+        old = _FakeThread()
+        mgr._downloader = old
+        mgr._stop_downloader()
+        assert old.cancelled and old.waited
+        assert mgr._downloader is None
+
+    def test_retire_releases_only_after_finish(self):
+        mgr = self._manager()
+        dl = _FakeThread()
+        mgr._downloader = dl
+        mgr._pending.append(dl)
+        mgr._retire_downloader(dl)
+        assert mgr._pending == [] and dl.deleted and mgr._downloader is None
+
+    def test_shutdown_waits_for_both_threads(self):
+        mgr = self._manager()
+        dl, chk = _FakeThread(), _FakeThread()
+        mgr._downloader, mgr._checker = dl, chk
+        mgr.shutdown()
+        assert dl.cancelled and dl.waited and chk.waited
+        assert mgr._downloader is None and mgr._checker is None
+
+
+class TestCancelStopsRetries:
+    """点了取消就必须彻底停下——这是最招人烦的老毛病。"""
+
+    def _manager(self, rounds):
+        """rounds: 每轮 _download_once 的返回值列表。"""
+        mgr = updater.UpdateManager.__new__(updater.UpdateManager)
+        mgr.window = None
+        mgr._checker = None
+        mgr._downloader = None
+        mgr._pending = []
+        mgr._user_cancelled = False
+        mgr.attempts = []
+
+        def fake_once(release, asset, attempt):
+            mgr.attempts.append(attempt)
+            return rounds[attempt - 1]
+        mgr._download_once = fake_once
+        mgr._install = lambda path: mgr.attempts.append("install")
+        return mgr
+
+    def test_cancel_during_download_stops_immediately(self):
+        dl = _FakeThread()
+
+        def cancelled_round(*_):
+            return (None, None, dl)
+        mgr = self._manager([(None, None, dl)] * 3)
+        original = mgr._download_once
+
+        def once(release, asset, attempt):
+            mgr._user_cancelled = True      # 用户在这一轮点了取消
+            return original(release, asset, attempt)
+        mgr._download_once = once
+        mgr._download_and_install({}, {"name": "pkg"})
+        assert mgr.attempts == [1]          # 只跑了一轮，没有重试
+
+    def test_failure_retries_up_to_the_limit(self, monkeypatch):
+        warned = []
+        monkeypatch.setattr(updater.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a[2])))
+        dl = _FakeThread()
+        mgr = self._manager([(None, "网络错误", dl)] * 3)
+        mgr._download_and_install({}, {"name": "pkg"})
+        assert mgr.attempts == [1, 2, 3]    # 重试到上限后才提示
+        assert warned and "网络" in warned[0]
+
+    def test_cancel_on_the_retry_round_stops_there(self):
+        dl = _FakeThread()
+        mgr = self._manager([(None, "网络错误", dl), (None, None, dl),
+                             (None, "网络错误", dl)])
+        original = mgr._download_once
+
+        def once(release, asset, attempt):
+            if attempt == 2:
+                mgr._user_cancelled = True   # 第二轮用户点了取消
+            return original(release, asset, attempt)
+        mgr._download_once = once
+        mgr._download_and_install({}, {"name": "pkg"})
+        assert mgr.attempts == [1, 2]        # 第三轮不该再来
+
+    def test_cancel_flag_set_by_dialog_cancel(self):
+        mgr = self._manager([])
+        dl = _FakeThread()
+        mgr._cancel_download(dl)
+        assert mgr._user_cancelled and dl.cancelled
+
+    def test_unexpected_error_does_not_escape(self, monkeypatch):
+        """升级流程里的异常必须被兜住：PyQt 里槽抛异常会 qFatal 掉整个进程。"""
+        reported = []
+        mgr = self._manager([])
+        mgr._download_once = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        mgr._report_unexpected = reported.append
+        mgr._download_and_install({}, {"name": "pkg"})
+        assert reported and isinstance(reported[0], RuntimeError)
+
+    def test_quiet_unlink_tolerates_missing_file(self, tmp_path):
+        updater.UpdateManager._quiet_unlink(str(tmp_path / "nope"))   # 不抛异常
+
+
+class TestCancelledDownloadDoesNotReportFailure:
+    def test_cancelled_read_error_is_not_a_failure(self, monkeypatch, tmp_path):
+        """取消后连接报错不能算下载失败，否则上层还会重试。"""
+        class Boom:
+            headers = {"Content-Length": "100"}
+
+            def read(self, n=None):
+                raise IOError("connection reset")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(updater, "_urlopen", lambda req, timeout: Boom())
+        d = updater.Downloader("http://x/pkg", str(tmp_path / "pkg"))
+        d.cancel()
+        failed = []
+        d.failed.connect(failed.append)
+        d.run()
+        assert failed == []
+
+
+class _FakeProgressDialog:
+    """假进度框：exec() 立刻返回，不进事件循环。"""
+
+    def __init__(self, *a, **k):
+        self.closed = False
+        self._cancel_cb = []
+
+        class _Sig:
+            def __init__(self, cbs):
+                self._cbs = cbs
+
+            def connect(self, cb):
+                self._cbs.append(cb)
+        self.canceled = _Sig(self._cancel_cb)
+
+    def setWindowTitle(self, *a): pass
+    def setAutoClose(self, *a): pass
+    def setMinimumDuration(self, *a): pass
+    def setValue(self, *a): pass
+    def close(self): self.closed = True
+    def wasCanceled(self): return True      # close() 之后 Qt 也会置真
+    def exec(self): return 0
+
+
+class TestCancelDetection:
+    """用户是否取消，只看"这一轮既没结果也没报错"。
+
+    canceled 信号和 wasCanceled() 都会被我们自己的 dialog.close() 带上，
+    拿它们判断会把"下载完成/失败"误判成用户取消。
+    """
+
+    def _manager(self, monkeypatch, emit):
+        """emit: 拿到 downloader 后要触发的信号（'done'/'failed'/None）。"""
+        monkeypatch.setattr(updater, "QProgressDialog", _FakeProgressDialog)
+
+        class FakeDownloader:
+            def __init__(self, *a, **k):
+                self.checksum_status = "ok"
+                self.cancelled = False
+                self._slots = {}
+
+            def _sig(self, name):
+                class _S:
+                    def __init__(s, owner, n): s.owner, s.n = owner, n
+                    def connect(s, cb): s.owner._slots.setdefault(s.n, []).append(cb)
+                return _S(self, name)
+
+            def __getattr__(self, name):
+                if name in ("progress", "done", "failed", "finished"):
+                    return self._sig(name)
+                raise AttributeError(name)
+
+            def cancel(self): self.cancelled = True
+            def isRunning(self): return False
+            def wait(self, ms=None): return True
+            def deleteLater(self): pass
+
+            def start(self):
+                for cb in self._slots.get(emit, []):
+                    cb("/tmp/pkg.dmg" if emit == "done" else "网络错误")
+
+        monkeypatch.setattr(updater, "Downloader", FakeDownloader)
+        mgr = updater.UpdateManager.__new__(updater.UpdateManager)
+        mgr.window = None
+        mgr._checker = None
+        mgr._downloader = None
+        mgr._pending = []
+        mgr._user_cancelled = False
+        return mgr
+
+    def _asset(self):
+        return {"name": "pkg.dmg", "browser_download_url": "http://x/pkg.dmg"}
+
+    def test_completed_download_is_not_treated_as_cancel(self, monkeypatch):
+        mgr = self._manager(monkeypatch, "done")
+        path, err, _ = mgr._download_once({}, self._asset(), 1)
+        assert path == "/tmp/pkg.dmg" and err is None
+        assert mgr._user_cancelled is False       # 关键：不能误判成取消
+
+    def test_failed_download_is_not_treated_as_cancel(self, monkeypatch):
+        mgr = self._manager(monkeypatch, "failed")
+        path, err, _ = mgr._download_once({}, self._asset(), 1)
+        assert path is None and err == "网络错误"
+        assert mgr._user_cancelled is False       # 否则自动重试就没了
+
+    def test_no_outcome_means_user_cancelled(self, monkeypatch):
+        mgr = self._manager(monkeypatch, None)    # 既不 done 也不 failed
+        path, err, dl = mgr._download_once({}, self._asset(), 1)
+        assert path is None and err is None
+        assert mgr._user_cancelled is True and dl.cancelled

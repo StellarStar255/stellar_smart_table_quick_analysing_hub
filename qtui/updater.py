@@ -152,7 +152,9 @@ class Downloader(QThread):
             self.done.emit(self.dest)
         except Exception as exc:
             self._remove_partial()
-            self.failed.emit(str(exc))
+            if not self._cancelled:
+                # 取消导致的报错不算失败，否则上层还会"好心"重试
+                self.failed.emit(str(exc))
 
     def _verify(self):
         status, expected = _fetch_checksum(self._release, self._asset_name)
@@ -328,6 +330,10 @@ class UpdateManager:
         self.window = parent_window
         self._checker = None
         self._downloader = None
+        # 还没结束的下载线程：QThread 对象在线程仍在运行时被回收，
+        # Qt 会直接 abort（下载失败自动重试时就是这样闪退的）
+        self._pending = []
+        self._user_cancelled = False
 
     # ---- 检查 ----
 
@@ -388,7 +394,42 @@ class UpdateManager:
     # 首次下载 + 自动重试 2 次（弱网下截断/损坏常见，重试通常即可恢复）
     _MAX_DOWNLOAD_ATTEMPTS = 3
 
-    def _download_and_install(self, release, asset, attempt=1):
+    def _download_and_install(self, release, asset):
+        """下载 → 校验 → 安装；失败自动重试，用户取消立即收手。
+
+        重试写成循环而不是递归：递归会让每次重试再叠一层模态事件循环，
+        而且用户在里层点了取消，外层的失败处理还会接着往下重试。
+        """
+        self._user_cancelled = False
+        try:
+            for attempt in range(1, self._MAX_DOWNLOAD_ATTEMPTS + 1):
+                path, error, downloader = self._download_once(release, asset, attempt)
+                if self._user_cancelled:
+                    self._stop_downloader()
+                    return                      # 用户按了取消：不重试、不弹框
+                if error is None and path is None:
+                    return                      # 没结果也没报错：当作放弃
+                if error is not None:
+                    if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
+                        continue
+                    QMessageBox.warning(
+                        self.window, tr("下载失败"),
+                        tr("升级包下载失败（已自动重试 {} 次）：\n{}").format(
+                            self._MAX_DOWNLOAD_ATTEMPTS - 1, error))
+                    return
+                action = self._check_package(path, downloader, attempt)
+                if action == "install":
+                    self._install(path)
+                    return
+                if action != "retry":
+                    return                      # 已在 _check_package 里提示过
+        except Exception as exc:                # noqa: BLE001
+            # PyQt 里槽函数抛出的异常会直接 qFatal 掉整个进程——升级失败
+            # 顶多提示一句，绝不能把用户正在编辑的表格连窗口一起带走
+            self._report_unexpected(exc)
+
+    def _download_once(self, release, asset, attempt):
+        """跑一轮下载，阻塞到结束。返回 (本地路径, 错误文本, 下载器)。"""
         dest = os.path.join(tempfile.gettempdir(), asset["name"])
         label = tr("正在下载 {} …").format(asset['name'])
         if attempt > 1:
@@ -399,56 +440,117 @@ class UpdateManager:
         dialog.setAutoClose(False)
         dialog.setMinimumDuration(0)
 
-        self._downloader = Downloader(asset["browser_download_url"], dest,
-                                      release=release, asset_name=asset["name"])
-        self._downloader.progress.connect(
+        # 上一轮的线程必须真的停下来再开新的
+        self._stop_downloader()
+        downloader = Downloader(asset["browser_download_url"], dest,
+                                parent=self.window, release=release,
+                                asset_name=asset["name"])
+        self._downloader = downloader
+        self._pending.append(downloader)
+        outcome = {}
+        downloader.finished.connect(
+            lambda dl=downloader: self._retire_downloader(dl))
+        downloader.progress.connect(
             lambda got, total: dialog.setValue(
                 int(got * 100 / total) if total else 0))
-        dialog.canceled.connect(self._downloader.cancel)
-        self._downloader.done.connect(
-            lambda path: (dialog.close(),
-                          self._verify_and_install(release, asset, path, attempt)))
-        self._downloader.failed.connect(
-            lambda msg: (dialog.close(),
-                         self._on_download_failed(release, asset, attempt, msg)))
-        self._downloader.start()
+        # 只用来尽快叫停线程；"是不是用户取消"不看这个信号——我们自己
+        # dialog.close() 时它也会发，那会把"下载完成"误判成取消
+        dialog.canceled.connect(downloader.cancel)
+        downloader.done.connect(
+            lambda path: (outcome.update(path=path), dialog.close()))
+        downloader.failed.connect(
+            lambda msg: (outcome.update(error=msg), dialog.close()))
+        downloader.start()
         dialog.exec()
+        # 判断用户是否取消，只认这一条：这一轮既没结果也没报错，就说明
+        # run() 是被 cancel 打断后直接返回的（canceled 信号和 wasCanceled()
+        # 都会被我们自己的 dialog.close() 带上，不可靠）
+        if not outcome:
+            self._cancel_download(downloader)
+        return outcome.get("path"), outcome.get("error"), downloader
 
-    def _on_download_failed(self, release, asset, attempt, msg):
-        if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
-            self._download_and_install(release, asset, attempt + 1)
+    def _cancel_download(self, downloader):
+        """用户点了取消：本轮停下，并且记住别再重试。"""
+        self._user_cancelled = True
+        downloader.cancel()
+
+    def _retire_downloader(self, downloader):
+        """线程真的结束了，可以放手让 Qt 回收。
+
+        finished 是线程退出前发出来的，此时线程未必真的停了；不 wait 就
+        deleteLater，Qt 会报 "QThread: Destroyed while thread is still
+        running" 然后 abort——升级过程中闪退就是这么来的。
+        """
+        downloader.wait(2000)
+        if downloader in self._pending:
+            self._pending.remove(downloader)
+        if self._downloader is downloader:
+            self._downloader = None
+        downloader.deleteLater()
+
+    def _stop_downloader(self):
+        """取消并等待当前下载线程结束，绝不在它还在跑时撒手。"""
+        current = self._downloader
+        if current is None:
             return
-        QMessageBox.warning(
-            self.window, tr("下载失败"),
-            tr("升级包下载失败（已自动重试 {} 次）：\n{}").format(
-                self._MAX_DOWNLOAD_ATTEMPTS - 1, msg))
+        current.cancel()
+        current.wait(5000)      # 已结束的线程上 wait 立即返回
+        self._downloader = None
 
-    def _verify_and_install(self, release, asset, path, attempt=1):
-        # 校验已在下载线程完成（取校验文件 + 对几百 MB 做 SHA256 都不占 UI 线程）
-        status = self._downloader.checksum_status if self._downloader else None
-        if status == "mismatch":
+    def shutdown(self):
+        """退出应用前调用：下载线程还在跑时被销毁，Qt 会 abort。"""
+        self._user_cancelled = True
+        self._stop_downloader()
+        for downloader in list(self._pending):   # 还没退干净的也要等
+            downloader.cancel()
+            downloader.wait(3000)
+        self._pending.clear()
+        checker = self._checker
+        if checker is not None and checker.isRunning():
+            checker.wait(3000)
+        self._checker = None
+
+    @staticmethod
+    def _quiet_unlink(path):
+        """删不掉就算了——升级流程里抛异常会把整个应用带走。"""
+        try:
             os.unlink(path)
-            if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
-                # 校验失败大概率是传输损坏，自动重新下载
-                self._download_and_install(release, asset, attempt + 1)
-                return
+        except OSError:
+            pass
+
+    def _report_unexpected(self, exc):
+        try:
+            QMessageBox.warning(
+                self.window, tr("升级"),
+                tr("升级过程出错，已中止（应用可以继续使用）：\n{}").format(exc))
+        except Exception:                        # noqa: BLE001
+            print("升级出错:", exc, file=sys.stderr)
+
+    def _check_package(self, path, downloader, attempt):
+        """校验下载好的包。返回 'install' / 'retry' / 'abort'。"""
+        # 校验已在下载线程完成（取校验文件 + 对几百 MB 做 SHA256 都不占 UI 线程）
+        status = downloader.checksum_status if downloader else None
+        last = attempt >= self._MAX_DOWNLOAD_ATTEMPTS
+        if status == "mismatch":
+            self._quiet_unlink(path)
+            if not last:
+                return "retry"          # 大概率是传输损坏，重下一次
             QMessageBox.critical(
                 self.window, tr("校验失败"),
                 tr("升级包 SHA256 校验失败（已自动重试 {} 次），已取消安装。\n"
                    "请前往官方 Release 页面手动下载。").format(
                     self._MAX_DOWNLOAD_ATTEMPTS - 1))
-            return
+            return "abort"
         if status == "unavailable":
             # 网络取不到校验文件 ≠ 没有校验文件：不能放行未校验的安装包
-            os.unlink(path)
-            if attempt < self._MAX_DOWNLOAD_ATTEMPTS:
-                self._download_and_install(release, asset, attempt + 1)
-                return
+            self._quiet_unlink(path)
+            if not last:
+                return "retry"
             QMessageBox.critical(
                 self.window, tr("无法校验"),
                 tr("无法获取升级包的校验文件（网络错误），已取消安装：\n{}").format(
-                    self._downloader.checksum_error if self._downloader else ""))
-            return
+                    downloader.checksum_error if downloader else ""))
+            return "abort"
         if status != "ok":
             box = QMessageBox(self.window)
             box.setIcon(QMessageBox.Icon.Warning)
@@ -459,9 +561,11 @@ class UpdateManager:
             box.addButton(tr("取消"), QMessageBox.ButtonRole.RejectRole)
             box.exec()
             if box.clickedButton() is not cont:
-                os.unlink(path)
-                return
+                self._quiet_unlink(path)
+                return "abort"
+        return "install"
 
+    def _install(self, path):
         if sys.platform == "darwin":
             ok = _install_macos(path)
         elif sys.platform.startswith("win"):

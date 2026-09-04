@@ -105,6 +105,9 @@ TRANSLATIONS = {
     '已保存: {}': 'Saved: {}',
     '全选 ({})': 'Select All ({})',
     '反选': 'Invert',
+    '升级': 'Update',
+    '升级过程出错，已中止（应用可以继续使用）：\n{}':
+        'The update was aborted because of an error (the app is still usable):\n{}',
     '更多条件...': 'More conditions...',
     '值太多，仅列出前 {} 个': 'Too many values; showing the first {}',
     '清除筛选': 'Clear Filter',

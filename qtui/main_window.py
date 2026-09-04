@@ -3070,6 +3070,10 @@ class MainWindow(QMainWindow):
             self._save_file_config()   # 记住最后停留的 sheet / 图片列
             self._settings.setValue("window/geometry", self.saveGeometry())
             self._settings.setValue("window/state", self.saveState())
+            # 下载/检查线程还在跑时随窗口一起销毁，Qt 会 abort
+            manager = getattr(self, "_update_manager", None)
+            if manager is not None:
+                manager.shutdown()
             event.accept()
         else:
             event.ignore()
