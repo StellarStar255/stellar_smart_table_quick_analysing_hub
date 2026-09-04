@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import pytest
-from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent
+from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent, QTimer
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
@@ -172,6 +172,44 @@ class TestPopup:
         p = self._popup([("a", 1)])
         p._advanced()
         assert p.result == "advanced"
+
+    def test_click_outside_closes_and_cancels(self):
+        p = self._popup([("a", 1)])
+        p.move(100, 100)
+        p.resize(200, 200)
+        p.show()
+        _app.processEvents()
+        outside = QPointF(600, 600)
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress, outside, outside,
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        assert p.eventFilter(p, ev) is True        # 吞掉这一下
+        assert not p.isVisible()
+        assert p.result is None                    # 等于取消，不改筛选
+
+    def test_click_inside_keeps_it_open(self):
+        p = self._popup([("a", 1)])
+        p.move(100, 100)
+        p.resize(200, 200)
+        p.show()
+        _app.processEvents()
+        inside = QPointF(p.frameGeometry().center())
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress, inside, inside,
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        assert p.eventFilter(p, ev) is False
+        assert p.isVisible()
+        p.close()
+
+    def test_popup_at_returns_after_accept(self):
+        """popup_at 自跑事件循环：确定/取消后必须真的返回，不能卡住。"""
+        p = self._popup([("a", 1), ("b", 1)])
+        QTimer.singleShot(0, lambda: (
+            p.value_list.item(1).setCheckState(Qt.CheckState.Unchecked),
+            p._accept()))
+        p.popup_at(QPoint(50, 50))
+        assert p.result == ["a"]
+        assert not p.isVisible()
 
     def test_sort_buttons_report_order(self):
         p = self._popup([("a", 1)])

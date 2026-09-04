@@ -8,11 +8,11 @@ ColumnFilterPopup  无边框弹层：升序/降序、搜索、带计数的值勾
                    全选/反选、清除筛选。结果放在 result / sort_ascending。
 """
 
-from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QEventLoop, QRect, QPoint, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
+    QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
 )
 
 from qtui.i18n import tr
@@ -127,6 +127,7 @@ class ColumnFilterPopup(QDialog):
         self.result = None
         self.sort_ascending = None
         self._target_pos = None
+        self._loop = None
         self._truncated = len(value_counts) > MAX_VALUES
         self._values = value_counts[:MAX_VALUES]
 
@@ -301,7 +302,12 @@ class ColumnFilterPopup(QDialog):
         self.accept()
 
     def popup_at(self, global_pos):
-        """在给定屏幕坐标下方弹出，超出屏幕时向上翻。"""
+        """在给定屏幕坐标下方弹出并等待结果；点弹层外面 = 取消。
+
+        没有用 exec()：模态窗口会让外面的点击压根送不到事件过滤器，
+        就实现不了"点空白处自动关闭"。改成非模态 + 自己跑一个事件循环，
+        效果等价（调用方仍然是同步等结果），但外部点击看得见。
+        """
         # adjustSize 会按"列表想显示全部值"来算高度，值多时能撑到上千像素，
         # 于是超出屏幕后被推到别处——这里把尺寸夹在可控范围内
         self.adjustSize()
@@ -312,8 +318,42 @@ class ColumnFilterPopup(QDialog):
         # 管理器还会自作主张摆位——显式设 WA_Moved，并在 show 之后再摆一次
         self.setAttribute(Qt.WidgetAttribute.WA_Moved, True)
         self.move(self._target_pos)
+        self.show()
+        self.raise_()
+        self.activateWindow()
         self.search_edit.setFocus()
-        return self.exec()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._loop = QEventLoop()
+        try:
+            self._loop.exec()
+        finally:
+            self._loop = None
+            if app is not None:
+                app.removeEventFilter(self)
+        # 注意：实例属性 self.result 盖住了 QDialog.result()，这里返回的是
+        # 我们自己的结果（None / 'clear' / 'advanced' / 勾选值列表）
+        return self.result
+
+    def eventFilter(self, obj, event):
+        """点在弹层外面就关掉（并吞掉这一下，免得顺手改了表格选区）。"""
+        if event.type() in (QEvent.Type.MouseButtonPress,
+                            QEvent.Type.NonClientAreaMouseButtonPress):
+            try:
+                pos = event.globalPosition().toPoint()
+            except AttributeError:
+                pos = event.globalPos()
+            if self.isVisible() and not self.frameGeometry().contains(pos):
+                self.reject()
+                return True
+        return super().eventFilter(obj, event)
+
+    def done(self, code):
+        super().done(code)
+        if self._loop is not None:
+            self._loop.quit()      # 结束 popup_at 里的事件循环
 
     def _clamp_to_screen(self, global_pos):
         pos = QPoint(global_pos)
