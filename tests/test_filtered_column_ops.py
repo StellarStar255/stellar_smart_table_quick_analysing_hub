@@ -1,4 +1,4 @@
-"""筛选状态下增删列：视图和 original_df 同步，行操作仍然被拦住。"""
+"""筛选状态下增删行/列：视图和 original_df 同步；只有"设为表头"仍要求先清筛选。"""
 import os
 import sys
 
@@ -79,11 +79,76 @@ def test_colors_and_suspended_formulas_follow_new_column(win):
     assert win._orig_cell_colors == {(0, 2): "#ff0000"}
 
 
-def test_row_ops_are_still_blocked(win, monkeypatch):
+def test_promote_header_is_still_blocked(win, monkeypatch):
     warned = []
     monkeypatch.setattr(QMessageBox, "information",
                         lambda *a, **k: warned.append(a[2]))
-    before = len(win.model.df)
-    win.insert_row(0)
-    assert len(win.model.df) == before
-    assert warned == [tr("筛选状态下不支持增删行，请先清除筛选")]
+    win.promote_row_to_header(1)
+    assert warned == [tr("筛选状态下不支持此操作，请先清除筛选")]
+
+
+class TestFilteredRowOps:
+    """筛选视图：北京(原 0)、北京(原 2)；原表共 4 行。"""
+
+    def test_insert_row_lands_after_the_visible_row_above(self, win):
+        win.insert_row(1)                       # 在视图第 1 行（原 2）上面插
+        # 原表：北京(0) 上海(1) [新] 北京(3) 广州(4)
+        assert len(win.original_df) == 5
+        assert pd.isna(win.original_df.at[2, "城市"])
+        assert list(win.model.df["城市"].fillna("")) == ["北京", "", "北京"]
+        assert win._filtered_idx_map == [0, 2, 3]
+
+    def test_insert_at_top_goes_before_first_visible(self, win):
+        win.insert_row(0)
+        assert pd.isna(win.original_df.at[0, "城市"])
+        assert win._filtered_idx_map == [0, 1, 3]
+
+    def test_insert_at_end_goes_after_last_visible(self, win):
+        win.insert_row(2)
+        # 最后可见行原来是 2，新行插到原 3；广州被推到 4
+        assert pd.isna(win.original_df.at[3, "城市"])
+        assert win.original_df.at[4, "城市"] == "广州"
+        assert win._filtered_idx_map == [0, 2, 3]
+
+    def test_edit_inserted_row_reaches_original(self, win):
+        win.insert_row(1)
+        win.model.setData(win.model.index(2, 1), "77")    # 视图数据行 1 = 新行
+        assert str(win.original_df.at[2, "数量"]) in ("77", "77.0")
+
+    def test_delete_rows_removes_matching_original_rows(self, win, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "question",
+                            lambda *a, **k: QMessageBox.StandardButton.Yes)
+        win.table.selectionModel().select(
+            win.model.index(2, 0),
+            win.table.selectionModel().SelectionFlag.Select)    # 视图数据行 1
+        win.delete_selected_rows()
+        assert list(win.original_df["城市"]) == ["北京", "上海", "广州"]
+        assert list(win.model.df["城市"]) == ["北京"]
+        assert win._filtered_idx_map == [0]
+
+    def test_ledgers_follow_row_insert_and_delete(self, win, monkeypatch):
+        win.clear_all_filters()
+        win.model.set_dataframe(pd.DataFrame({"a": [1, 2, 3], "b": [0, 0, 0]}))
+        win.model.setData(win.model.index(3, 1), "=A3*2")     # 数据行 2 的 b
+        win.model.cell_colors[(2, 0)] = "#ff0000"
+        win.active_filters = [{"col": "a", "condition": "值在列表中",
+                               "value": ["1", "3"]}]
+        win._reapply_filters()
+        assert win._suspended_formulas == {(2, 1): "=A3*2"}
+        win.insert_row(0)                                       # 原表最前面插一行
+        assert win._suspended_formulas == {(3, 1): "=A4*2"}
+        assert win._orig_cell_colors == {(3, 0): "#ff0000"}
+        monkeypatch.setattr(QMessageBox, "question",
+                            lambda *a, **k: QMessageBox.StandardButton.Yes)
+        win.table.selectionModel().select(
+            win.model.index(1, 0),
+            win.table.selectionModel().SelectionFlag.Select)    # 删掉新插的那行
+        win.delete_selected_rows()
+        assert win._suspended_formulas == {(2, 1): "=A3*2"}
+        assert win._orig_cell_colors == {(2, 0): "#ff0000"}
+
+    def test_clear_filter_after_row_ops_restores_consistent_table(self, win):
+        win.insert_row(1)
+        win.model.setData(win.model.index(2, 0), "新城")
+        win.clear_all_filters()
+        assert list(win.model.df["城市"]) == ["北京", "上海", "新城", "北京", "广州"]

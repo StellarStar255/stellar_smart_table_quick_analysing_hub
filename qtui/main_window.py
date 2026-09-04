@@ -1866,25 +1866,27 @@ class MainWindow(QMainWindow):
     # ---------- 行列操作 ----------
 
     def _require_no_filter(self):
-        """行的增删在筛选下没法安全映射位置（列可以，见 _sync_original_columns）。"""
+        """只剩"设为表头"这种整表重构还要求先清筛选；增删行列都已支持筛选中操作。"""
         if self.active_filters:
             QMessageBox.information(self, tr("提示"),
-                                    tr("筛选状态下不支持增删行，请先清除筛选"))
+                                    tr("筛选状态下不支持此操作，请先清除筛选"))
             return False
         return True
 
-    def _shift_original_ledgers(self, col_map):
-        """把原坐标底账（挂起公式、原始底色）的列号按 col_map 重排。
+    def _remap_original_ledgers(self, row_map=None, col_map=None):
+        """把原坐标底账（挂起公式、原始底色）的行/列号按映射重排。
 
-        col_map: 旧列号 -> 新列号，返回 None 表示该列已删除。
+        row_map / col_map: 旧号 -> 新号，返回 None 表示该行/列已删除；
+        表头行（-1）不参与行映射。公式内的引用同步重写。
         """
         def remap(d):
             out = {}
             for (r, c), v in d.items():
-                nc = c if c < 0 else col_map(c)
-                if nc is None:
+                nr = r if (r < 0 or row_map is None) else row_map(r)
+                nc = c if col_map is None else col_map(c)
+                if nr is None or nc is None:
                     continue
-                out[(r, nc)] = v
+                out[(nr, nc)] = v
             return out
         if self._orig_cell_colors:
             self._orig_cell_colors = remap(self._orig_cell_colors)
@@ -1892,9 +1894,56 @@ class MainWindow(QMainWindow):
             shifted = remap(self._suspended_formulas)
             engine = self.model.engine
             self._suspended_formulas = {
-                key: engine.adjust_formula_refs(f, None, col_map)
+                key: engine.adjust_formula_refs(f, row_map, col_map)
                 for key, f in shifted.items()
             }
+
+    def _orig_positions(self):
+        """筛选视图各行在 original_df 里的位置（idx_map 存的是索引标签）。"""
+        index = self.original_df.index
+        return [index.get_loc(label) for label in (self._filtered_idx_map or [])]
+
+    def _insert_row_filtered(self, view_pos):
+        """筛选中插入行：原表里紧贴目标行上方插入（末尾则接在最后可见行后），
+        新行同时留在视图里（哪怕它不满足筛选条件）。"""
+        positions = self._orig_positions()
+        view_pos = min(max(view_pos, 0), len(positions))
+        if not positions:
+            orig_pos = len(self.original_df)
+        elif view_pos < len(positions):
+            orig_pos = positions[view_pos]
+        else:
+            orig_pos = positions[-1] + 1
+        self.model.insert_row(view_pos)
+        df = self.original_df
+        empty = pd.DataFrame([[np.nan] * len(df.columns)], columns=df.columns)
+        self.original_df = pd.concat(
+            [df.iloc[:orig_pos], empty, df.iloc[orig_pos:]]).reset_index(drop=True)
+        positions = [p + 1 if p >= orig_pos else p for p in positions]
+        positions.insert(view_pos, orig_pos)
+        self._filtered_idx_map = positions      # reset_index 后标签 == 位置
+        self._remap_original_ledgers(row_map=lambda r: r + 1 if r >= orig_pos else r)
+
+    def _remove_rows_filtered(self, view_rows):
+        """筛选中删行：按行映射删掉原表里对应的行。"""
+        positions = self._orig_positions()
+        view_rows = sorted({r for r in view_rows if 0 <= r < len(positions)})
+        if not view_rows:
+            return
+        deleted = sorted({positions[r] for r in view_rows})
+        deleted_set = set(deleted)
+
+        def row_map(r):
+            if r in deleted_set:
+                return None
+            return r - bisect.bisect_left(deleted, r)
+        self.model.remove_rows(view_rows)
+        df = self.original_df
+        self.original_df = df.drop(df.index[deleted]).reset_index(drop=True)
+        gone = set(view_rows)
+        self._filtered_idx_map = [row_map(p) for i, p in enumerate(positions)
+                                  if i not in gone]
+        self._remap_original_ledgers(row_map=row_map)
 
     def _sync_original_columns(self, insert_pos=None, name=None, removed=None):
         """筛选中做的列增删同步到 original_df（列与行筛选无关，可以安全同步）。
@@ -1905,8 +1954,8 @@ class MainWindow(QMainWindow):
             return
         if insert_pos is not None:
             self.original_df.insert(insert_pos, name, np.nan)
-            self._shift_original_ledgers(
-                lambda c: c + 1 if c >= insert_pos else c)
+            self._remap_original_ledgers(
+                col_map=lambda c: c + 1 if c >= insert_pos else c)
         if removed:
             dropped = sorted(removed)
             names = [self.original_df.columns[c] for c in dropped]
@@ -1917,7 +1966,7 @@ class MainWindow(QMainWindow):
                 if c in deleted:
                     return None
                 return c - bisect.bisect_left(dropped, c)
-            self._shift_original_ledgers(col_map)
+            self._remap_original_ledgers(col_map=col_map)
 
     def _current_row(self):
         """当前数据行（0 基）；视图第 0 行是表头行。"""
@@ -1931,10 +1980,11 @@ class MainWindow(QMainWindow):
         return idx.column() if idx.isValid() else len(self.model.df.columns)
 
     def insert_row(self, position=None):
-        if not self._require_no_filter():
-            return
         pos = position if position is not None else self._current_row()
-        self.model.insert_row(pos)
+        if self.active_filters and self.original_df is not None:
+            self._insert_row_filtered(pos)
+        else:
+            self.model.insert_row(pos)
         self._mark_modified()
 
     def insert_column(self, position=None):
@@ -1945,8 +1995,6 @@ class MainWindow(QMainWindow):
         self._insert_col_at(pos, name.strip() or None)
 
     def delete_selected_rows(self):
-        if not self._require_no_filter():
-            return
         # 视图行 0 是表头行，不可删除；转换为数据行坐标
         rows = sorted({i.row() - HEADER_ROWS for i in self.table.selectionModel().selectedIndexes()
                        if i.row() > 0})
@@ -1955,7 +2003,10 @@ class MainWindow(QMainWindow):
         ret = QMessageBox.question(self, tr("删除行"), tr("确定删除选中的 {} 行？").format(len(rows)))
         if ret != QMessageBox.StandardButton.Yes:
             return
-        self.model.remove_rows(rows)
+        if self.active_filters and self.original_df is not None:
+            self._remove_rows_filtered(rows)
+        else:
+            self.model.remove_rows(rows)
         self._mark_modified()
         self.update_statusbar()
 
@@ -2111,7 +2162,11 @@ class MainWindow(QMainWindow):
         base_df = self.original_df if self.original_df is not None else df
         if colname not in base_df.columns:
             return
-        counts = filter_engine.value_counts(base_df[colname])
+        # 和 Excel 一样：只列"其它列筛选之后还剩下"的值，多列逐步收窄时
+        # 不会看到一堆勾了也没结果的值；本列自己的条件不参与（否则只剩已勾的）
+        others = [f for f in self.active_filters if f.get("col") != colname]
+        scope = filter_engine.apply_filters(base_df, others)[0] if others else base_df
+        counts = filter_engine.value_counts(scope[colname])
         existing = self._column_value_filter(colname)
         has_filter = any(f.get("col") == colname for f in self.active_filters)
         popup = ColumnFilterPopup(

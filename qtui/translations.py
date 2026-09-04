@@ -147,7 +147,7 @@ TRANSLATIONS = {
     '已撤销': 'Undone',
     '已重做': 'Redone',
     '提示': 'Notice',
-    '筛选状态下不支持增删行，请先清除筛选': 'Cannot insert or delete rows while filtered. Clear filters first',
+    '筛选状态下不支持此操作，请先清除筛选': 'This action is not available while filtered. Clear filters first',
     '列名（留空自动命名）:': 'Column name (leave blank to auto-name):',
     '确定删除选中的 {} 行？': 'Delete the selected {} row(s)?',
     '确定删除列: {}？': 'Delete column(s): {}?',
