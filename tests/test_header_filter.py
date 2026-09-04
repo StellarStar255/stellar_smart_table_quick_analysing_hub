@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from PyQt6.QtCore import Qt, QPoint, QPointF, QEvent
 from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 _app = QApplication.instance() or QApplication([])
@@ -76,6 +77,42 @@ class TestHeaderArrow:
                          Qt.KeyboardModifier.NoModifier)
         header.mousePressEvent(ev)
         assert got == []
+
+    def test_real_click_on_arrow_opens_the_popup(self, win, monkeypatch):
+        """走真实鼠标事件（表头视口 -> QHeaderView.mousePressEvent）的整条路。"""
+        opened = []
+        monkeypatch.setattr(ColumnFilterPopup, "popup_at",
+                            lambda self, pos: opened.append(pos) or 0)
+        header = win.table.horizontalHeader()
+        QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         header.arrow_rect_at(1).center())
+        assert len(opened) == 1
+
+    def test_popup_anchors_under_the_column_header(self, win, monkeypatch):
+        got = []
+        monkeypatch.setattr(ColumnFilterPopup, "popup_at",
+                            lambda self, pos: got.append(pos) or 0)
+        win.open_column_filter(1)
+        header = win.table.horizontalHeader()
+        expect = header.viewport().mapToGlobal(
+            QPoint(header.sectionViewportPosition(1), header.height()))
+        assert (got[0].x(), got[0].y()) == (expect.x(), expect.y())
+
+    def test_column_menu_uses_the_same_popup(self, win, monkeypatch):
+        opened = []
+        monkeypatch.setattr(type(win), "open_column_filter",
+                            lambda self, col: opened.append(col))
+        monkeypatch.setattr(type(win), "open_filter_dialog",
+                            lambda self, **kw: opened.append("old dialog"))
+        from PyQt6.QtWidgets import QMenu
+        from qtui.i18n import tr
+        wanted = tr("筛选此列 ({})...").format("数量")
+        monkeypatch.setattr(QMenu, "exec", lambda self, *a: (
+            [a_ for a_ in self.actions() if a_.text() == wanted][0].trigger()))
+        header = win.table.horizontalHeader()
+        win._show_col_menu(QPoint(header.sectionViewportPosition(1) + 5, 5))
+        assert opened == [1]
 
     def test_filtered_columns_get_the_funnel(self, win):
         win.active_filters = [{"col": "数量", "condition": "值在列表中",

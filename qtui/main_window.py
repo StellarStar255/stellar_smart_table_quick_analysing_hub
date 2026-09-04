@@ -2921,8 +2921,9 @@ class MainWindow(QMainWindow):
             return
         colname = str(self.model.df.columns[col])
         menu = QMenu(self)
+        # 和点列头箭头是同一个弹层，两条路进来行为一致
         menu.addAction(tr("筛选此列 ({})...").format(colname),
-                       lambda: self.open_filter_dialog(preset_col=colname))
+                       lambda: self.open_column_filter(col))
         menu.addAction(tr("升序排序"), lambda: self._sort_by(col, True))
         menu.addAction(tr("降序排序"), lambda: self._sort_by(col, False))
         menu.addSeparator()
