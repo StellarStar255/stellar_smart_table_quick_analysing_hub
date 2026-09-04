@@ -272,6 +272,35 @@ class TestApplyThroughWindow:
         assert opened == ["城市"]
         assert win.active_filters == []
 
+    def test_values_cascade_from_other_columns_filters(self, win, monkeypatch):
+        """其它列筛过之后，本列只列剩下的值和计数（Excel 行为）。"""
+        win.active_filters = [{"col": "数量", "condition": "值在列表中",
+                               "value": ["10"]}]           # 只剩北京、广州两行
+        win._reapply_filters()
+        seen = {}
+        monkeypatch.setattr(ColumnFilterPopup, "__init__",
+                            lambda self, parent, colname, counts, **kw: (
+                                seen.update(counts=counts), None)[1])
+        monkeypatch.setattr(ColumnFilterPopup, "popup_at", lambda self, pos: 0)
+        monkeypatch.setattr(ColumnFilterPopup, "sort_ascending", None, raising=False)
+        monkeypatch.setattr(ColumnFilterPopup, "result", None, raising=False)
+        win.open_column_filter(0)
+        assert seen["counts"] == [("北京", 1), ("广州", 1)]
+
+    def test_own_column_filter_does_not_narrow_its_own_list(self, win, monkeypatch):
+        win.active_filters = [{"col": "城市", "condition": "值在列表中",
+                               "value": ["北京"]}]
+        win._reapply_filters()
+        seen = {}
+        monkeypatch.setattr(ColumnFilterPopup, "__init__",
+                            lambda self, parent, colname, counts, **kw: (
+                                seen.update(counts=counts), None)[1])
+        monkeypatch.setattr(ColumnFilterPopup, "popup_at", lambda self, pos: 0)
+        monkeypatch.setattr(ColumnFilterPopup, "sort_ascending", None, raising=False)
+        monkeypatch.setattr(ColumnFilterPopup, "result", None, raising=False)
+        win.open_column_filter(0)
+        assert [v for v, _ in seen["counts"]] == ["上海", "北京", "广州", ""]
+
     def test_sort_from_popup_sorts_column(self, win, monkeypatch):
         self._run_popup(win, monkeypatch, lambda p: p._sort(True))
         win.open_column_filter(1)
