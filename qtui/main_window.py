@@ -74,6 +74,7 @@ from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
 from .header_filter import ColumnFilterPopup, FilterHeaderView
 from .find_dialog import FindReplaceDialog
+from .sort_dialog import SortDialog
 from .image_panel import ImagePreviewPanel
 from qtui.i18n import tr
 
@@ -1802,16 +1803,22 @@ class MainWindow(QMainWindow):
         if self._text_editor_focused():
             QApplication.focusWidget().undo()
             return
+        version = self.model.structure_version
         if self.model.undo():
             self._mark_modified()
+            if self.model.structure_version != version:
+                self._update_image_context()
             self.update_statusbar(tr("已撤销"))
 
     def redo(self):
         if self._text_editor_focused():
             QApplication.focusWidget().redo()
             return
+        version = self.model.structure_version
         if self.model.redo():
             self._mark_modified()
+            if self.model.structure_version != version:
+                self._update_image_context()
             self.update_statusbar(tr("已重做"))
 
     def _text_editor_focused(self):
@@ -1864,6 +1871,16 @@ class MainWindow(QMainWindow):
         self.table.selectAll()
 
     # ---------- 行列操作 ----------
+
+    def _after_structure_change(self):
+        """结构操作（增删行列/排序）后的统一收尾。
+
+        筛选状态下 original_df / 行映射 / 原坐标底账由本窗口手工同步，
+        模型的撤销记录回退不了这些，只能作废历史；非筛选时结构操作可撤销。
+        """
+        if self.active_filters:
+            self.model.clear_history()
+        self._mark_modified()
 
     def _require_no_filter(self):
         """只剩"设为表头"这种整表重构还要求先清筛选；增删行列都已支持筛选中操作。"""
@@ -1985,7 +2002,7 @@ class MainWindow(QMainWindow):
             self._insert_row_filtered(pos)
         else:
             self.model.insert_row(pos)
-        self._mark_modified()
+        self._after_structure_change()
 
     def insert_column(self, position=None):
         name, ok = QInputDialog.getText(self, tr("插入列"), tr("列名（留空自动命名）:"))
@@ -2007,7 +2024,7 @@ class MainWindow(QMainWindow):
             self._remove_rows_filtered(rows)
         else:
             self.model.remove_rows(rows)
-        self._mark_modified()
+        self._after_structure_change()
         self.update_statusbar()
 
     def _remove_columns(self, cols):
@@ -2025,7 +2042,7 @@ class MainWindow(QMainWindow):
                 self.clear_all_filters()
         else:
             self._rebuild_filter_bar()   # 漏斗标记跟着列位置变
-        self._mark_modified()
+        self._after_structure_change()
 
     def delete_selected_columns(self):
         cols = sorted({i.column() for i in self.table.selectionModel().selectedIndexes()})
@@ -2073,37 +2090,34 @@ class MainWindow(QMainWindow):
         df = self.model.df
         if df.empty:
             return
-        col, ok = QInputDialog.getItem(self, tr("排序"), tr("选择排序列:"),
-                                       [str(c) for c in df.columns], 0, False)
-        if not ok:
+        current = self.table.currentIndex()
+        preset = current.column() if current.isValid() else 0
+        dialog = SortDialog([str(c) for c in df.columns], self, preset_col=preset)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        order, ok = QInputDialog.getItem(self, tr("排序"), tr("排序方式:"), [tr("升序"), tr("降序")], 0, False)
-        if not ok:
-            return
-        self._sort_by(list(df.columns).index(col), order == tr("升序"))
+        self._sort_by_keys(dialog.keys())
 
     def _sort_by(self, col_idx, ascending):
+        self._sort_by_keys([(col_idx, ascending)])
+
+    def _sort_by_keys(self, keys):
+        """按多个键排序（[(列号, 是否升序), ...]，靠前的优先）。"""
+        positions = self.model.sort_positions(keys)
+        if positions is None:
+            return
         if self.active_filters:
             # 筛选视图下位置引用语义模糊，公式仍冻结为静态值
             self._freeze_formulas(tr("排序"))
-        df = self.model.df
-        colname = df.columns[col_idx]
-        # 数值列按数值排，混合列按字符串排
-        keys = pd.to_numeric(df[colname], errors="coerce")
-        if keys.notna().sum() >= df[colname].notna().sum() and keys.notna().any():
-            sort_series = keys
-        else:
-            sort_series = df[colname].astype(str)
-        positions = sort_series.sort_values(
-            ascending=ascending, kind="mergesort", na_position="last").index
         if self._filtered_idx_map:
             self._filtered_idx_map = [self._filtered_idx_map[i] for i in positions]
         # 公式单元格/引用与背景色在模型内跟随行序移动；
         # 含部分区域的公式无法安全重排，被冻结为静态值
         frozen = self.model.reorder_rows(positions)
-        self._mark_modified()
-        message = tr("已按 {} {}排序").format(
-            colname, tr("升序") if ascending else tr("降序"))
+        self._after_structure_change()
+        columns = self.model.df.columns
+        parts = [tr("{}（{}）").format(columns[c], tr("升序") if asc else tr("降序"))
+                 for c, asc in keys]
+        message = tr("已按 {} 排序").format(tr("，").join(parts))
         if frozen:
             message += tr("；{} 个含部分区域引用的公式已转为静态值").format(frozen)
         self.update_statusbar(message)
@@ -2976,7 +2990,7 @@ class MainWindow(QMainWindow):
         self.model.insert_column(pos, name)
         self._sync_original_columns(insert_pos=pos,
                                     name=self.model.df.columns[pos])
-        self._mark_modified()
+        self._after_structure_change()
 
     def _show_col_menu(self, pos):
         col = self.table.horizontalHeader().logicalIndexAt(pos)

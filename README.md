@@ -52,13 +52,13 @@ python smart_table_quick_analysing_hub_qt.py -h
 ### ✏️ Data Editing
 - **Intuitive editing**: Double-click any cell to edit
 - **Copy & paste**: Standard copy/paste operations
-- **Undo/redo**: Full undo/redo support (up to 50 steps)
+- **Undo/redo**: Full undo/redo support (up to 500 steps), including row/column insert & delete, sort, and promote-to-header
 - **Batch operations**: Multi-row selection and bulk deletion
 
 ### 🧮 Cell Formulas
 - **Excel-consistent grid**: Fixed letter columns (A/B/C...), row 1 is the editable header row, data starts at row 2 — formula coordinates mean exactly the same thing here and in Excel
 - **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A2:A10)`, `=IF(A2>10, "high", "low")`
-- **39 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
+- **43 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
 - **Auto recalculation**: Dependent formulas update when referenced cells change
 - **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill; filtering suspends formulas and restores them when filters are cleared
@@ -66,7 +66,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **Round-trip with Excel**: Formulas are read from and written back to .xlsx as real formulas
 
 ### 🔧 Data Processing
-- **Sorting**: Sort any column in ascending or descending order
+- **Sorting**: Sort by one or more columns, each ascending or descending (stable; blanks last)
 - **Filtering**: Multiple conditions including equals, contains, greater than, and less than
   - ✨ Pick filter values from a dropdown list
   - ✨ All active filters shown as live tags
@@ -210,11 +210,11 @@ Alternatively, click a column header for quick sorting.
 | Sorting & filtering | ✅ | ✅ |
 | Basic statistics | ✅ | ✅ |
 | Find & replace | ✅ | ✅ |
-| Undo/redo | ✅ (50 steps) | ✅ |
+| Undo/redo | ✅ (500 steps, incl. structural ops) | ✅ |
 | Completely free | ✅ | ❌ |
 | Open source | ✅ | ❌ |
 | Cross-platform | ✅ | ⚠️ |
-| Cell formulas | ✅ (39 functions) | ✅ |
+| Cell formulas | ✅ (43 functions) | ✅ |
 | Charts | ⚠️ Planned | ✅ |
 
 ## Roadmap
@@ -322,13 +322,13 @@ python smart_table_quick_analysing_hub_qt.py -h
 ### ✏️ 数据编辑
 - **直观编辑**: 双击单元格即可编辑
 - **复制粘贴**: 支持标准的复制粘贴操作
-- **撤销重做**: 完整的撤销/重做功能（最多50步）
+- **撤销重做**: 完整的撤销/重做功能（最多 500 步），增删行列、排序、设为表头也能撤销
 - **批量操作**: 支持多行选择和批量删除
 
 ### 🧮 单元格公式
 - **Excel 一致的网格**: 固定字母列（A/B/C...），第 1 行是可编辑的表头行，数据从第 2 行起——公式坐标与 Excel 完全一致，跨应用含义相同
 - **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A2:A10)`、`=IF(A2>10, "高", "低")`
-- **39 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / IF / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
+- **43 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
 - **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）；筛选期间公式挂起，清除筛选后恢复重算
@@ -336,7 +336,7 @@ python smart_table_quick_analysing_hub_qt.py -h
 - **与 Excel 互通**: 公式从 .xlsx 读入，保存时也以真公式写回
 
 ### 🔧 数据处理
-- **排序**: 按任意列升序或降序排序
+- **排序**: 支持多列排序，每列可分别指定升序/降序（稳定排序，空值排最后）
 - **筛选**: 支持等于、包含、大于、小于等多种筛选条件
   - ✨ 从下拉列表选择筛选值
   - ✨ 实时显示所有筛选条件标签
@@ -480,11 +480,11 @@ python smart_table_quick_analysing_hub_qt.py
 | 排序筛选 | ✅ | ✅ |
 | 基本统计 | ✅ | ✅ |
 | 查找替换 | ✅ | ✅ |
-| 撤销重做 | ✅ (50步) | ✅ |
+| 撤销重做 | ✅ (500 步，含结构操作) | ✅ |
 | 完全免费 | ✅ | ❌ |
 | 开源 | ✅ | ❌ |
 | 跨平台 | ✅ | ⚠️ |
-| 单元格公式 | ✅（39 函数） | ✅ |
+| 单元格公式 | ✅（43 函数） | ✅ |
 | 图表 | ⚠️ 待开发 | ✅ |
 
 ## 未来规划
