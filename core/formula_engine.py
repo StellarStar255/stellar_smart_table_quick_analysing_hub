@@ -60,6 +60,48 @@ def _excel_round(value, digits, mode):
     return float(result)
 
 
+class _RangeValues(list):
+    """区域引用的值：行的列表（每行一个元组），可当普通嵌套列表用。
+
+    额外缓存按列构造时顺手得到的展平视图，聚合函数（SUM/COUNT/…）
+    直接取缓存，不必递归展平几十万个单元素行——整列公式的主要开销。
+    """
+
+    __slots__ = ("_cols", "_numeric_cols", "_flat_all", "_flat_nonblank", "_flat_numeric")
+
+    def __init__(self, cols, numeric_cols):
+        # cols: 每列一个 Python 列表（空白为 None）；numeric_cols: 每列是否数值 dtype
+        super().__init__(zip(*cols) if cols else ())
+        self._cols = cols
+        self._numeric_cols = numeric_cols
+        self._flat_all = self._flat_nonblank = self._flat_numeric = None
+
+    def flat_all(self):
+        """行主序展平，空白保留为 None（条件函数按位置配对用）。"""
+        if self._flat_all is None:
+            if len(self._cols) == 1:
+                self._flat_all = self._cols[0]
+            else:
+                self._flat_all = [v for row in self for v in row]
+        return self._flat_all
+
+    def flat_nonblank(self):
+        if self._flat_nonblank is None:
+            self._flat_nonblank = [v for v in self.flat_all() if v is not None]
+        return self._flat_nonblank
+
+    def flat_numeric(self):
+        if self._flat_numeric is None:
+            if len(self._cols) == 1 and self._numeric_cols[0]:
+                # 数值列：None 以外全是 float，去掉 None 即可
+                self._flat_numeric = self.flat_nonblank()
+            else:
+                self._flat_numeric = [
+                    v for v in self.flat_all()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return self._flat_numeric
+
+
 class _IfCallLowering(ast.NodeTransformer):
     """把 _if(...) 调用降为 Python 条件表达式，恢复分支惰性求值。
 
@@ -243,6 +285,31 @@ class FormulaEngine:
                 for row in range(r0, r1 + 1)
                 for col in range(c0, c1 + 1)]
 
+    def extract_dependency_spec(self, formula: str, df: Optional[pd.DataFrame] = None):
+        """公式的依赖规格：(单格集合, 区域边界列表 [(r0, r1, c0, c1)])。
+
+        区域不展开成单元格——整列引用（B2:B200001）展开是几十万个键，
+        登记/注销都是热点；调用方按边界做包含判断即可。区域裁剪到表格范围
+        （含表头行 -1），越界的区域整个丢弃。
+        """
+        df = df if df is not None else self._df
+        expr = self.STRING_PATTERN.sub('', formula)
+        ranges = []
+        for match in self.RANGE_REF_PATTERN.finditer(expr):
+            r0, r1, c0, c1 = self._range_bounds(match)
+            if df is not None:
+                r0, r1 = max(r0, -1), min(r1, len(df) - 1)
+                c0, c1 = max(c0, 0), min(c1, len(df.columns) - 1)
+            if r0 <= r1 and c0 <= c1:
+                ranges.append((r0, r1, c0, c1))
+        cells = set()
+        for match in self.CELL_REF_PATTERN.finditer(self.RANGE_REF_PATTERN.sub('', expr)):
+            try:
+                cells.add(self.parse_cell_ref(match.group(), df))
+            except ValueError:
+                pass
+        return cells, ranges
+
     def extract_dependencies(self, formula: str, df: Optional[pd.DataFrame] = None) -> Set[Tuple[int, int]]:
         """从公式中提取所有被引用的单元格 (row_index, col_index)。"""
         df = df if df is not None else self._df
@@ -330,24 +397,30 @@ class FormulaEngine:
             r0 = 0
         if r0 > r1:
             return grid
-        height = r1 - r0 + 1
-        rows = [[None] * width for _ in range(height)]
         block = df.iloc[r0:r1 + 1, c0:c1 + 1]
+        cols, numeric_cols = [], []
         for j in range(width):
             series = block.iloc[:, j]
             dtype = series.dtype
             if (pd.api.types.is_numeric_dtype(dtype)
                     and not pd.api.types.is_bool_dtype(dtype)):
-                values = series.to_numpy(dtype=float, na_value=np.nan).tolist()
-                for i, v in enumerate(values):
-                    if v == v:
-                        rows[i][j] = v
+                # 整列 C 级转换：NaN -> None
+                values = series.to_numpy(dtype=float, na_value=np.nan)
+                obj = values.astype(object)
+                obj[np.isnan(values)] = None
+                cols.append(obj.tolist())
+                numeric_cols.append(True)
             else:
                 convert = self._convert_scalar
-                for i, v in enumerate(series.tolist()):
-                    rows[i][j] = convert(v)
-        grid.extend(rows)
-        return grid
+                blank = pd.isna(series).to_numpy()
+                cols.append([None if b else (v if isinstance(v, str) else convert(v))
+                             for v, b in zip(series.tolist(), blank)])
+                numeric_cols.append(False)
+        values = _RangeValues(cols, numeric_cols)
+        if grid:
+            grid.extend(values)   # 带表头行：退化为普通嵌套列表
+            return grid
+        return values
 
     def evaluate(self, formula: str, df: Optional[pd.DataFrame] = None) -> Any:
         """
@@ -821,7 +894,9 @@ class FormulaEngine:
             # 与 Excel 一致：COUNTA/AND/OR 等都忽略空白
             values = []
             for a in args:
-                if isinstance(a, (list, tuple)):
+                if isinstance(a, _RangeValues):
+                    values.extend(a.flat_nonblank())
+                elif isinstance(a, (list, tuple)):
                     values.extend(_flatten(a))
                 elif a is not None:
                     values.append(a)
@@ -831,8 +906,14 @@ class FormulaEngine:
             return isinstance(v, (int, float)) and not isinstance(v, bool)
 
         def _flat_numeric(args):
-            # 展平并只保留数值，供聚合函数使用
-            return [v for v in _flatten(args) if _is_num(v)]
+            # 展平并只保留数值，供聚合函数使用；区域直接取缓存的数值视图
+            values = []
+            for a in args:
+                if isinstance(a, _RangeValues):
+                    values.extend(a.flat_numeric())
+                else:
+                    values.extend(v for v in _flatten([a]) if _is_num(v))
+            return values
 
         def _sum(*args):
             return sum(_flat_numeric(args))
@@ -867,7 +948,9 @@ class FormulaEngine:
             # 条件函数要保持位置对应（条件区与求和区按位置配对），空白保留为 None
             values = []
             for a in args:
-                if isinstance(a, (list, tuple)):
+                if isinstance(a, _RangeValues):
+                    values.extend(a.flat_all())
+                elif isinstance(a, (list, tuple)):
                     values.extend(_flatten_keep_blank(a))
                 else:
                     values.append(a)

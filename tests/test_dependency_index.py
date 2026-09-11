@@ -48,8 +48,12 @@ class TestDependencyIndex:
         m.setData(m.index(1, 0), '5')
         assert m.df.iat[0, 2] == 10.0         # 依赖恢复，重算生效
 
-    def test_range_formula_registers_all_keys(self, m):
+    def test_range_formula_registers_bounds_not_cells(self, m):
         m.setData(m.index(1, 2), '=SUM(A2:B3)')
-        assert m._formula_deps[(0, 2)] == {(0, 0), (0, 1), (1, 0), (1, 1)}
+        # 区域只记边界（整列引用展开成几十万个键是性能热点）
+        assert m._formula_ranges[(0, 2)] == [(0, 1, 0, 1)]
+        assert (0, 2) not in m._formula_deps
         m.setData(m.index(2, 1), '30')        # 区域内任意格触发重算
         assert m.df.iat[0, 2] == 43.0         # 1+2+10+30
+        m.setData(m.index(1, 2), '')          # 清公式后区域依赖一并注销
+        assert not m._formula_ranges

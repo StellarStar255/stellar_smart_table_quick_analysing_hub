@@ -88,18 +88,28 @@ python smart_table_quick_analysing_hub_qt.py -h
 - `Ctrl+S`: Save (switches to the new file after saving)
 - `Ctrl+Shift+S`: Save As a copy (keep editing the original file)
 
-**Editing**
-- `Ctrl+Z`: Undo
-- `Ctrl+Y`: Redo
-- `Ctrl+C`: Copy
-- `Ctrl+V`: Paste
+**Editing** (Ctrl = Cmd on macOS)
+- `Ctrl+Z`: Undo; `Ctrl+Y` / `Ctrl+Shift+Z`: Redo
+- `Ctrl+X` / `Ctrl+C` / `Ctrl+V`: Cut / Copy / Paste
 - `Delete` / `Backspace`: Clear selected cells
+- `Ctrl+D` / `Ctrl+R`: Fill down / fill right from the first row / column of the selection
+- `Ctrl+Enter`: Commit without moving; with a multi-cell selection, fills every selected cell (formulas shift like Excel)
+- `F4` (while editing a formula): Cycle the reference under the caret `A1` → `$A$1` → `A$1` → `$A1`
+- `Alt+=`: AutoSum the contiguous numbers above (or to the left)
+- `Ctrl+;` / `Ctrl+Shift+;`: Insert today's date / current time
+- `Ctrl+Shift+=`: Insert as many rows as selected (columns when whole columns are selected); `Ctrl+Shift+-`: delete them
+- `Ctrl+F` / `Ctrl+H`: Find / Replace
 - Just type on a selected cell to overwrite it (Excel-style); arrow keys commit and move
 - `Enter`: Commit and move down (`Shift+Enter` moves up); `Tab` commits and moves right, and a following `Enter` returns to the column where you started tabbing
 - `F2` / double-click: Edit in place with the caret at the end; `Esc` cancels
 
-**Navigation** ✨New
+**Navigation & Selection**
 - `↑` / `↓`: Move up/down (auto page-turn at boundaries)
+- `Ctrl+↑/↓/←/→`: Jump to the table edge; add `Shift` to extend the selection
+- `Ctrl+Home` / `Ctrl+End`: First data cell / last cell
+- `Shift+Space` / `Ctrl+Space` (`^Space` on macOS): Select the whole row / column
+- `Ctrl+G` / `F5`: Go to a cell (e.g. `B12`) or row number
+- `Ctrl+PgUp` / `Ctrl+PgDn`: Previous / next sheet
 - `Page Up` / `Page Down`: Previous/next page
 - `Home` / `End`: First/last row of the current page
 
@@ -358,18 +368,28 @@ python smart_table_quick_analysing_hub_qt.py -h
 - `Ctrl+S`: 保存文件（保存后切换到新文件）
 - `Ctrl+Shift+S`: 保存为副本（继续编辑原文件）
 
-**编辑操作**
-- `Ctrl+Z`: 撤销
-- `Ctrl+Y`: 重做
-- `Ctrl+C`: 复制
-- `Ctrl+V`: 粘贴
+**编辑操作**（macOS 上 Ctrl 即 Cmd）
+- `Ctrl+Z`: 撤销；`Ctrl+Y` / `Ctrl+Shift+Z`: 重做
+- `Ctrl+X` / `Ctrl+C` / `Ctrl+V`: 剪切 / 复制 / 粘贴
 - `Delete` / `Backspace`: 清空选中单元格
+- `Ctrl+D` / `Ctrl+R`: 用选区首行 / 首列向下 / 向右填充
+- `Ctrl+Enter`: 提交但不移动；选中多格时填满整个选区（公式按 Excel 规则平移）
+- `F4`（编辑公式时）: 循环切换光标处引用 `A1` → `$A$1` → `A$1` → `$A1`
+- `Alt+=`: 自动求和（上方连续数字，其次左侧）
+- `Ctrl+;` / `Ctrl+Shift+;`: 插入今天日期 / 当前时间
+- `Ctrl+Shift+=`: 插入与选区等高的行（整列选区时插入列）；`Ctrl+Shift+-`: 删除
+- `Ctrl+F` / `Ctrl+H`: 查找 / 替换
 - 选中单元格后直接打字即覆盖输入（与 Excel 一致），方向键提交并移动
 - `Enter`: 提交并下移（`Shift+Enter` 上移）；`Tab` 提交并右移，之后按 `Enter` 回到开始 Tab 的那一列
 - `F2` / 双击: 光标编辑模式（光标在末尾），`Esc` 取消
 
-**导航操作** ✨新
+**导航与选择**
 - `↑` / `↓`: 上下移动（到边界时自动翻页）
+- `Ctrl+↑/↓/←/→`: 跳到表格边缘；加 `Shift` 扩展选区
+- `Ctrl+Home` / `Ctrl+End`: 第一个数据格 / 最后一格
+- `Shift+Space` / `Ctrl+Space`（macOS 为 `^Space`）: 选中整行 / 整列
+- `Ctrl+G` / `F5`: 定位到单元格（如 `B12`）或行号
+- `Ctrl+PgUp` / `Ctrl+PgDn`: 上一个 / 下一个 Sheet
 - `Page Up` / `Page Down`: 上一页/下一页
 - `Home` / `End`: 当前页首行/末行
 

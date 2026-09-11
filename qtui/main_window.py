@@ -170,7 +170,15 @@ class _FastCellDelegate(QStyledItemDelegate):
             mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
             shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if mods & Qt.KeyboardModifier.ControlModifier:
+                    # Excel：Ctrl+Enter 提交且不移动；有多格选区时填满整个选区
+                    view.commit_and_fill(editor)
+                    return True
                 view.commit_and_move(editor, -1 if shift else 1, 0, enter=True)
+                return True
+            if key == Qt.Key.Key_F4 and editor.text().startswith("="):
+                # Excel：公式编辑中 F4 循环切换光标处引用的绝对/相对（A1→$A$1→A$1→$A1）
+                view.toggle_absolute_ref(editor)
                 return True
             if key == Qt.Key.Key_Tab:
                 view.commit_and_move(editor, 0, 1, tab=True)
@@ -333,6 +341,135 @@ class _ExcelTableView(QTableView):
         self.commitData(editor)
         self.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
         self.move_relative(dr, dc, enter=enter, tab=tab)
+
+    def commit_and_fill(self, editor):
+        """Ctrl+Enter：提交编辑器、留在原格；选区有多格时把输入填进每一格
+        （公式按相对位置平移，与 Excel 一致）。"""
+        text = editor.text()
+        cur = self.currentIndex()
+        self.commitData(editor)
+        self.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+        m = self.model()
+        sm = self.selectionModel()
+        if m is None or sm is None or not cur.isValid():
+            return
+        is_formula = text.startswith("=") and len(text) > 1
+        filled = 0
+        for idx in sm.selectedIndexes():
+            if idx == cur or idx.row() == 0:
+                continue
+            val = (m.shift_formula(text, idx.row() - cur.row(), idx.column() - cur.column())
+                   if is_formula else text)
+            if m.setData(idx, val):
+                filled += 1
+        sm.setCurrentIndex(cur, QItemSelectionModel.SelectionFlag.NoUpdate)
+        win = self.window()
+        if filled and hasattr(win, "update_statusbar"):
+            win.update_statusbar(tr("已填充 {} 个单元格").format(filled))
+
+    _REF_TOKEN = re.compile(r'\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?')
+
+    @staticmethod
+    def _cycle_absolute(ref):
+        """A1 -> $A$1 -> A$1 -> $A1 -> A1（区域按首端点的状态整体切换）。"""
+        parts = ref.split(":")
+        col_abs, row_abs = parts[0].startswith("$"), "$" in parts[0].lstrip("$")
+        nxt = {(False, False): (True, True), (True, True): (False, True),
+               (False, True): (True, False), (True, False): (False, False)}[(col_abs, row_abs)]
+        out = []
+        for part in parts:
+            m = re.match(r'\$?([A-Za-z]+)\$?(\d+)$', part)
+            out.append(("$" if nxt[0] else "") + m.group(1) + ("$" if nxt[1] else "") + m.group(2))
+        return ":".join(out)
+
+    def toggle_absolute_ref(self, editor):
+        """F4：切换光标所在（或紧邻）引用的绝对/相对形式。"""
+        text, pos = editor.text(), editor.cursorPosition()
+        for m in self._REF_TOKEN.finditer(text):
+            if m.start() <= pos <= m.end():
+                new = self._cycle_absolute(m.group())
+                editor.setText(text[:m.start()] + new + text[m.end():])
+                editor.setCursorPosition(m.start() + len(new))
+                editor._point_span = None   # 点选记录已失效
+                return True
+        return False
+
+    def clear_selected_cells(self):
+        """清空选中单元格内容（表头行跳过——清列名属重命名）。返回清空数。"""
+        sm = self.selectionModel()
+        model = self.model()
+        ranges = [r for r in sm.selection() if r.isValid()] if sm is not None else []
+        if not ranges or model is None:
+            return 0
+        nrows = len(model.df)
+        cells = set()
+        for rg in ranges:
+            for r in range(max(rg.top(), 1), min(rg.bottom(), nrows) + 1):
+                for c in range(rg.left(), rg.right() + 1):
+                    cells.add((r - 1, c))
+        return model.clear_cells(cells) if cells else 0
+
+    def _editing(self):
+        return self.state() == QAbstractItemView.State.EditingState
+
+    def select_whole_rows(self):
+        """Shift+Space：选区所在的整行（多行选区取包围盒）。"""
+        if self._editing():
+            return
+        rng = self._selection_range()
+        m = self.model()
+        if rng is None or m is None or m.columnCount() == 0:
+            return
+        sm = self.selectionModel()
+        sm.select(QItemSelection(m.index(rng[0], 0), m.index(rng[2], m.columnCount() - 1)),
+                  QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
+    def select_whole_columns(self):
+        """Ctrl+Space：选区所在的整列（含表头行）。"""
+        if self._editing():
+            return
+        rng = self._selection_range()
+        m = self.model()
+        if rng is None or m is None or m.rowCount() == 0:
+            return
+        sm = self.selectionModel()
+        sm.select(QItemSelection(m.index(0, rng[1]), m.index(m.rowCount() - 1, rng[3])),
+                  QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
+    def whole_columns_selected(self):
+        """选区是否覆盖整列（而非整表）：决定 Ctrl+Shift+= / - 作用于列还是行。"""
+        rng = self._selection_range()
+        m = self.model()
+        if rng is None or m is None:
+            return False
+        return (rng[0] == 0 and rng[2] == m.rowCount() - 1
+                and rng[3] - rng[1] + 1 < m.columnCount())
+
+    def fill_selection(self, down=True):
+        """Ctrl+D / Ctrl+R：用选区首行/首列填充整个选区；单行/单列选区则从
+        上方/左侧相邻格填入（Excel 语义）。"""
+        rng = self._selection_range()
+        if rng is None or self.model() is None or self._editing():
+            return
+        t, l, b, r = rng
+        if down:
+            if b == t:
+                if t <= 1:
+                    return      # 上方只有表头行
+                t -= 1
+            src, tgt = (t, l, t, r), (t, l, b, r)
+        else:
+            if r == l:
+                if l == 0:
+                    return
+                l -= 1
+            src, tgt = (t, l, b, l), (t, l, b, r)
+        self._fill_source, self._fill_target = src, tgt
+        try:
+            self._perform_fill()
+        finally:
+            self._fill_source = self._fill_target = None
+            self.viewport().update()
 
     def _formula_editor(self):
         """正在编辑且内容以 = 开头的单元格编辑器；否则 None。"""
@@ -527,9 +664,9 @@ class _ExcelTableView(QTableView):
                 self.edit(self.currentIndex())
                 event.accept()
                 return
-        # Cmd/Ctrl+方向键：跳到表格边缘；加 Shift 扩展选区到边缘
-        # （Excel 语义；macOS 上 Cmd 映射为 Qt 的 ControlModifier）
-        if (key in arrows
+        # Cmd/Ctrl+方向键：跳到表格边缘；Ctrl+Home/End：跳到首格/末格；
+        # 加 Shift 扩展选区（Excel 语义；macOS 上 Cmd 映射为 Qt 的 ControlModifier）
+        if (key in arrows + (Qt.Key.Key_Home, Qt.Key.Key_End)
                 and mods & Qt.KeyboardModifier.ControlModifier
                 and not mods & ~(Qt.KeyboardModifier.ControlModifier
                                  | Qt.KeyboardModifier.ShiftModifier)
@@ -544,8 +681,12 @@ class _ExcelTableView(QTableView):
                     row = min(1, m.rowCount() - 1)   # 首数据行（0 是表头）
                 elif key == Qt.Key.Key_Left:
                     col = 0
-                else:
+                elif key == Qt.Key.Key_Right:
                     col = m.columnCount() - 1
+                elif key == Qt.Key.Key_Home:
+                    row, col = min(1, m.rowCount() - 1), 0
+                else:   # End
+                    row, col = m.rowCount() - 1, m.columnCount() - 1
                 target = m.index(row, col)
                 sm = self.selectionModel()
                 if mods & Qt.KeyboardModifier.ShiftModifier and sm is not None:
@@ -567,17 +708,8 @@ class _ExcelTableView(QTableView):
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier
                 and self.state() != QAbstractItemView.State.EditingState):
             sm = self.selectionModel()
-            ranges = [r for r in sm.selection() if r.isValid()] if sm is not None else []
-            if ranges:
-                model = self.model()
-                nrows = len(model.df)
-                cells = set()
-                for rg in ranges:
-                    # 视图行 -> 数据行；跳过表头行 0
-                    for r in range(max(rg.top(), 1), min(rg.bottom(), nrows) + 1):
-                        for c in range(rg.left(), rg.right() + 1):
-                            cells.add((r - 1, c))
-                cleared = model.clear_cells(cells) if cells else 0
+            if sm is not None and sm.hasSelection():
+                cleared = self.clear_selected_cells()
                 win = self.window()
                 if cleared and hasattr(win, 'update_statusbar'):
                     win.update_statusbar(
@@ -844,6 +976,8 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, tr("新建Sheet..."), self.create_new_sheet)
         self._add_action(file_menu, tr("保存为新Sheet..."), self.save_as_new_sheet)
         self._add_action(file_menu, tr("删除Sheet..."), self.delete_sheets)
+        self._add_action(file_menu, tr("下一个Sheet"), lambda: self.switch_sheet_relative(1), "Ctrl+PgDown")
+        self._add_action(file_menu, tr("上一个Sheet"), lambda: self.switch_sheet_relative(-1), "Ctrl+PgUp")
         file_menu.addSeparator()
         self._add_action(file_menu, tr("导入CSV..."), self.import_csv)
         self._add_action(file_menu, tr("导出CSV..."), self.export_csv)
@@ -853,14 +987,30 @@ class MainWindow(QMainWindow):
         # 编辑
         edit_menu = menubar.addMenu(tr("编辑"))
         self._add_action(edit_menu, tr("撤销"), self.undo, "Ctrl+Z")
-        self._add_action(edit_menu, tr("重做"), self.redo, "Ctrl+Shift+Z")
+        self._add_action(edit_menu, tr("重做"), self.redo, ["Ctrl+Shift+Z", "Ctrl+Y"])
         edit_menu.addSeparator()
+        self._add_action(edit_menu, tr("剪切"), self.cut_selection, "Ctrl+X")
         self._add_action(edit_menu, tr("复制"), self.copy_selection, "Ctrl+C")
         self._add_action(edit_menu, tr("粘贴"), self.paste_selection, "Ctrl+V")
+        self._add_action(edit_menu, tr("清除内容"), self.clear_selected_cells)
         self._add_action(edit_menu, tr("删除选中行"), self.delete_selected_rows)
         edit_menu.addSeparator()
+        self._add_action(edit_menu, tr("向下填充"), lambda: self.table.fill_selection(True), "Ctrl+D")
+        self._add_action(edit_menu, tr("向右填充"), lambda: self.table.fill_selection(False), "Ctrl+R")
+        self._add_action(edit_menu, tr("自动求和"), self.auto_sum, "Alt+=")
+        self._add_action(edit_menu, tr("插入日期"), lambda: self.insert_datetime(False), "Ctrl+;")
+        self._add_action(edit_menu, tr("插入时间"), lambda: self.insert_datetime(True),
+                         ["Ctrl+Shift+;", "Ctrl+:"])
+        edit_menu.addSeparator()
         self._add_action(edit_menu, tr("全选"), self.select_all, "Ctrl+A")
+        self._add_action(edit_menu, tr("选择整行"), self.table.select_whole_rows, "Shift+Space")
+        # macOS 上 Cmd+Space 被 Spotlight 占用，Meta+Space（即 ^Space）与 Excel for Mac 一致
+        self._add_action(edit_menu, tr("选择整列"), self.table.select_whole_columns,
+                         ["Ctrl+Space", "Meta+Space"])
+        self._add_action(edit_menu, tr("定位..."), self.goto_cell_dialog, ["Ctrl+G", "F5"])
+        edit_menu.addSeparator()
         self._add_action(edit_menu, tr("查找替换..."), self.open_find_dialog, "Ctrl+F")
+        self._add_action(edit_menu, tr("替换..."), lambda: self.open_find_dialog(replace=True), "Ctrl+H")
 
         # 视图
         view_menu = menubar.addMenu(tr("视图"))
@@ -902,6 +1052,12 @@ class MainWindow(QMainWindow):
         self._add_action(data_menu, tr("插入列"), self.insert_column)
         self._add_action(data_menu, tr("删除行"), self.delete_selected_rows)
         self._add_action(data_menu, tr("删除列"), self.delete_selected_columns)
+        data_menu.addSeparator()
+        # Excel：Ctrl+Shift+= 插入、Ctrl+Shift+- 删除，按选区是整列还是整行决定对象
+        self._add_action(data_menu, tr("按选区插入行/列"), self.insert_by_selection,
+                         ["Ctrl+Shift+=", "Ctrl++"])
+        self._add_action(data_menu, tr("按选区删除行/列"), self.delete_by_selection,
+                         ["Ctrl+Shift+-", "Ctrl+_"])
 
         # 统计
         stats_menu = menubar.addMenu(tr("统计"))
@@ -970,7 +1126,8 @@ class MainWindow(QMainWindow):
     def _add_action(self, menu, text, slot, shortcut=None):
         action = QAction(text, self)
         if shortcut:
-            action.setShortcut(QKeySequence(shortcut))
+            keys = [shortcut] if isinstance(shortcut, str) else list(shortcut)
+            action.setShortcuts([QKeySequence(k) for k in keys])
         # triggered(bool) 会把 checked 透传给带可选参数的槽
         # （insert_row(position=False) 崩溃、new_file(confirm=False) 跳过保存确认），
         # 统一丢弃信号参数
@@ -1870,6 +2027,132 @@ class MainWindow(QMainWindow):
             return
         self.table.selectAll()
 
+    def cut_selection(self):
+        """Ctrl+X：复制到剪贴板后清空选区（Excel 的延迟移动简化为复制+清空）。"""
+        if self._text_editor_focused():
+            w = QApplication.focusWidget()
+            if hasattr(w, "cut"):
+                w.cut()
+            return
+        self.copy_selection()
+        cleared = self.table.clear_selected_cells()
+        if cleared:
+            self._mark_modified()
+            self.update_statusbar(tr("已剪切 {} 个单元格").format(cleared))
+
+    def clear_selected_cells(self):
+        cleared = self.table.clear_selected_cells()
+        if cleared:
+            self._mark_modified()
+            self.update_statusbar(tr("已清除 {} 个单元格").format(cleared))
+
+    def insert_datetime(self, with_time):
+        """Ctrl+; 插入今天日期，Ctrl+Shift+; 插入当前时间；编辑中则插到光标处。"""
+        import datetime as _dt
+        now = _dt.datetime.now()
+        text = now.strftime("%H:%M") if with_time else now.strftime("%Y-%m-%d")
+        if self._text_editor_focused():
+            QApplication.focusWidget().insert(text)
+            return
+        idx = self.table.currentIndex()
+        if idx.isValid() and idx.row() > 0:
+            self.model.setData(idx, text)
+            self._mark_modified()
+
+    def auto_sum(self):
+        """Alt+=：在当前格写入对上方（其次左侧）连续数字区域的 SUM 公式。"""
+        idx = self.table.currentIndex()
+        if not idx.isValid() or idx.row() == 0 or self._text_editor_focused():
+            return
+        df = self.model.df
+        row, col = idx.row() - HEADER_ROWS, idx.column()
+
+        def is_num(v):
+            return isinstance(v, (int, float, np.integer, np.floating)) and not (
+                isinstance(v, (float, np.floating)) and np.isnan(v)) and not isinstance(v, bool)
+
+        def run(cells):
+            """从近到远的连续数字格数。"""
+            n = 0
+            for v in cells:
+                if not is_num(v):
+                    break
+                n += 1
+            return n
+
+        letter = FormulaEngine.col_index_to_letter
+        up = run(df.iat[r, col] for r in range(row - 1, -1, -1))
+        if up:
+            # 数据行 r 对应 Excel 行 r+2（第 1 行是表头）
+            formula = "=SUM({0}{1}:{0}{2})".format(letter(col), row - up + 2, row + 1)
+        else:
+            left = run(df.iat[row, c] for c in range(col - 1, -1, -1))
+            if not left:
+                self.update_statusbar(tr("上方/左侧没有可求和的数字"))
+                return
+            formula = "=SUM({0}{2}:{1}{2})".format(letter(col - left), letter(col - 1), row + 2)
+        self.model.setData(idx, formula)
+        self._mark_modified()
+        self.update_statusbar(formula)
+
+    def goto_cell_dialog(self):
+        """Ctrl+G / F5：跳到指定单元格（如 B12）或行号。"""
+        text, ok = QInputDialog.getText(self, tr("定位"), tr("单元格引用（如 B12）或行号:"))
+        if not ok or not text.strip():
+            return
+        ref = text.strip().replace("$", "").upper()
+        m = re.match(r"^([A-Z]{1,3})?(\d+)$", ref)
+        if not m:
+            self.update_statusbar(tr("无效的单元格引用: {}").format(text.strip()))
+            return
+        col = FormulaEngine.col_letter_to_index(m.group(1)) if m.group(1) else \
+            max(self.table.currentIndex().column(), 0)
+        excel_row = int(m.group(2))
+        ncols, nrows = self.model.columnCount(), self.model.rowCount()
+        if ncols == 0 or nrows == 0 or excel_row < 1:
+            return
+        # Excel 第 1 行是表头（视图行 0），第 n 行是视图行 n-1
+        index = self.model.index(min(excel_row - 1, nrows - 1), min(col, ncols - 1))
+        self.table.setCurrentIndex(index)
+        self.table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self.table.setFocus()
+
+    def switch_sheet_relative(self, delta):
+        """Ctrl+PgDown / PgUp：切到下一个/上一个 Sheet（循环）。"""
+        names = self.sheet_names
+        if len(names) < 2 or self.current_sheet not in names:
+            return
+        target = names[(names.index(self.current_sheet) + delta) % len(names)]
+        self.sheet_combo.setCurrentText(target)
+
+    def insert_by_selection(self):
+        """Ctrl+Shift+=：整列选区插入同样多的列，否则插入同样多的行（Excel 语义）。"""
+        rng = self.table._selection_range()
+        if rng is None or self._text_editor_focused():
+            return
+        t, l, b, r = rng
+        if self.table.whole_columns_selected():
+            for i in range(r - l + 1):
+                self._insert_col_at(l)
+            self.update_statusbar(tr("已插入 {} 列").format(r - l + 1))
+        else:
+            top = max(t, 1) - HEADER_ROWS
+            count = b - max(t, 1) + 1
+            if count <= 0:
+                return
+            for i in range(count):
+                self.insert_row(top)
+            self.update_statusbar(tr("已插入 {} 行").format(count))
+
+    def delete_by_selection(self):
+        """Ctrl+Shift+-：整列选区删列，否则删行（都会先确认）。"""
+        if self._text_editor_focused():
+            return
+        if self.table.whole_columns_selected():
+            self.delete_selected_columns()
+        else:
+            self.delete_selected_rows()
+
     # ---------- 行列操作 ----------
 
     def _after_structure_change(self):
@@ -2657,12 +2940,12 @@ class MainWindow(QMainWindow):
 
     # ================= 查找 / 跳转 =================
 
-    def open_find_dialog(self):
+    def open_find_dialog(self, replace=False):
         if self._find_dialog is None:
             self._find_dialog = FindReplaceDialog(self)
         self._find_dialog.show()
         self._find_dialog.raise_()
-        self._find_dialog.find_edit.setFocus()
+        (self._find_dialog.replace_edit if replace else self._find_dialog.find_edit).setFocus()
 
     def jump_to_cell(self, row, col):
         """跳转到数据行 row（0 基）；视图中偏移一行表头。"""
@@ -2925,6 +3208,7 @@ class MainWindow(QMainWindow):
             menu.addAction(tr("在末尾新增一行"),
                            lambda: self.insert_row(len(self.model.df)))
             menu.addSeparator()
+        menu.addAction(tr("剪切"), self.cut_selection)
         menu.addAction(tr("复制"), lambda: self.copy_selection())
         menu.addAction(tr("不带列名复制"), lambda: self.copy_selection(with_headers=False))
         menu.addAction(tr("复制后转置"), self.copy_selection_transposed)
