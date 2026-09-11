@@ -779,3 +779,86 @@ class TestSingleRowRangeRemap:
         e = FormulaEngine()
         assert not e.formula_has_partial_ranges('=SUM(A2:C2)', 10)
         assert e.formula_has_partial_ranges('=SUM(A2:A3)', 10)
+
+
+@pytest.fixture
+def orders():
+    df = pd.DataFrame({
+        'Region': ['x', 'y', 'x', 'y'],
+        'Qty': [1, 2, 3, 4],
+        'Price': [10, 0, 20, 5],
+    })
+    return FormulaEngine(df)
+
+
+class TestIfError:
+    """IFERROR 必须惰性求值：第一个实参抛错或算出错误值时才用兜底值"""
+
+    def test_division_by_zero_falls_back(self, orders):
+        assert orders.evaluate('=IFERROR(B2/C3, "n/a")') == 'n/a'
+
+    def test_no_error_returns_value(self, orders):
+        assert orders.evaluate('=IFERROR(B2/C2, "n/a")') == 0.1
+
+    def test_lookup_miss_falls_back(self, orders):
+        assert orders.evaluate(
+            '=IFERROR(VLOOKUP("zz", A2:B5, 2, FALSE), "none")') == 'none'
+
+    def test_deleted_reference_falls_back(self, orders):
+        assert orders.evaluate('=IFERROR(#REF!, 0)') == 0
+        assert orders.evaluate('=IFERROR(SUM(#REF!), -1)') == -1
+
+    def test_plain_ref_error_still_surfaces(self, orders):
+        assert orders.evaluate('=SUM(#REF!)') == '#REF!'
+        assert orders.evaluate('=A2+#REF!') == '#REF!'
+
+    def test_error_value_from_cell(self):
+        df = pd.DataFrame({'A': ['#DIV/0!', 1]})
+        assert FormulaEngine(df).evaluate('=IFERROR(A2, "bad")') == 'bad'
+        assert FormulaEngine(df).evaluate('=IFERROR(A3, "bad")') == 1
+
+    def test_fallback_is_lazy(self, orders):
+        # 无错时兜底分支不应求值（否则 1/0 会炸）
+        assert orders.evaluate('=IFERROR(B2, 1/0)') == 1
+
+    def test_nested_with_if_and_case_insensitive(self, orders):
+        assert orders.evaluate('=iferror(SUM(B2:B5), 0) + IF(B2>0, 1, 2)') == 11
+
+    def test_unknown_function_is_not_swallowed(self, orders):
+        # 函数名拼错是要暴露给用户的问题，不算可兜底的运行时错误
+        assert orders.evaluate('=IFERROR(FOO(1), 0)') == '#NAME?'
+
+    def test_lambda_names_still_whitelisted(self, orders):
+        # IFERROR 实参会被包成 lambda，白名单检查必须深入嵌套代码对象
+        assert orders.evaluate('=IFERROR(__import__("os"), 0)') == '#NAME?'
+
+
+class TestMultiCriteriaAggregates:
+    def test_sumifs_single_criterion(self, orders):
+        assert orders.evaluate('=SUMIFS(B2:B5, A2:A5, "x")') == 4
+
+    def test_sumifs_two_criteria(self, orders):
+        assert orders.evaluate('=SUMIFS(B2:B5, A2:A5, "x", C2:C5, ">15")') == 3
+
+    def test_countifs(self, orders):
+        assert orders.evaluate('=COUNTIFS(A2:A5, "y", C2:C5, ">0")') == 1
+        assert orders.evaluate('=COUNTIFS(A2:A5, "?", B2:B5, ">=2")') == 3
+
+    def test_averageifs(self, orders):
+        assert orders.evaluate('=AVERAGEIFS(C2:C5, A2:A5, "x")') == 15
+
+    def test_averageifs_no_match_is_div0(self, orders):
+        assert orders.evaluate('=AVERAGEIFS(C2:C5, A2:A5, "zz")') == '#DIV/0!'
+
+    def test_mismatched_range_sizes_is_value_error(self, orders):
+        assert orders.evaluate('=SUMIFS(B2:B5, A2:A4, "x")') == '#VALUE!'
+        assert orders.evaluate('=COUNTIFS(A2:A5, "x", C2:C3, ">0")') == '#VALUE!'
+
+    def test_missing_criteria_is_value_error(self, orders):
+        assert orders.evaluate('=SUMIFS(B2:B5, A2:A5)') == '#VALUE!'
+
+    def test_wildcard_and_blank(self):
+        df = pd.DataFrame({'A': ['ab', None, 'ac'], 'B': [1, 2, 3]})
+        eng = FormulaEngine(df)
+        assert eng.evaluate('=SUMIFS(B2:B4, A2:A4, "a*")') == 4
+        assert eng.evaluate('=COUNTIFS(A2:A4, "")') == 1

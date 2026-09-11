@@ -3,6 +3,7 @@
 解耦版本：通过参数传入DataFrame而不是依赖GUI对象
 """
 import ast
+import types
 import datetime
 import fnmatch
 import math
@@ -74,6 +75,38 @@ class _IfCallLowering(ast.NodeTransformer):
                       else ast.Constant(value=False))
             return ast.IfExp(test=node.args[0], body=node.args[1], orelse=orelse)
         return node
+
+
+class _IfErrorCallLowering(ast.NodeTransformer):
+    """把 _iferror(value, fallback) 的两个实参包成无参 lambda，实现惰性求值。
+
+    =IFERROR(A1/B1, 0) 的价值就在于 A1/B1 抛错时不炸——若按普通函数
+    先求实参，异常在进入 _iferror 之前就冒出来了。
+    """
+
+    @staticmethod
+    def _thunk(node):
+        return ast.Lambda(
+            args=ast.arguments(posonlyargs=[], args=[], vararg=None,
+                               kwonlyargs=[], kw_defaults=[], kwarg=None,
+                               defaults=[]),
+            body=node)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if (isinstance(node.func, ast.Name) and node.func.id == '_iferror'
+                and not node.keywords and len(node.args) == 2):
+            node.args = [self._thunk(a) for a in node.args]
+        return node
+
+
+def _iter_code_names(code):
+    """递归收集代码对象及其嵌套函数（lambda）引用的全部名字。"""
+    for name in code.co_names:
+        yield name
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            yield from _iter_code_names(const)
 
 
 class FormulaNameError(ValueError):
@@ -348,9 +381,9 @@ class FormulaEngine:
                 lambda m: stash(repr(self._decode_string_literal(m.group()))),
                 expr)
 
-            # 引用越界（如复制平移出表格）直接报 #REF!
-            if '#REF!' in expr:
-                return "#REF!"
+            # 引用越界（如复制平移出表格）：换成求值时抛 #REF! 的调用，
+            # 不直接返回——IFERROR(#REF!, 0) 要能兜住
+            expr = expr.replace('#REF!', '_referr()')
 
             # Excel 风格比较符转 Python 风格：= -> ==, <> -> !=
             expr = self._normalize_operators(expr)
@@ -437,9 +470,11 @@ class FormulaEngine:
     # Excel 函数名 -> 求值环境中的实现名（长名在前，避免 CONCAT 抢先匹配 CONCATENATE）
     FUNC_MAP = {
         'CONCATENATE': '_concat', 'CONCAT': '_concat',
-        'AVERAGEIF': '_averageif', 'AVERAGE': '_avg',
-        'COUNTIF': '_countif', 'COUNTA': '_counta', 'COUNT': '_count',
-        'SUMIF': '_sumif', 'SUM': '_sum',
+        'AVERAGEIFS': '_averageifs', 'AVERAGEIF': '_averageif', 'AVERAGE': '_avg',
+        'COUNTIFS': '_countifs', 'COUNTIF': '_countif',
+        'COUNTA': '_counta', 'COUNT': '_count',
+        'SUMIFS': '_sumifs', 'SUMIF': '_sumif', 'SUM': '_sum',
+        'IFERROR': '_iferror',
         'LEFT': '_left', 'RIGHT': '_right', 'MID': '_mid',
         'LEN': '_len', 'UPPER': '_upper', 'LOWER': '_lower', 'TRIM': '_trim',
         'MAX': '_max', 'MIN': '_min',
@@ -860,6 +895,59 @@ class FormulaEngine:
                 raise ZeroDivisionError("AVERAGEIF: no matching values")
             return sum(matched) / len(matched)
 
+        def _multi_criteria_mask(pairs):
+            """SUMIFS/COUNTIFS 的 (区域, 条件) 对 -> 逐位置的布尔掩码。
+
+            各条件区域大小必须一致（与 Excel 一致，否则 #VALUE!）。
+            """
+            if not pairs or len(pairs) % 2:
+                raise TypeError("criteria ranges and criteria must come in pairs")
+            mask = None
+            for i in range(0, len(pairs), 2):
+                values = _flatten_keep_blank([pairs[i]])
+                pred = self._criteria_predicate(pairs[i + 1])
+                hits = [pred(v) for v in values]
+                if mask is None:
+                    mask = hits
+                elif len(hits) != len(mask):
+                    raise TypeError("SUMIFS/COUNTIFS ranges must be the same size")
+                else:
+                    mask = [a and b for a, b in zip(mask, hits)]
+            return mask
+
+        def _countifs(*pairs):
+            return sum(1 for hit in _multi_criteria_mask(pairs) if hit)
+
+        def _sumifs(sum_rng, *pairs):
+            values = _flatten_keep_blank([sum_rng])
+            mask = _multi_criteria_mask(pairs)
+            if len(values) != len(mask):
+                raise TypeError("SUMIFS ranges must be the same size")
+            return sum(v for v, hit in zip(values, mask) if hit and _is_num(v))
+
+        def _averageifs(avg_rng, *pairs):
+            values = _flatten_keep_blank([avg_rng])
+            mask = _multi_criteria_mask(pairs)
+            if len(values) != len(mask):
+                raise TypeError("AVERAGEIFS ranges must be the same size")
+            matched = [v for v, hit in zip(values, mask) if hit and _is_num(v)]
+            if not matched:
+                raise ZeroDivisionError("AVERAGEIFS: no matching values")
+            return sum(matched) / len(matched)
+
+        def _iferror(value_thunk, fallback_thunk):
+            """实参已被 AST 改写为 lambda：先算 value，抛错或算出错误值才算 fallback。"""
+            try:
+                value = value_thunk()
+            except Exception:
+                return fallback_thunk()
+            if FormulaEngine.is_error(value):
+                return fallback_thunk()
+            return value
+
+        def _referr():
+            raise FormulaRefError("reference deleted or out of range")
+
         # ---------- 查找函数 ----------
 
         def _as_grid(a):
@@ -1110,6 +1198,8 @@ class FormulaEngine:
             '_avg': _avg, '_concat': _concat, '_count': _count,
             '_counta': _counta, '_countif': _countif,
             '_sumif': _sumif, '_averageif': _averageif,
+            '_sumifs': _sumifs, '_countifs': _countifs, '_averageifs': _averageifs,
+            '_iferror': _iferror, '_referr': _referr,
             '_and': _and, '_or': _or, '_not': _not,
             '_vlookup': _vlookup, '_xlookup': _xlookup,
             '_index': _index, '_match': _match,
@@ -1130,13 +1220,17 @@ class FormulaEngine:
         if extra_names:
             allowed_names.update(extra_names)
 
-        # 经 AST 把 _if 调用降为条件表达式，保证分支惰性求值
-        tree = _IfCallLowering().visit(ast.parse(expr, mode='eval'))
+        # 经 AST 把 _if 调用降为条件表达式、_iferror 实参包成 lambda，
+        # 保证分支惰性求值
+        tree = ast.parse(expr, mode='eval')
+        tree = _IfErrorCallLowering().visit(_IfCallLowering().visit(tree))
         ast.fix_missing_locations(tree)
         code = compile(tree, '<formula>', 'eval')
 
-        for name in code.co_names:
+        # 名字检查要深入 lambda（IFERROR 实参）的嵌套代码对象
+        for name in _iter_code_names(code):
             if name not in allowed_names:
                 raise FormulaNameError(tr("不支持的函数: {}").format(name))
 
-        return eval(code, {"__builtins__": {}}, allowed_names)
+        # lambda 体内的自由名字只从 globals 解析，所以白名单放进 globals
+        return eval(code, dict(allowed_names, __builtins__={}))
