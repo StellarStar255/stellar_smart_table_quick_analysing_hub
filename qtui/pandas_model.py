@@ -116,6 +116,9 @@ class PandasTableModel(QAbstractTableModel):
         # 正向索引：公式单元格 -> 它依赖的键集合。注销依赖只按此索引
         # 精确清除，避免线性扫描 _dependents（大量公式时是 O(N²) 热点）
         self._formula_deps = {}
+        # 区域依赖只记边界：公式单元格 -> [(r0, r1, c0, c1), ...]。整列引用
+        # 展开成几十万个键是清除筛选/打开文件时的主要卡顿来源
+        self._formula_ranges = {}
         self._engine = FormulaEngine()
         # 行列结构版本号：任何插入/删除/重排/整表替换都会递增，
         # 供公式剪贴板等按位置缓存的状态判断是否已失效
@@ -368,9 +371,9 @@ class PandasTableModel(QAbstractTableModel):
         for col, rows, *_ in entries:
             keys.update((int(r), col) for r in rows)
         self._emit_cells_changed(keys)
-        # 只重算真正被公式引用的单元格
-        for key in keys & self._dependents.keys():
-            self._recalc_dependents(key)
+        # 所有受影响的公式合并成一个闭包按依赖序算一遍，
+        # 而不是每个被清的格各触发一轮（整列公式会被重算上千次）
+        self._recalc_cells(self._closure_of(keys))
         self.modified = True
 
     def _emit_cells_changed(self, keys):
@@ -410,11 +413,13 @@ class PandasTableModel(QAbstractTableModel):
         if not formula:
             return
         self._engine.set_dataframe(self._df)
-        keys = self._engine.extract_dependencies(formula)
+        keys, ranges = self._engine.extract_dependency_spec(formula)
         for key in keys:
             self._dependents.setdefault(key, set()).add(formula_cell)
         if keys:
             self._formula_deps[formula_cell] = keys
+        if ranges:
+            self._formula_ranges[formula_cell] = ranges
 
     def _unregister_deps(self, formula_cell):
         for key in self._formula_deps.pop(formula_cell, ()):
@@ -423,24 +428,43 @@ class PandasTableModel(QAbstractTableModel):
                 deps.discard(formula_cell)
                 if not deps:
                     del self._dependents[key]
+        self._formula_ranges.pop(formula_cell, None)
 
     def _rebuild_all_deps(self):
         self._dependents.clear()
         self._formula_deps.clear()
+        self._formula_ranges.clear()
         for key in list(self.formulas):
             self._register_deps(key)
 
-    def _dependent_closure(self, changed_cell):
-        """依赖 changed_cell 的全部公式单元格（传递闭包，迭代 BFS）。"""
+    @staticmethod
+    def _in_ranges(cell, ranges):
+        r, c = cell
+        return any(r0 <= r <= r1 and c0 <= c <= c1 for r0, r1, c0, c1 in ranges)
+
+    def _dependents_of(self, cell):
+        """直接依赖 cell 的公式单元格：单格登记的 + 区域包含它的。"""
+        out = set(self._dependents.get(cell, ()))
+        if self._formula_ranges:
+            for fcell, ranges in self._formula_ranges.items():
+                if self._in_ranges(cell, ranges):
+                    out.add(fcell)
+        return out
+
+    def _closure_of(self, seeds):
+        """依赖任一 seed 的全部公式单元格（传递闭包，迭代 BFS）。"""
         closure = set()
-        queue = deque([changed_cell])
+        queue = deque(seeds)
         while queue:
             cell = queue.popleft()
-            for fcell in self._dependents.get(cell, ()):
+            for fcell in self._dependents_of(cell):
                 if fcell not in closure and fcell in self.formulas:
                     closure.add(fcell)
                     queue.append(fcell)
         return closure
+
+    def _dependent_closure(self, changed_cell):
+        return self._closure_of([changed_cell])
 
     def _evaluation_order(self, cells):
         """对公式单元格集合做拓扑排序（被依赖者在前）。返回 (有序列表, 环上单元格集合)。
@@ -452,13 +476,19 @@ class PandasTableModel(QAbstractTableModel):
         cells = set(cells)
         indeg = {}
         for cell in cells:
-            indeg[cell] = sum(1 for dep in self._formula_deps.get(cell, ()) if dep in cells)
+            # 去重：同一依赖既被单格引用又落在区域里只算一条边，
+            # 与下方按 _dependents_of（集合）递减的口径一致
+            deps = {dep for dep in self._formula_deps.get(cell, ()) if dep in cells}
+            ranges = self._formula_ranges.get(cell)
+            if ranges:
+                deps.update(other for other in cells if self._in_ranges(other, ranges))
+            indeg[cell] = len(deps)
         queue = deque(sorted(c for c in cells if indeg[c] == 0))
         order = []
         while queue:
             cell = queue.popleft()
             order.append(cell)
-            for fcell in self._dependents.get(cell, ()):
+            for fcell in self._dependents_of(cell):
                 if fcell in cells:
                     indeg[fcell] -= 1
                     if indeg[fcell] == 0:
@@ -475,7 +505,9 @@ class PandasTableModel(QAbstractTableModel):
         迭代实现：千行以上的连锁公式（=A2+1 填充到底）递归会栈溢出。
         环上的公式写入 #CIRC!。
         """
-        closure = self._dependent_closure(changed_cell)
+        self._recalc_cells(self._dependent_closure(changed_cell))
+
+    def _recalc_cells(self, closure):
         if not closure:
             return
         order, cyclic = self._evaluation_order(closure)
@@ -521,6 +553,7 @@ class PandasTableModel(QAbstractTableModel):
         self.formulas.clear()
         self._dependents.clear()
         self._formula_deps.clear()
+        self._formula_ranges.clear()
 
     def _coerce(self, value, col):
         """尽量保持列的数值类型；无法转换时整列转为 object。"""
@@ -681,6 +714,7 @@ class PandasTableModel(QAbstractTableModel):
         self.formulas = dict(formulas) if formulas else {}
         self._dependents.clear()
         self._formula_deps.clear()
+        self._formula_ranges.clear()
         if self.formulas:
             # 纯公式行读回来是空行会被 pandas 裁掉，把表格补齐到公式覆盖的范围
             need_rows = max(r for r, _ in self.formulas) + 1 - len(self._df)
