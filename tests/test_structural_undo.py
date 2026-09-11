@@ -181,3 +181,28 @@ class TestHistory:
         m.undo()
         m.redo()
         assert m.structure_version == v0 + 3
+
+
+class TestReorderSkipsRecalc:
+    """行重排后公式值不变（引用随行移动），不能逐个重算——整列填充公式的表要好几秒。"""
+
+    def test_sort_does_not_reevaluate_but_values_stay_right(self, monkeypatch):
+        m = PandasTableModel(pd.DataFrame({'X': [30, 10, 20], 'Y': [0.0, 0.0, 0.0]}))
+        m.setData(m.index(1, 1), '=A2*2')      # 同行引用
+        m.setData(m.index(2, 1), '=A4+1')      # 跨行引用（指向 X=20 那行）
+        m.setData(m.index(3, 1), '=SUM(A2:A4)')  # 整列区域，成员不变
+        calls = []
+        real = m._evaluate
+        monkeypatch.setattr(m, '_evaluate', lambda f: calls.append(f) or real(f))
+        m.sort(0, Qt.SortOrder.AscendingOrder)
+        assert calls == []                      # 排序不重算
+        assert m.df['X'].tolist() == [10, 20, 30]
+        assert m.formulas == {(2, 1): '=A4*2', (0, 1): '=A3+1', (1, 1): '=SUM(A2:A4)'}
+        assert m.df['Y'].tolist() == [21, 60, 60]
+        m.setData(m.index(3, 0), '5')           # 依赖索引已重建：改 X 触发正确重算
+        assert m.df['Y'].tolist() == [21, 35, 10]
+        m.undo()                                # 撤销单元格编辑（会重算依赖，属正常）
+        calls.clear()
+        m.undo()                                # 撤销重排
+        assert calls == []                      # 撤销重排同样不重算
+        assert m.df['X'].tolist() == [30, 10, 20] and m.df['Y'].tolist() == [60, 21, 60]
