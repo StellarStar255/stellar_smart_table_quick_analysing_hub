@@ -52,52 +52,66 @@ class TestValueCounts:
 
 
 class TestHeaderArrow:
+    """箭头住在第 1 行（列名行）单元格右侧，由表格视图绘制与响应。"""
+
     def test_arrow_click_emits_filter_signal(self, win):
-        header = win.table.horizontalHeader()
-        assert isinstance(header, FilterHeaderView)
+        assert isinstance(win.table.horizontalHeader(), FilterHeaderView)
         got = []
-        header.filterClicked.disconnect()      # 别真弹出筛选层
-        header.filterClicked.connect(got.append)
-        rect = header.arrow_rect_at(1)
+        win.table.filterArrowClicked.disconnect()      # 别真弹出筛选层
+        win.table.filterArrowClicked.connect(got.append)
+        rect = win.table.filter_arrow_rect(1)
+        assert rect is not None
+        cell = win.table.visualRect(win.model.index(0, 1))
+        assert cell.contains(rect)                     # 箭头在列名格内、贴右侧
+        assert rect.right() >= cell.right() - 4
         ev = QMouseEvent(QEvent.Type.MouseButtonPress,
                          QPointF(rect.center()), QPointF(rect.center()),
                          Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier)
-        header.mousePressEvent(ev)
+        win.table.mousePressEvent(ev)
         assert got == [1]
+        assert win.table.currentIndex().column() != 1 or not win.table.currentIndex().isValid()
 
     def test_click_away_from_arrow_does_not_open_filter(self, win):
-        header = win.table.horizontalHeader()
         got = []
-        header.filterClicked.disconnect()
-        header.filterClicked.connect(got.append)
-        pos = QPointF(header.sectionViewportPosition(1) + 4, header.height() / 2)
+        win.table.filterArrowClicked.disconnect()
+        win.table.filterArrowClicked.connect(got.append)
+        cell = win.table.visualRect(win.model.index(0, 1))
+        pos = QPointF(cell.left() + 4, cell.center().y())
         ev = QMouseEvent(QEvent.Type.MouseButtonPress, pos, pos,
                          Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier)
-        header.mousePressEvent(ev)
+        win.table.mousePressEvent(ev)
         assert got == []
+        # 数据行同一横向位置也不是箭头
+        data_cell = win.table.visualRect(win.model.index(2, 1))
+        assert win.table._arrow_hit(QPoint(data_cell.right() - 6, data_cell.center().y())) == -1
 
     def test_real_click_on_arrow_opens_the_popup(self, win, monkeypatch):
-        """走真实鼠标事件（表头视口 -> QHeaderView.mousePressEvent）的整条路。"""
+        """走真实鼠标事件（表格视口 -> mousePressEvent）的整条路。"""
         opened = []
         monkeypatch.setattr(ColumnFilterPopup, "popup_at",
                             lambda self, pos: opened.append(pos) or 0)
-        header = win.table.horizontalHeader()
-        QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton,
+        QTest.mouseClick(win.table.viewport(), Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier,
-                         header.arrow_rect_at(1).center())
+                         win.table.filter_arrow_rect(1).center())
         assert len(opened) == 1
 
-    def test_popup_anchors_under_the_column_header(self, win, monkeypatch):
+    def test_popup_anchors_under_the_header_cell(self, win, monkeypatch):
         got = []
         monkeypatch.setattr(ColumnFilterPopup, "popup_at",
                             lambda self, pos: got.append(pos) or 0)
         win.open_column_filter(1)
-        header = win.table.horizontalHeader()
-        expect = header.viewport().mapToGlobal(
-            QPoint(header.sectionViewportPosition(1), header.height()))
+        cell = win.table.visualRect(win.model.index(0, 1))
+        expect = win.table.viewport().mapToGlobal(QPoint(cell.left(), cell.bottom() + 1))
         assert (got[0].x(), got[0].y()) == (expect.x(), expect.y())
+
+    def test_filtered_column_is_marked(self, win):
+        win.active_filters = [{"col": "数量", "condition": "值在列表中", "value": ["10"]}]
+        win._reapply_filters()
+        assert win.table.horizontalHeader().filtered_columns == {1}
+        win.clear_all_filters()
+        assert win.table.horizontalHeader().filtered_columns == set()
 
     def test_column_menu_uses_the_same_popup(self, win, monkeypatch):
         opened = []

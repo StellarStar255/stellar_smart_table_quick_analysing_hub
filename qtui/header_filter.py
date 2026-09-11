@@ -2,13 +2,13 @@
 """
 Excel 式列筛选：列头下拉箭头 + 值勾选弹层。
 
-FilterHeaderView   在每个列头右侧画一个下拉箭头（该列已筛选时画成实心漏斗），
-                   点箭头发 filterClicked(列号)；点列头其它位置行为不变。
+FilterHeaderView   字母表头，记录哪些列已筛选；箭头画在第 1 行（列名行）
+                   单元格右侧（已筛选画成实心漏斗），由表格视图绘制/响应点击。
 ColumnFilterPopup  无边框弹层：升序/降序、搜索、带计数的值勾选列表、
                    全选/反选、清除筛选。结果放在 result / sort_ascending。
 """
 
-from PyQt6.QtCore import Qt, QEvent, QEventLoop, QRect, QPoint, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QEventLoop, QRect, QPoint
 from PyQt6.QtGui import QColor, QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
@@ -24,92 +24,69 @@ MAX_VALUES = 2000       # 弹层里最多列出的去重值个数
 BLANK_LABEL = "(空白)"   # 空值在列表里的显示名，内部值是空串
 
 
-class FilterHeaderView(QHeaderView):
-    """列头带筛选箭头的横向表头。"""
+def arrow_rect_in(rect):
+    """单元格矩形右侧的箭头点击区。"""
+    box = min(ARROW_BOX, rect.height() - 2)
+    return QRect(rect.right() - box - 2,
+                 rect.top() + (rect.height() - box) // 2, box, box)
 
-    filterClicked = pyqtSignal(int)
+
+def _triangle(box):
+    cx = box.center().x()
+    cy = box.center().y()
+    half = max(3, box.width() // 4)
+    return QPolygon([QPoint(cx - half, cy - half // 2),
+                     QPoint(cx + half, cy - half // 2),
+                     QPoint(cx, cy + half)])
+
+
+def _funnel(box):
+    """漏斗：上宽下窄的梯形 + 短柄。"""
+    cx = box.center().x()
+    top = box.top() + box.height() // 4
+    bottom = box.bottom() - box.height() // 4
+    half = max(3, box.width() // 3)
+    neck = max(1, half // 3)
+    mid = (top + bottom) // 2
+    return QPolygon([QPoint(cx - half, top), QPoint(cx + half, top),
+                     QPoint(cx + neck, mid), QPoint(cx + neck, bottom),
+                     QPoint(cx - neck, bottom), QPoint(cx - neck, mid)])
+
+
+def paint_arrow(painter, box, filtered, color):
+    """在 box 里画下拉三角（已筛选时画实心漏斗）。"""
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(color))
+    painter.setBrush(color)
+    painter.drawPolygon(_funnel(box) if filtered else _triangle(box))
+    painter.restore()
+
+
+class FilterHeaderView(QHeaderView):
+    """横向字母表头。
+
+    只负责记录哪些列已筛选；箭头本身画在表格第 1 行（列名行）的单元格里，
+    由表格视图绘制与响应点击——箭头挨着列名比挂在字母行上更自然。
+    """
 
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._filtered_cols = set()
         self.setSectionsClickable(True)
-        self.setMouseTracking(True)
+
+    @property
+    def filtered_columns(self):
+        return self._filtered_cols
 
     def set_filtered_columns(self, cols):
-        """更新哪些列已有筛选（画成漏斗）。"""
+        """更新哪些列已有筛选（列名行画成漏斗）。"""
         cols = set(cols)
         if cols != self._filtered_cols:
             self._filtered_cols = cols
-            self.viewport().update()
-
-    # ---------- 箭头位置 ----------
-
-    @staticmethod
-    def _arrow_rect_in(rect):
-        box = min(ARROW_BOX, rect.height() - 2)
-        return QRect(rect.right() - box - 2,
-                     rect.top() + (rect.height() - box) // 2, box, box)
-
-    def arrow_rect_at(self, logical_index):
-        """视口坐标下该列箭头的点击区。"""
-        x = self.sectionViewportPosition(logical_index)
-        w = self.sectionSize(logical_index)
-        return self._arrow_rect_in(QRect(x, 0, w, self.height()))
-
-    def has_arrow(self, logical_index):
-        return self.sectionSize(logical_index) >= MIN_SECTION_FOR_ARROW
-
-    # ---------- 绘制 ----------
-
-    def paintSection(self, painter, rect, logical_index):
-        super().paintSection(painter, rect, logical_index)
-        if not self.has_arrow(logical_index):
-            return
-        filtered = logical_index in self._filtered_cols
-        box = self._arrow_rect_in(rect)
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor(ACCENT) if filtered else QColor(150, 150, 150)
-        painter.setPen(QPen(color))
-        painter.setBrush(color)
-        if filtered:
-            painter.drawPolygon(self._funnel(box))
-        else:
-            painter.drawPolygon(self._triangle(box))
-        painter.restore()
-
-    @staticmethod
-    def _triangle(box):
-        cx = box.center().x()
-        cy = box.center().y()
-        half = max(3, box.width() // 4)
-        return QPolygon([QPoint(cx - half, cy - half // 2),
-                         QPoint(cx + half, cy - half // 2),
-                         QPoint(cx, cy + half)])
-
-    @staticmethod
-    def _funnel(box):
-        """漏斗：上宽下窄的梯形 + 短柄。"""
-        cx = box.center().x()
-        top = box.top() + box.height() // 4
-        bottom = box.bottom() - box.height() // 4
-        half = max(3, box.width() // 3)
-        neck = max(1, half // 3)
-        mid = (top + bottom) // 2
-        return QPolygon([QPoint(cx - half, top), QPoint(cx + half, top),
-                         QPoint(cx + neck, mid), QPoint(cx + neck, bottom),
-                         QPoint(cx - neck, bottom), QPoint(cx - neck, mid)])
-
-    # ---------- 交互 ----------
-
-    def mousePressEvent(self, event):
-        idx = self.logicalIndexAt(event.pos())
-        if (event.button() == Qt.MouseButton.LeftButton and idx >= 0
-                and self.has_arrow(idx)
-                and self.arrow_rect_at(idx).contains(event.pos())):
-            self.filterClicked.emit(idx)
-            return          # 不走默认的点列头行为（选列/排序）
-        super().mousePressEvent(event)
+            view = self.parentWidget()
+            if view is not None and hasattr(view, "viewport"):
+                view.viewport().update()
 
 
 class ColumnFilterPopup(QDialog):

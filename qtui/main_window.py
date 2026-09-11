@@ -21,7 +21,7 @@ import pandas as pd
 
 from PyQt6.QtCore import (
     Qt, QTimer, QSettings, QEvent, QPoint, QRect, QItemSelection,
-    QItemSelectionModel,
+    QItemSelectionModel, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
@@ -72,7 +72,8 @@ def _isna_scalar(v):
         return False
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
-from .header_filter import ColumnFilterPopup, FilterHeaderView
+from .header_filter import (ColumnFilterPopup, FilterHeaderView, arrow_rect_in,
+                            paint_arrow, MIN_SECTION_FOR_ARROW)
 from .find_dialog import FindReplaceDialog
 from .sort_dialog import SortDialog
 from .image_panel import ImagePreviewPanel
@@ -250,6 +251,11 @@ class _FastCellDelegate(QStyledItemDelegate):
                 painter.setFont(option.font)
                 metrics = option.fontMetrics
             avail = rect.width() - 2 * self._PAD
+            arrow_box = None
+            if is_header and isinstance(view := self.parent(), _ExcelTableView) \
+                    and view.has_filter_arrow(index.column()):
+                arrow_box = arrow_rect_in(rect)
+                avail -= arrow_box.width() + 2
             # 粗体宽度不同，缓存键必须区分表头行，且按对应字体度量省略
             key = (text, avail, is_header)
             elided = self._elide_cache.get(key)
@@ -262,6 +268,12 @@ class _FastCellDelegate(QStyledItemDelegate):
             align = model.data(index, Qt.ItemDataRole.TextAlignmentRole)
             painter.drawText(rect.adjusted(self._PAD, 0, -self._PAD, 0),
                              align, elided)
+            if arrow_box is not None:
+                # 列筛选箭头：颜色跟列名文字一致（橙底白字/浅底黑字都可读）
+                header = view.horizontalHeader()
+                filtered = (index.column() in header.filtered_columns
+                            if isinstance(header, FilterHeaderView) else False)
+                paint_arrow(painter, arrow_box, filtered, pen_color)
 
         # 当前单元格边框（保留可见的焦点指示）
         if option.state & QStyle.StateFlag.State_HasFocus:
@@ -275,7 +287,10 @@ class _FastCellDelegate(QStyledItemDelegate):
 class _ExcelTableView(QTableView):
     """Excel 风格交互：回车提交后跳下一行继续编辑；
     输入公式时点击/拖选其他单元格插入引用（point mode）；
-    拖拽选区右下角填充柄把公式/值填充到相邻区域（fill handle）。"""
+    拖拽选区右下角填充柄把公式/值填充到相邻区域（fill handle）；
+    列名行（视图第 0 行）每格右侧有列筛选箭头，点击发 filterArrowClicked(列号)。"""
+
+    filterArrowClicked = pyqtSignal(int)
 
     # 光标紧跟这些字符时点击才插入引用，否则视为普通点击（提交编辑）
     _REF_TRIGGERS = '=(,:+-*/^&<>'
@@ -291,6 +306,30 @@ class _ExcelTableView(QTableView):
         super().__init__(parent)
         # 悬停填充柄要变十字光标，需要无按键的 move 事件
         self.viewport().setMouseTracking(True)
+
+    # ---------- 列名行的筛选箭头 ----------
+
+    def has_filter_arrow(self, col):
+        return self.columnWidth(col) >= MIN_SECTION_FOR_ARROW
+
+    def filter_arrow_rect(self, col):
+        """视口坐标下该列筛选箭头的点击区；列名行不可见时返回 None。"""
+        m = self.model()
+        if m is None or not self.has_filter_arrow(col):
+            return None
+        rect = self.visualRect(m.index(0, col))
+        if not rect.isValid() or rect.isEmpty():
+            return None
+        return arrow_rect_in(rect)
+
+    def _arrow_hit(self, pos):
+        """pos 落在哪一列的筛选箭头上；没有返回 -1。"""
+        idx = self.indexAt(pos)
+        if idx.isValid() and idx.row() == 0:
+            box = self.filter_arrow_rect(idx.column())
+            if box is not None and box.adjusted(-2, -2, 2, 2).contains(pos):
+                return idx.column()
+        return -1
 
     # ---------- 滚动 ----------
 
@@ -730,6 +769,12 @@ class _ExcelTableView(QTableView):
     def mousePressEvent(self, event):
         self._tab_origin_col = None
         editor = self._formula_editor()
+        if editor is None and event.button() == Qt.MouseButton.LeftButton:
+            col = self._arrow_hit(event.position().toPoint())
+            if col >= 0:
+                self.filterArrowClicked.emit(col)
+                event.accept()      # 不选中/不编辑该格
+                return
         if editor is not None and event.button() == Qt.MouseButton.LeftButton:
             idx = self.indexAt(event.position().toPoint())
             if idx.isValid() and self._insert_point_ref(editor, idx):
@@ -759,11 +804,13 @@ class _ExcelTableView(QTableView):
             self._fill_step(event.position().toPoint())
             event.accept()
             return
-        # 悬停填充柄时提示可拖拽
+        # 悬停填充柄时提示可拖拽；悬停筛选箭头时显示手形
         handle = self._fill_handle_rect()
         if (handle is not None and handle.adjusted(-2, -2, 2, 2)
                 .contains(event.position().toPoint())):
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        elif self._arrow_hit(event.position().toPoint()) >= 0:
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.viewport().unsetCursor()
         super().mouseMoveEvent(event)
@@ -807,6 +854,9 @@ class _ExcelTableView(QTableView):
     def mouseDoubleClickEvent(self, event):
         if self._formula_editor() is not None:
             event.accept()   # 公式点选中，双击不切换编辑目标
+            return
+        if self._arrow_hit(event.position().toPoint()) >= 0:
+            event.accept()   # 连点箭头不进入列名编辑
             return
         handle = self._fill_handle_rect()
         if (handle is not None
@@ -882,7 +932,7 @@ class MainWindow(QMainWindow):
             | QAbstractItemView.EditTrigger.AnyKeyPressed)
         self.filter_header = FilterHeaderView(self.table)
         self.table.setHorizontalHeader(self.filter_header)
-        self.filter_header.filterClicked.connect(self.open_column_filter)
+        self.table.filterArrowClicked.connect(self.open_column_filter)
         self.table.horizontalHeader().setDefaultSectionSize(140)
         # 列头单击仅选中整列，不触发排序——大表排序开销大且易误触，
         # 排序走工具栏/菜单/右键三个显式入口
@@ -2470,10 +2520,7 @@ class MainWindow(QMainWindow):
             self, colname, counts,
             checked=set(existing["value"]) if existing else None,
             has_filter=has_filter)
-        # 贴着该列列头的左下角弹出（和 Excel 一样挂在列头下面）
-        header = self.table.horizontalHeader()
-        anchor = QPoint(header.sectionViewportPosition(col_idx), header.height())
-        popup.popup_at(header.viewport().mapToGlobal(anchor))
+        popup.popup_at(self._column_filter_anchor(col_idx))
         if popup.sort_ascending is not None:
             self._sort_by(col_idx, popup.sort_ascending)
             return
@@ -2492,6 +2539,16 @@ class MainWindow(QMainWindow):
             self._reapply_filters()
         else:
             self.clear_all_filters()
+
+    def _column_filter_anchor(self, col_idx):
+        """筛选弹层的锚点：列名行该格的左下角；列名行滚出视野时退到字母列头下方。"""
+        cell = self.table.visualRect(self.model.index(0, col_idx))
+        viewport_rect = self.table.viewport().rect()
+        if cell.isValid() and not cell.isEmpty() and viewport_rect.intersects(cell):
+            return self.table.viewport().mapToGlobal(QPoint(cell.left(), cell.bottom() + 1))
+        header = self.table.horizontalHeader()
+        anchor = QPoint(header.sectionViewportPosition(col_idx), header.height())
+        return header.viewport().mapToGlobal(anchor)
 
     def _update_filter_indicators(self):
         """把已筛选的列画成漏斗。"""
