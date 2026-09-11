@@ -597,6 +597,10 @@ class PandasTableModel(QAbstractTableModel):
             self._redo_stack.append(record)
             self._after_batch(record[1])
             return True
+        if record[0] == "__struct__":
+            self._replay_struct(record, forward=False)
+            self._redo_stack.append(record)
+            return True
         row, col = record[0], record[1]
         self._apply_cell_record(record, forward=False)
         self._redo_stack.append(record)
@@ -628,6 +632,10 @@ class PandasTableModel(QAbstractTableModel):
             self._undo_stack.append(record)
             self._after_batch(record[1])
             return True
+        if record[0] == "__struct__":
+            self._replay_struct(record, forward=True)
+            self._undo_stack.append(record)
+            return True
         row, col = record[0], record[1]
         self._apply_cell_record(record, forward=True)
         self._undo_stack.append(record)
@@ -636,6 +644,15 @@ class PandasTableModel(QAbstractTableModel):
         self._recalc_dependents((row, col))
         self.modified = True
         return True
+
+    def clear_history(self):
+        """清空撤销/重做栈。
+
+        筛选状态下的结构操作由宿主同步 original_df 等底账，模型这边的
+        撤销记录无法把那些底账一起回退，宿主做完后调用此方法作废历史。
+        """
+        self._undo_stack.clear()
+        self._redo_stack.clear()
 
     def _apply_formula_state(self, row, col, formula):
         key = (row, col)
@@ -727,63 +744,169 @@ class PandasTableModel(QAbstractTableModel):
 
     # ---------- 结构操作 ----------
 
-    def insert_row(self, position: int):
-        self._invalidate_values()
-        # position 为数据行坐标，视图中偏移一行（表头行）
-        view_pos = position + self.HEADER_ROWS
-        self.beginInsertRows(QModelIndex(), view_pos, view_pos)
+    # ---------- 结构操作（增删行列 / 重排 / 设为表头），全部可撤销 ----------
+    #
+    # 每个操作分三层：
+    #   _do_*      纯数据层，只改 self._df，不发信号、不动底账；
+    #   公共方法   发模型信号、平移/清理公式与颜色底账、记一条 "__struct__" 撤销记录；
+    #   _replay_struct  撤销/重做：反向/正向重放 _do_*，再整体恢复操作前/后的
+    #                  底账快照（公式表、颜色表、各列 dtype）。
+    # 底账用快照而不是"再反向平移一次"：插入/删除对公式引用的改写并非严格
+    # 互逆（删行会把引用变成 #REF!），快照能保证撤销后和操作前逐字节一致。
+    # 公式数量通常远小于单元格数，快照开销可忽略；被删的行列数据随记录保存。
+
+    def _snapshot(self):
+        return (dict(self.formulas), dict(self.cell_colors), list(self._df.dtypes))
+
+    def _restore_snapshot(self, snap):
+        formulas, colors, dtypes = snap
+        self.formulas = dict(formulas)
+        self.cell_colors = dict(colors)
+        if len(dtypes) == len(self._df.columns):
+            for col, dtype in enumerate(dtypes):
+                self._restore_dtype(col, dtype)
+        self.evaluate_all_formulas()
+
+    def _finish_structure(self):
+        self.modified = True
+        self.structure_version += 1
+
+    def _do_insert_row(self, position):
         empty = pd.DataFrame([[np.nan] * len(self._df.columns)], columns=self._df.columns)
         self._df = pd.concat(
             [self._df.iloc[:position], empty, self._df.iloc[position:]]
         ).reset_index(drop=True)
+
+    def _do_remove_rows(self, positions):
+        removed = self._df.iloc[positions].copy()
+        self._df = self._df.drop(self._df.index[positions]).reset_index(drop=True)
+        return removed
+
+    def _do_reinsert_rows(self, positions, removed):
+        """把 _do_remove_rows 删掉的行按原位置放回去。"""
+        total = len(self._df) + len(removed)
+        kept = self._df.copy()
+        kept.index = np.setdiff1d(np.arange(total), np.asarray(positions, dtype=int))
+        removed = removed.copy()
+        removed.index = np.asarray(positions, dtype=int)
+        self._df = pd.concat([kept, removed]).sort_index().reset_index(drop=True)
+
+    def _do_insert_column(self, position, name, values=np.nan):
+        self._df.insert(position, name, values)
+
+    def _do_remove_columns(self, positions):
+        """删除列，返回 [(位置, 列名, 值数组)] 供撤销放回。"""
+        removed = [(p, self._df.columns[p], self._df.iloc[:, p].to_numpy(copy=True))
+                   for p in positions]
+        self._df = self._df.drop(columns=[name for _p, name, _v in removed])
+        return removed
+
+    def _do_reinsert_columns(self, removed):
+        for pos, name, values in sorted(removed, key=lambda t: t[0]):
+            self._df.insert(pos, name, values)
+
+    def _do_reorder(self, positions):
+        self._df = self._df.iloc[list(positions)].reset_index(drop=True)
+
+    def insert_row(self, position: int):
+        before = self._snapshot()
+        self._invalidate_values()
+        # position 为数据行坐标，视图中偏移一行（表头行）
+        view_pos = position + self.HEADER_ROWS
+        self.beginInsertRows(QModelIndex(), view_pos, view_pos)
+        self._do_insert_row(position)
         self._shift_keys(row_start=position, row_delta=1)
         self.endInsertRows()
-        self.modified = True
-        self.structure_version += 1
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._finish_structure()
+        self._push_undo(("__struct__", "insert_row", position, before, self._snapshot()))
 
-    def remove_rows(self, positions):
+    def remove_rows(self, positions, record=True):
         """按显示位置批量删除行。positions 为升序去重列表。"""
+        positions = sorted(set(positions))
         if not positions:
             return
+        before = self._snapshot()
         self._invalidate_values()
         self.beginResetModel()
-        self._df = self._df.drop(self._df.index[positions]).reset_index(drop=True)
+        removed = self._do_remove_rows(positions)
         self._remove_keys(rows=set(positions))
         self.endResetModel()
-        self.modified = True
-        self.structure_version += 1
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._finish_structure()
+        if record:
+            self._push_undo(("__struct__", "remove_rows", positions, removed,
+                             before, self._snapshot()))
 
     def insert_column(self, position: int, name: str = None):
         if name is None:
             name = self._unique_col_name(tr("新列"))
+        before = self._snapshot()
         self._invalidate_values()
         self.beginInsertColumns(QModelIndex(), position, position)
-        self._df.insert(position, name, np.nan)
+        self._do_insert_column(position, name)
         self._shift_keys(col_start=position, col_delta=1)
         self.endInsertColumns()
-        self.modified = True
-        self.structure_version += 1
-        # 列位置整体平移，旧撤销记录会写错列（行操作同理已清）
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._finish_structure()
+        self._push_undo(("__struct__", "insert_column", position, name,
+                         before, self._snapshot()))
 
     def remove_columns(self, positions):
+        positions = sorted(set(positions))
         if not positions:
             return
+        before = self._snapshot()
         self._invalidate_values()
         self.beginResetModel()
-        cols = [self._df.columns[p] for p in positions]
-        self._df = self._df.drop(columns=cols)
+        removed = self._do_remove_columns(positions)
         self._remove_keys(cols=set(positions))
         self.endResetModel()
-        self.modified = True
-        self.structure_version += 1
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._finish_structure()
+        self._push_undo(("__struct__", "remove_columns", positions, removed,
+                         before, self._snapshot()))
+
+    def _replay_struct(self, record, forward):
+        """撤销（forward=False）/重做（forward=True）一条结构记录。"""
+        kind, args = record[1], record[2:]
+        before, after = args[-2], args[-1]
+        self._invalidate_values()
+        self.beginResetModel()
+        if kind == "insert_row":
+            (position,) = args[:-2]
+            if forward:
+                self._do_insert_row(position)
+            else:
+                self._do_remove_rows([position])
+        elif kind == "remove_rows":
+            positions, removed = args[:-2]
+            if forward:
+                self._do_remove_rows(positions)
+            else:
+                self._do_reinsert_rows(positions, removed)
+        elif kind == "insert_column":
+            position, name = args[:-2]
+            if forward:
+                self._do_insert_column(position, name)
+            else:
+                self._do_remove_columns([position])
+        elif kind == "remove_columns":
+            positions, removed = args[:-2]
+            if forward:
+                self._do_remove_columns(positions)
+            else:
+                self._do_reinsert_columns(removed)
+        elif kind == "reorder":
+            (positions,) = args[:-2]
+            if forward:
+                self._do_reorder(positions)
+            else:
+                inverse = np.empty(len(positions), dtype=int)
+                inverse[np.asarray(positions, dtype=int)] = np.arange(len(positions))
+                self._do_reorder(inverse)
+        elif kind == "promote":
+            old_df, new_df = args[:-2]
+            self._df = (new_df if forward else old_df).copy()
+        self._restore_snapshot(after if forward else before)
+        self.endResetModel()
+        self._finish_structure()
 
     def _shift_keys(self, row_start=None, row_delta=0, col_start=None, col_delta=0):
         """插入行/列后平移公式/背景色的键，并同步平移公式内的引用。"""
@@ -858,6 +981,8 @@ class PandasTableModel(QAbstractTableModel):
         """
         if not 0 <= data_row < len(self._df):
             return False
+        before = self._snapshot()
+        old_df = self._df.copy()
         raw = list(self._df.iloc[data_row])
         names, used = [], set()
         for i, v in enumerate(raw):
@@ -871,8 +996,8 @@ class PandasTableModel(QAbstractTableModel):
                 n += 1
             used.add(name)
             names.append(name)
-        # 先移除表头行及其上方行（公式/颜色/撤销/结构版本统一处理）
-        self.remove_rows(list(range(data_row + 1)))
+        # 先移除表头行及其上方行（公式/颜色/结构版本统一处理；撤销记录由本方法整体记一条）
+        self.remove_rows(list(range(data_row + 1)), record=False)
         self.beginResetModel()
         self._invalidate_values()
         self._df.columns = names
@@ -889,6 +1014,8 @@ class PandasTableModel(QAbstractTableModel):
                     self._df.isetitem(i, converted)
         self.endResetModel()
         self.modified = True
+        self._push_undo(("__struct__", "promote", old_df, self._df.copy(),
+                         before, self._snapshot()))
         return True
 
     def rename_column(self, position: int, new_name: str):
@@ -929,24 +1056,54 @@ class PandasTableModel(QAbstractTableModel):
             i += 1
         return f"{base}{i}"
 
-    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
-        if column < 0 or column >= len(self._df.columns):
-            return
-        series = self._df.iloc[:, column]
-        # 数值列按数值排；混合列（公式写入 #DIV/0! 后整列 object）数值在前、
-        # 文本在后（同 Excel）——直接 sort_values 会在 str/float 比较时抛 TypeError
+    @staticmethod
+    def _sort_key(series):
+        """列 -> 可比较的排序键。
+
+        数值列按数值排；混合列（公式写入 #DIV/0! 后整列 object）数值在前、
+        文本在后（同 Excel）——直接 sort_values 会在 str/float 比较时抛 TypeError。
+        空值保持为 None，由 na_position 统一排到末尾。
+        """
         keys = pd.to_numeric(series, errors="coerce")
         if keys.notna().sum() < series.notna().sum():
             keys = pd.Series(
                 [None if pd.isna(v) else ((0, n) if n == n else (1, str(v)))
                  for v, n in zip(series.tolist(), keys.tolist())],
                 index=series.index, dtype=object)
-        positions = keys.sort_values(
-            ascending=(order == Qt.SortOrder.AscendingOrder),
+        return keys
+
+    def sort_positions(self, keys):
+        """多键排序后的新行序（positions[i] = 新第 i 行对应的旧行号），不改数据。
+
+        keys: [(列号, 是否升序), ...]，按优先级排列；越界列忽略、重复列只取首次。
+        稳定排序：键相等的行保持原相对顺序。返回 None 表示没有可用的键。
+        """
+        ncols = len(self._df.columns)
+        seen, ordered = set(), []
+        for col, ascending in keys:
+            if 0 <= col < ncols and col not in seen:
+                seen.add(col)
+                ordered.append((col, bool(ascending)))
+        if not ordered:
+            return None
+        frame = pd.DataFrame({i: self._sort_key(self._df.iloc[:, c])
+                              for i, (c, _a) in enumerate(ordered)})
+        return frame.sort_values(
+            by=list(range(len(ordered))),
+            ascending=[a for _c, a in ordered],
             kind="mergesort",
             na_position="last",
-        ).index
+        ).index.tolist()
+
+    def sort_by_keys(self, keys):
+        """按多个键排序（见 sort_positions）。返回被冻结的公式数，无键时 None。"""
+        positions = self.sort_positions(keys)
+        if positions is None:
+            return None
         return self.reorder_rows(positions)
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        return self.sort_by_keys([(column, order == Qt.SortOrder.AscendingOrder)])
 
     def reorder_rows(self, positions):
         """按新行序重排（positions[i] = 新第 i 行对应的旧行号）。
@@ -954,9 +1111,11 @@ class PandasTableModel(QAbstractTableModel):
         公式单元格、公式内的行引用、背景色都跟随数据移动。区域引用
         不重写：覆盖全部行的区域（整列聚合）成员不变、安全保留并重算；
         含部分区域的公式在重排后成员会变成无关行，冻结为静态值
-        （返回冻结数量，供调用方提示）。结构变化，撤销栈清空。
+        （返回冻结数量，供调用方提示）。可撤销：撤销按逆排列复原行序，
+        并恢复重排前的公式表（被冻结的公式随之复活）。
         """
         positions = list(positions)
+        before = self._snapshot()
         self._invalidate_values()
         self.beginResetModel()
         frozen = 0
@@ -971,7 +1130,7 @@ class PandasTableModel(QAbstractTableModel):
             self.formulas = kept
         # 旧行位置 -> 新行位置
         row_map = {old: new for new, old in enumerate(positions)}
-        self._df = self._df.iloc[positions].reset_index(drop=True)
+        self._do_reorder(positions)
         if self.formulas:
             self._engine.set_dataframe(self._df)
             self.formulas = {
@@ -986,8 +1145,6 @@ class PandasTableModel(QAbstractTableModel):
             }
         self.evaluate_all_formulas()
         self.endResetModel()
-        self.modified = True
-        self.structure_version += 1
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._finish_structure()
+        self._push_undo(("__struct__", "reorder", positions, before, self._snapshot()))
         return frozen

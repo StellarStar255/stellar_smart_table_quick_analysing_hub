@@ -365,12 +365,13 @@ class TestReorderRows:
         assert m.cell_colors == {(1, 0): '#ff0000'}
         assert m._df.iat[1, 1] == 60
 
-    def test_reorder_clears_undo_and_marks_modified(self):
+    def test_reorder_is_undoable_and_marks_modified(self):
         m = make_model()
         m.setData(m.index(1, 0), '99')
         m.reorder_rows([1, 2, 0])
         assert m.modified
-        assert not m._undo_stack
+        # 重排本身入栈；先前的单元格编辑仍在其下
+        assert len(m._undo_stack) == 2 and m._undo_stack[-1][0] == "__struct__"
 
 
 class TestInsertDeleteFollowsFormulas:
@@ -452,19 +453,21 @@ class TestReviewFindings:
         m.set_dataframe(df, formulas={(0, 1): '=SUMPRODUCT(A2:A4, B3:B4)'})
         assert m._df.iat[0, 1] == 42.0
 
-    def test_insert_column_clears_undo(self):
-        # finding 6: 列插入后旧撤销记录会写错列
+    def test_insert_column_keeps_earlier_edit_undoable(self):
+        # 列插入前的单元格编辑记录用的是旧列号：先撤销插入、再撤销编辑，坐标才一致
         m = make_model()
         m.setData(m.index(1, 1), '99')
-        assert m._undo_stack
         m.insert_column(0)
-        assert not m._undo_stack and not m._redo_stack
+        assert len(m._undo_stack) == 2 and not m._redo_stack
+        assert m.undo() and list(m.df.columns) == ['X', 'Y']
+        assert m.undo() and m.df.iat[0, 1] == 1.0
 
-    def test_remove_columns_clears_undo(self):
+    def test_remove_columns_is_undoable(self):
         m = make_model()
         m.setData(m.index(1, 1), '99')
         m.remove_columns([0])
-        assert not m._undo_stack
+        assert m.undo()
+        assert list(m.df.columns) == ['X', 'Y'] and m.df.iat[0, 1] == 99
 
     def test_structure_version_bumps_on_structural_ops(self):
         # finding 7: 结构版本号供公式剪贴板判断失效
