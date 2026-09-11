@@ -792,14 +792,17 @@ class PandasTableModel(QAbstractTableModel):
     def _snapshot(self):
         return (dict(self.formulas), dict(self.cell_colors), list(self._df.dtypes))
 
-    def _restore_snapshot(self, snap):
+    def _restore_snapshot(self, snap, evaluate=True):
         formulas, colors, dtypes = snap
         self.formulas = dict(formulas)
         self.cell_colors = dict(colors)
         if len(dtypes) == len(self._df.columns):
             for col, dtype in enumerate(dtypes):
                 self._restore_dtype(col, dtype)
-        self.evaluate_all_formulas()
+        if evaluate:
+            self.evaluate_all_formulas()
+        else:
+            self._rebuild_all_deps()
 
     def _finish_structure(self):
         self.modified = True
@@ -938,7 +941,9 @@ class PandasTableModel(QAbstractTableModel):
         elif kind == "promote":
             old_df, new_df = args[:-2]
             self._df = (new_df if forward else old_df).copy()
-        self._restore_snapshot(after if forward else before)
+        # 纯行重排不改变任何公式的值（引用随行一起移动），不必重算——
+        # 整列填充了公式的表重算一遍要好几秒；其余结构操作照常重算
+        self._restore_snapshot(after if forward else before, evaluate=(kind != "reorder"))
         self.endResetModel()
         self._finish_structure()
 
@@ -1177,7 +1182,9 @@ class PandasTableModel(QAbstractTableModel):
                 for (r, c), v in self.cell_colors.items()
                 if r in row_map or r < 0   # 表头行颜色（-1）不随行序移动
             }
-        self.evaluate_all_formulas()
+        # 公式值随行移动、引用已重写到新行号，结果不变：只重建依赖索引不重算
+        # （含部分区域的公式已冻结；整列区域成员不变）
+        self._rebuild_all_deps()
         self.endResetModel()
         self._finish_structure()
         self._push_undo(("__struct__", "reorder", positions, before, self._snapshot()))
