@@ -105,3 +105,56 @@ class TestPointMode:
         win.table.commitData(editor)
         assert win.model.formulas == {(0, 0): '=B3'}
         assert str(win.model.df.iat[0, 0]) == '2'
+
+
+class TestClickThroughExpandedEditor:
+    """长公式把编辑器撑宽盖住邻格时，点被盖住的格子仍能插入引用。"""
+
+    LONG = '=CONCAT("/a/very/long/path/that/pushes/the/editor/over/its/neighbours/",'
+
+    def _expanded_editor(self, win):
+        editor = open_editor(win, 1, 0, self.LONG)
+        _app.processEvents()
+        own = win.table.visualRect(win.model.index(1, 0))
+        assert editor.width() > own.width(), "编辑器应已被长文本撑宽"
+        return editor, own
+
+    def _press_on(self, win, editor, view_row, col, button=Qt.MouseButton.LeftButton):
+        cell = win.table.visualRect(win.model.index(view_row, col))
+        pos = editor.mapFrom(win.table.viewport(), cell.center())
+        assert editor.rect().contains(pos), "该格应被编辑器盖住"
+        QTest.mousePress(editor, button, Qt.KeyboardModifier.NoModifier, pos)
+        return pos
+
+    def test_click_on_covered_neighbour_inserts_ref(self, win):
+        editor, _ = self._expanded_editor(win)
+        pos = self._press_on(win, editor, 1, 1)      # B2 被编辑器盖住
+        QTest.mouseRelease(editor, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
+        assert editor.text() == self.LONG + 'B2'
+        assert win._cell_delegate.active_editor is editor
+        assert win.table._point_anchor is None
+
+    def test_drag_over_covered_cells_makes_range(self, win):
+        editor, _ = self._expanded_editor(win)
+        self._press_on(win, editor, 1, 1)
+        cell = win.table.visualRect(win.model.index(2, 1))
+        pos = editor.mapFrom(win.table.viewport(), cell.center())
+        QTest.mouseMove(editor, pos)
+        QTest.mouseRelease(editor, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
+        assert editor.text() == self.LONG + 'B2:B3'
+
+    def test_click_inside_own_cell_moves_caret_not_ref(self, win):
+        editor, own = self._expanded_editor(win)
+        pos = editor.mapFrom(win.table.viewport(), own.center())
+        QTest.mouseClick(editor, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
+        assert editor.text() == self.LONG
+        assert editor.cursorPosition() < len(self.LONG)
+
+    def test_no_ref_when_caret_not_insertable(self, win):
+        editor, _ = self._expanded_editor(win)
+        editor.setText(self.LONG + 'A9')
+        editor.setCursorPosition(len(editor.text()))
+        _app.processEvents()
+        pos = self._press_on(win, editor, 1, 1)
+        QTest.mouseRelease(editor, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
+        assert editor.text() == self.LONG + 'A9'

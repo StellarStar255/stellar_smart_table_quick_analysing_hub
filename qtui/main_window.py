@@ -21,7 +21,7 @@ import pandas as pd
 
 from PyQt6.QtCore import (
     Qt, QTimer, QSettings, QEvent, QPoint, QRect, QItemSelection,
-    QItemSelectionModel, pyqtSignal,
+    QItemSelectionModel, pyqtSignal, QPersistentModelIndex, QModelIndex,
 )
 from PyQt6.QtGui import (
     QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
@@ -140,6 +140,8 @@ class _FastCellDelegate(QStyledItemDelegate):
         # 光标模式（F2/双击）：方向键在文本内移动光标，且光标放到末尾而不是全选
         typing = bool(getattr(view, "_typing_pending", False))
         editor._typing_mode = typing
+        editor._edit_index = QPersistentModelIndex(index)   # 点选时区分"本格"与被盖住的邻格
+        editor._point_drag = False
         if not typing and isinstance(editor, QLineEdit):
             QTimer.singleShot(0, lambda e=editor: self._caret_to_end(e))
         return editor
@@ -194,6 +196,16 @@ class _FastCellDelegate(QStyledItemDelegate):
                 dr, dc = self._ARROW_DELTAS[key]
                 view.commit_and_move(editor, dr, dc)
                 return True
+        # 公式编辑器是会随文字变宽的 QExpandingLineEdit，长公式会盖住右侧
+        # 邻格，点击落在编辑器里而到不了表格。这里接住：点在本格范围内照常
+        # 移光标；点在被盖住的邻格上且光标处可插引用时，插入该格引用，
+        # 拖动扩成区域引用（与视图 mousePressEvent 的点选逻辑一致）
+        if (editor is self.active_editor and isinstance(editor, QLineEdit)
+                and event.type() in (QEvent.Type.MouseButtonPress,
+                                     QEvent.Type.MouseMove,
+                                     QEvent.Type.MouseButtonRelease)):
+            if self._point_mode_mouse(editor, event):
+                return True
         # 公式点选引用（Excel point mode）：正在输入公式且光标处可插入
         # 引用时，点击表格导致的失焦不提交编辑器——随后视图的
         # mousePressEvent 会把点中的单元格引用插入公式
@@ -207,6 +219,43 @@ class _FastCellDelegate(QStyledItemDelegate):
                 if w is view or w is view.viewport():
                     return False
         return super().eventFilter(editor, event)
+
+    def _point_mode_mouse(self, editor, event):
+        """编辑器内的鼠标事件转成点选引用；返回 True 表示已处理。"""
+        view = self.parent()
+        if not isinstance(view, _ExcelTableView):
+            return False
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonRelease:
+            if getattr(editor, "_point_drag", False):
+                editor._point_drag = False
+                view._point_anchor = None
+                return True
+            return False
+        pos_vp = editor.mapTo(view.viewport(), event.position().toPoint())
+        if etype == QEvent.Type.MouseMove:
+            if not getattr(editor, "_point_drag", False):
+                return False
+            idx = view.indexAt(pos_vp)
+            if idx.isValid() and view._formula_editor() is editor:
+                view._drag_point_range(editor, idx)
+            return True
+        # MouseButtonPress
+        if event.button() != Qt.MouseButton.LeftButton or view._formula_editor() is not editor:
+            return False
+        own = getattr(editor, "_edit_index", None)
+        own_index = QModelIndex(own) if own is not None and own.isValid() else QModelIndex()
+        if own_index.isValid() and view.visualRect(own_index).contains(pos_vp):
+            return False          # 本格范围内：正常放光标
+        idx = view.indexAt(pos_vp)
+        if not idx.isValid() or idx == own_index:
+            return False
+        if not view._insert_point_ref(editor, idx):
+            return False
+        view._point_anchor = idx
+        editor._point_drag = True
+        editor.setFocus()
+        return True
 
     def paint(self, painter, option, index):
         model = self._model
@@ -1223,7 +1272,15 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         self.copy_headers_cb = QCheckBox(tr("复制列名"))
-        self.copy_headers_cb.setChecked(True)
+        self.copy_headers_cb.setToolTip(tr(
+            "复制时在第一行附带列名，方便粘贴到 Excel 等外部软件。\n"
+            "在本应用内粘贴时会自动去掉这一行，不会把列名粘进单元格。"))
+        settings = getattr(self, "_settings", None)
+        self.copy_headers_cb.setChecked(
+            bool(settings.value("copy/headers", False, type=bool)) if settings else False)
+        self.copy_headers_cb.toggled.connect(
+            lambda on: self._settings.setValue("copy/headers", bool(on))
+            if getattr(self, "_settings", None) else None)
         tb.addWidget(self.copy_headers_cb)
         self.auto_save_cb = QCheckBox(tr("自动保存"))
         self.auto_save_cb.setChecked(self.auto_save)
@@ -2814,6 +2871,11 @@ class MainWindow(QMainWindow):
             if f:
                 formula_cells[(row_rank[r] + header_line, col_rank[c])] = {
                     "text": f, "src": (r, c)}
+        # 应用内粘贴时用来识别自己复制的内容：选项附带的列名行不该粘进表格
+        self._own_clipboard = {
+            "text": clip_text,
+            "optional_header": bool(with_headers and not header_selected),
+        }
         self._formula_clipboard = {
             "text": clip_text,
             "cells": formula_cells,
@@ -2864,6 +2926,14 @@ class MainWindow(QMainWindow):
         idx = self.table.currentIndex()
         start_row = idx.row() if idx.isValid() else 1
         start_col = idx.column() if idx.isValid() else 0
+        clip_cells = clip["cells"] if use_formulas else {}
+        own = getattr(self, "_own_clipboard", None)
+        if (start_row != 0 and own is not None and own["text"] == text
+                and own["optional_header"] and len(rows) > 1):
+            # 「复制列名」附带的列名行只是给外部软件用的：在本应用内粘贴到
+            # 数据区时去掉，否则列名会顶掉目标格、数据整体下移一行
+            rows = rows[1:]
+            clip_cells = {(r - 1, c): v for (r, c), v in clip_cells.items() if r >= 1}
         # 视图容量 = 数据行数 + 1 行表头
         need_rows = start_row + len(rows) - (len(self.model.df) + 1)
         need_cols = start_col + max(len(r) for r in rows) - len(self.model.df.columns)
@@ -2902,7 +2972,7 @@ class MainWindow(QMainWindow):
             for c_off, val in enumerate(row_vals):
                 target_row = start_row + r_off
                 index = self.model.index(target_row, start_col + c_off)
-                formula = clip["cells"].get((r_off, c_off)) if use_formulas else None
+                formula = clip_cells.get((r_off, c_off))
                 if formula and target_row > 0:
                     # 逐格计算平移量（不连续选区各格偏移不同）
                     src_r, src_c = formula["src"]
