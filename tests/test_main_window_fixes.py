@@ -137,3 +137,65 @@ class TestClipboardDelimiter:
 
     def test_tab_wins_over_comma(self, win):
         assert win._parse_clipboard_text("a,b\t1") == [["a,b", "1"]]
+
+
+class TestCopyHeadersOptionDoesNotLeakIntoPaste:
+    """「复制列名」只影响剪贴板文本；应用内粘贴不会把列名粘进单元格。"""
+
+    def _copy(self, win, row, col):
+        idx = win.model.index(row, col)
+        win.table.setCurrentIndex(idx)
+        win.table.selectionModel().select(
+            idx, win.table.selectionModel().SelectionFlag.ClearAndSelect)
+        win.copy_selection()
+
+    def test_default_off(self, win):
+        assert not win.copy_headers_cb.isChecked()
+
+    def test_paste_into_data_cell_drops_option_header(self, win):
+        win.copy_headers_cb.setChecked(True)
+        self._copy(win, 1, 0)                       # A 列第 1 个数据格 = 1.0
+        assert QApplication.clipboard().text().splitlines()[0] == "A"
+        win.table.setCurrentIndex(win.model.index(2, 1))
+        before_below = win.model.df.iat[2, 1]
+        win.paste_selection()
+        assert win.model.df.iat[1, 1] == 1.0        # 值到了目标格
+        assert win.model.df.iat[2, 1] == before_below   # 下一行没被顶掉
+        assert "A" not in win.model.df.iloc[:, 1].astype(str).tolist()
+
+    def test_paste_onto_header_row_keeps_header(self, win):
+        win.copy_headers_cb.setChecked(True)
+        self._copy(win, 1, 0)
+        win.table.setCurrentIndex(win.model.index(0, 1))
+        win.paste_selection()
+        name = str(win.model.df.columns[1])
+        assert name.startswith("A") and name != "B"   # 列名粘到表头行（重名会加后缀）
+        assert float(win.model.df.iat[0, 1]) == 1.0
+
+    def test_explicitly_selected_header_still_pastes(self, win):
+        win.copy_headers_cb.setChecked(True)
+        sm = win.table.selectionModel()
+        win.table.setCurrentIndex(win.model.index(0, 0))
+        sm.select(win.model.index(0, 0), sm.SelectionFlag.ClearAndSelect)
+        sm.select(win.model.index(1, 0), sm.SelectionFlag.Select)
+        win.copy_selection()
+        win.table.setCurrentIndex(win.model.index(2, 1))
+        win.paste_selection()
+        assert str(win.model.df.iat[1, 1]) == "A" and float(win.model.df.iat[2, 1]) == 1.0
+
+    def test_external_text_with_two_lines_pastes_both(self, win):
+        win.copy_headers_cb.setChecked(True)
+        QApplication.clipboard().setText("A\n1.0")   # 不是本应用复制的
+        win._own_clipboard = None
+        win.table.setCurrentIndex(win.model.index(2, 1))
+        win.paste_selection()
+        assert str(win.model.df.iat[1, 1]) == "A"
+
+    def test_formula_paste_still_shifts_with_option_on(self, win):
+        win.copy_headers_cb.setChecked(True)
+        win.model.setData(win.model.index(1, 1), "=A2*2")
+        self._copy(win, 1, 1)
+        win.table.setCurrentIndex(win.model.index(3, 1))
+        win.paste_selection()
+        assert win.model.formulas.get((2, 1)) == "=A4*2"
+        assert (3, 1) not in win.model.formulas

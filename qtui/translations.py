@@ -261,6 +261,8 @@ TRANSLATIONS = {
     '清空输出': 'Clear Output',
     "# 可用变量: df (当前数据副本), pd, np\n# 可用函数: save_as_sheet(df, '名称'), save_figure(fig, '文件名.png')": "# Available variables: df (copy of current data), pd, np\n# Available functions: save_as_sheet(df, 'name'), save_figure(fig, 'filename.png')",
     '结果 DataFrame:': 'Result DataFrame:',
+    '复制时在第一行附带列名，方便粘贴到 Excel 等外部软件。\n在本应用内粘贴时会自动去掉这一行，不会把列名粘进单元格。':
+        'Include the column names as the first line when copying, for pasting into Excel and other apps.\nPasting inside this app drops that line automatically, so column names never land in cells.',
     '选择预设…': 'Choose a preset…',
     '插入列名': 'Insert Column',
     '（当前没有数据）': '(no data loaded)',
