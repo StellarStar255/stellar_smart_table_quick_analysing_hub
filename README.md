@@ -2,7 +2,7 @@
 
 **English** | [中文](#smart-table-hub---智能表格处理工具)
 
-A powerful Excel alternative built with Python and PyQt6 for fast processing of Excel and CSV files, with a rich set of data manipulation features.
+A lightweight spreadsheet app built with Python and PyQt6. It opens and saves Excel (.xlsx/.xls) and CSV files, and comes with a rich set of data manipulation features.
 
 > The app UI is available in English and Chinese — switch via "View → Language" menu, takes effect after restart.
 
@@ -74,6 +74,16 @@ python smart_table_quick_analysing_hub_qt.py -h
   - ✨ Stack multiple filter conditions
 - **Find & replace**: Global find and replace
 - **Insert/delete**: Flexible row and column insertion and deletion
+
+### 🐍 Python Data Analysis
+- **Presets with a parameter form**: pick a preset (pivot table, group & aggregate, Top N, charts, cleaning...) and choose column names from dropdowns instead of editing strings; the form and the code stay in sync both ways
+- **Column-name autocomplete**: type inside quotes to complete column names (Ctrl+Space to force), or insert them from the toolbar menu
+- **Results and charts inline**: DataFrames appear in a result table, matplotlib figures in a chart tab (copy / save as PNG); pivot row labels and multi-level columns are flattened for you
+- **Friendly errors**: a wrong column name shows the failing line, close matches, and the list of available columns
+- **Whole-workbook access**: `sheets['name']`, `df_full` (unfiltered), `selection` and `selected_columns` are available in your code
+- **Write back**: save a result as a new sheet, replace the current sheet, or append the result columns to the current sheet (always confirmed first, always undoable)
+- **History**: the last 30 runs and the editor content are kept across restarts
+- **AI code generation** (optional): describe the analysis in plain language and let Claude write the pandas code, or ask it to fix the last error. Needs `pip install anthropic` and an Anthropic API key (menu AI → Settings); only column names, types and a few sample values are sent, never the whole table
 
 ### 📈 Statistics
 - **Descriptive statistics**: View complete statistics for your data in one click
@@ -221,20 +231,22 @@ Alternatively, click a column header for quick sorting.
 | Basic statistics | ✅ | ✅ |
 | Find & replace | ✅ | ✅ |
 | Undo/redo | ✅ (500 steps, incl. structural ops) | ✅ |
-| Completely free | ✅ | ❌ |
+| Free, no subscription | ✅ | ❌ (desktop app is paid; the web version is free with limited features) |
 | Open source | ✅ | ❌ |
-| Cross-platform | ✅ | ⚠️ |
+| Linux support | ✅ | ❌ |
 | Cell formulas | ✅ (43 functions) | ✅ |
 | Charts | ⚠️ Planned | ✅ |
 
+> Comparison based on publicly available information as of September 2026 and may become outdated.
+
 ## Roadmap
 
-- [x] Excel formula evaluation (25+ functions, nesting, auto-recalc, `#REF!` tracking)
+- [x] Excel-compatible formula evaluation (43 functions, nesting, auto-recalc, `#REF!` tracking)
 - [x] Keep formulas while filtering (suspended as static values during filtering, restored and recalculated when filters are cleared)
 - [ ] Data visualization (charts)
 - [ ] Conditional formatting
 - [ ] Pivot tables
-- [ ] Multiple worksheets
+- [x] Multiple worksheets (create, delete, switch with `Ctrl+PgUp` / `Ctrl+PgDn`)
 - [ ] More data processing functions
 - [ ] Themes and style customization
 
@@ -268,6 +280,10 @@ A: Fixed in v1.2.0. Previously the row count was automatically reduced for files
 
 This project is licensed under the MIT License — free to use, modify, and distribute.
 
+## Trademarks
+
+Microsoft and Excel are trademarks of the Microsoft group of companies. Smart Table Hub is an independent project and is not affiliated with, endorsed by, or sponsored by Microsoft. References to Excel are made solely to describe file-format compatibility and comparable features.
+
 ## Contributing
 
 Issues and Pull Requests are welcome!
@@ -278,7 +294,7 @@ Issues and Pull Requests are welcome!
 
 [English](#smart-table-hub) | **中文**
 
-一个功能强大的Excel替代品，使用Python和PyQt6构建，支持快速处理Excel、CSV文件和各种数据操作。
+一个使用 Python 和 PyQt6 构建的轻量表格工具，可打开和保存 Excel（.xlsx/.xls）与 CSV 文件，并提供丰富的数据处理功能。
 
 > 应用界面支持中英文切换，菜单「视图 → 语言 / Language」，切换后重启生效。
 
@@ -354,6 +370,16 @@ python smart_table_quick_analysing_hub_qt.py -h
   - ✨ 支持多个筛选条件叠加
 - **查找替换**: 全局查找和替换功能
 - **插入/删除**: 灵活插入和删除行列
+
+### 🐍 Python 数据分析
+- **带参数表单的预设**：选一个预设（透视表、分组聚合、TopN、图表、清洗……），列名从下拉框里选，不用改字符串；表单和代码双向同步
+- **列名补全**：在引号里打字自动补全列名（Ctrl+Space 强制弹出），也可从工具栏菜单直接插入
+- **结果与图表内嵌**：DataFrame 显示在结果表页，matplotlib 图显示在图表页（可复制 / 存 PNG）；透视表的行标签和多级列名自动展开
+- **友好报错**：列名写错时给出出错行、相近列名和当前可用列
+- **访问整个工作簿**：代码里可用 `sheets['名字']`、`df_full`（筛选前全表）、`selection`（当前选区）、`selected_columns`
+- **结果回写**：结果可存为新 Sheet、替换当前 Sheet、或追加为当前 Sheet 的新列（都会先确认，都可撤销）
+- **历史记录**：最近 30 次运行和编辑器内容重启后仍在
+- **AI 生成代码**（可选）：用一句话描述分析需求，由 Claude 生成 pandas 代码，或让它修复上次报错。需要 `pip install anthropic` 和 Anthropic API Key（菜单 AI → 设置）；只发送列名、类型和少量样例值，不上传整张表
 
 ### 📈 数据统计
 - **描述性统计**: 一键查看数据的完整统计信息
@@ -501,20 +527,22 @@ python smart_table_quick_analysing_hub_qt.py
 | 基本统计 | ✅ | ✅ |
 | 查找替换 | ✅ | ✅ |
 | 撤销重做 | ✅ (500 步，含结构操作) | ✅ |
-| 完全免费 | ✅ | ❌ |
+| 免费、无需订阅 | ✅ | ❌（桌面版收费；网页版免费但功能受限） |
 | 开源 | ✅ | ❌ |
-| 跨平台 | ✅ | ⚠️ |
+| Linux 支持 | ✅ | ❌ |
 | 单元格公式 | ✅（43 函数） | ✅ |
 | 图表 | ⚠️ 待开发 | ✅ |
 
+> 对比基于 2026 年 9 月的公开信息，可能随时间变化。
+
 ## 未来规划
 
-- [x] 支持Excel公式计算（25+ 常用函数、嵌套、自动重算、`#REF!` 追踪）
+- [x] 兼容 Excel 的公式计算（43 个函数、嵌套、自动重算、`#REF!` 追踪）
 - [x] 筛选时保留公式（筛选期间挂起为静态值，清除筛选后恢复并重算）
 - [ ] 数据可视化（图表）
 - [ ] 条件格式化
 - [ ] 数据透视表
-- [ ] 多工作表支持
+- [x] 多工作表支持（新建、删除，`Ctrl+PgUp` / `Ctrl+PgDn` 切换）
 - [ ] 更多数据处理函数
 - [ ] 主题和样式定制
 
@@ -547,6 +575,10 @@ A: v1.2.0已修复此问题。之前对于多列文件会自动降低显示行�
 ## 许可证
 
 本项目采用 MIT 许可证，可自由使用、修改和分发。
+
+## 商标声明
+
+Microsoft 和 Excel 是微软公司集团的商标。Smart Table Hub 是独立项目，与微软没有任何隶属、背书或赞助关系。文中提及 Excel 仅用于说明文件格式兼容性和功能对照。
 
 ## 贡献
 
