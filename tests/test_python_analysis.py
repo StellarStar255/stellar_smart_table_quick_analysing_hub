@@ -27,7 +27,7 @@ def run_worker(code, df):
     results = []
     worker.done.connect(lambda *args: results.append(args))
     worker.run()  # 直接同步执行，不开线程
-    return results[0]  # (output, result_dfs, sheet_requests, figure_files)
+    return results[0][:4]  # (output, result_dfs, sheet_requests, figure_files)；[4] 是内嵌图表 PNG
 
 
 class TestCodeRunWorker:

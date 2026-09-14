@@ -941,6 +941,13 @@ class PandasTableModel(QAbstractTableModel):
         elif kind == "promote":
             old_df, new_df = args[:-2]
             self._df = (new_df if forward else old_df).copy()
+        elif kind == "add_columns":
+            start, pairs = args[:-2]
+            if forward:
+                for i, (name, values) in enumerate(pairs):
+                    self._do_insert_column(start + i, name, values)
+            else:
+                self._do_remove_columns(list(range(start, start + len(pairs))))
         # 纯行重排不改变任何公式的值（引用随行一起移动），不必重算——
         # 整列填充了公式的表重算一遍要好几秒；其余结构操作照常重算
         self._restore_snapshot(after if forward else before, evaluate=(kind != "reorder"))
@@ -1011,6 +1018,57 @@ class PandasTableModel(QAbstractTableModel):
                 for key, f in self.formulas.items()
             }
         self.evaluate_all_formulas()
+
+    def replace_dataframe(self, new_df: pd.DataFrame):
+        """整表替换（可撤销）：分析结果回写当前 Sheet。
+
+        旧表的公式/背景色随旧表一起进撤销记录；新表不带公式。
+        """
+        before = self._snapshot()
+        old_df = self._df.copy()
+        self._invalidate_values()
+        self.beginResetModel()
+        self._df = new_df.reset_index(drop=True).copy()
+        self.formulas = {}
+        self.cell_colors = {}
+        self._dependents.clear()
+        self._formula_deps.clear()
+        self._formula_ranges.clear()
+        self.endResetModel()
+        self._finish_structure()
+        self._push_undo(("__struct__", "promote", old_df, self._df.copy(),
+                         before, self._snapshot()))
+
+    def append_columns(self, pairs):
+        """在表尾追加若干列（可撤销）。pairs: [(列名, 值序列)]，长度须与行数一致。"""
+        pairs = [(str(n), np.asarray(v, dtype=object) if not isinstance(v, np.ndarray) else v)
+                 for n, v in pairs]
+        if not pairs:
+            return []
+        for name, values in pairs:
+            if len(values) != len(self._df):
+                raise ValueError(
+                    tr("列 {} 有 {} 行，与当前表的 {} 行不一致").format(name, len(values), len(self._df)))
+        before = self._snapshot()
+        start = len(self._df.columns)
+        used = set(map(str, self._df.columns))
+        final = []
+        for name, values in pairs:
+            base, n, cand = name, 1, name
+            while cand in used:
+                cand = f"{base}_{n}"
+                n += 1
+            used.add(cand)
+            final.append((cand, values))
+        self._invalidate_values()
+        self.beginInsertColumns(QModelIndex(), start, start + len(final) - 1)
+        for i, (name, values) in enumerate(final):
+            self._do_insert_column(start + i, name, values)
+        self.endInsertColumns()
+        self._finish_structure()
+        self._push_undo(("__struct__", "add_columns", start, final,
+                         before, self._snapshot()))
+        return [n for n, _ in final]
 
     def promote_row_to_header(self, data_row: int):
         """把指定数据行提升为表头：该行值成为列名，其上方行连同该行移除。

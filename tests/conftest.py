@@ -29,3 +29,14 @@ def isolated_recent_files(tmp_path_factory, monkeypatch):
     from qtui import file_io
     cfg = tmp_path_factory.mktemp("cfg") / "recent_files.json"
     monkeypatch.setattr(file_io, "RECENT_FILES_PATH", str(cfg))
+
+
+@pytest.fixture(autouse=True)
+def isolated_analysis_files(tmp_path_factory, monkeypatch):
+    """Python 分析窗口的预设/历史/上次代码文件全部指到临时目录。"""
+    from qtui import python_analysis
+    d = tmp_path_factory.mktemp("analysis")
+    monkeypatch.setattr(python_analysis, "_CONFIG_DIR", str(d))
+    monkeypatch.setattr(python_analysis, "PRESETS_FILE", str(d / "presets.json"))
+    monkeypatch.setattr(python_analysis, "LAST_CODE_FILE", str(d / "last_code.py"))
+    monkeypatch.setattr(python_analysis, "HISTORY_FILE", str(d / "history.json"))

@@ -206,3 +206,38 @@ class TestReorderSkipsRecalc:
         m.undo()                                # 撤销重排
         assert calls == []                      # 撤销重排同样不重算
         assert m.df['X'].tolist() == [30, 10, 20] and m.df['Y'].tolist() == [60, 21, 60]
+
+
+class TestReplaceAndAppendFromAnalysis:
+    """分析结果回写：整表替换 / 追加列，都可撤销重做。"""
+
+    def test_replace_dataframe_undo_restores_data_and_formulas(self):
+        m = make_model()
+        m.setData(m.index(1, 0), "=SUM(X2:X3)")   # 旧表里放个公式，撤销后要回来
+        original = values(m)
+        new = pd.DataFrame({'A': [1, 2], 'B': ['x', 'y']})
+        m.replace_dataframe(new)
+        assert list(m.df.columns) == ['A', 'B'] and len(m.df) == 2
+        assert m.formulas == {}
+        assert m.undo()
+        assert values(m) == original and list(m.df.columns) == ['X', 'Y', 'N']
+        assert (0, 0) in m.formulas
+        assert m.redo()
+        assert list(m.df.columns) == ['A', 'B']
+
+    def test_append_columns_dedupes_names_and_undoes(self):
+        m = make_model()
+        names = m.append_columns([('X', [7, 8, 9]), ('Z', ['p', 'q', 'r'])])
+        assert names == ['X_1', 'Z']
+        assert list(m.df.columns) == ['X', 'Y', 'N', 'X_1', 'Z']
+        assert list(m.df['Z']) == ['p', 'q', 'r']
+        assert m.undo()
+        assert list(m.df.columns) == ['X', 'Y', 'N']
+        assert m.redo()
+        assert list(m.df.columns) == ['X', 'Y', 'N', 'X_1', 'Z']
+
+    def test_append_columns_rejects_wrong_length(self):
+        m = make_model()
+        with pytest.raises(ValueError):
+            m.append_columns([('Z', [1, 2])])
+        assert list(m.df.columns) == ['X', 'Y', 'N']

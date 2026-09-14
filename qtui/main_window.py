@@ -1372,6 +1372,56 @@ class MainWindow(QMainWindow):
         self._mark_modified()
         self.update_statusbar(tr("已添加 Sheet: {}（保存文件后写入文件）").format(name))
 
+    # ---- 供 Python 分析窗口调用的数据接口 ----
+
+    def get_sheet_df(self, name):
+        """按名取某个 sheet 的完整数据副本（当前 sheet 取筛选前的全表）。
+
+        未缓存的 sheet 直接从文件读，不写缓存（可能在分析工作线程里被调用）。
+        """
+        if name == self.current_sheet or (not self.sheet_names and name in (None, "")):
+            full = self.original_df if self.original_df is not None else self.model.df
+            return full.copy()
+        if name in self._sheet_cache:
+            return self._sheet_cache[name].copy()
+        if self._excel_file is not None and name in self._excel_file.sheet_names:
+            return file_io.read_sheet(self._excel_file, name)
+        raise KeyError(name)
+
+    def selection_frame(self):
+        """当前选区的数据块 (DataFrame, 选中列名列表)；没有选中数据格时为 (None, [])。"""
+        sm = self.table.selectionModel()
+        if sm is None:
+            return None, []
+        indexes = sm.selectedIndexes()
+        df = self.model.df
+        cols = sorted({i.column() for i in indexes if i.column() < len(df.columns)})
+        rows = sorted({i.row() - HEADER_ROWS for i in indexes
+                       if i.row() >= HEADER_ROWS and i.row() - HEADER_ROWS < len(df)})
+        names = [str(df.columns[c]) for c in cols]
+        if not rows or not cols:
+            return None, names
+        return df.iloc[rows, cols].copy(), names
+
+    def replace_current_sheet_df(self, df):
+        """分析结果整表回写当前 sheet（可撤销）。筛选中不允许，避免把视图当全表。"""
+        if self.active_filters:
+            raise RuntimeError(tr("筛选状态下不支持此操作，请先清除筛选"))
+        self.model.replace_dataframe(df)
+        self._after_structure_change()
+        self.update_statusbar(tr("已用分析结果替换当前 Sheet（可撤销）"))
+
+    def append_columns_to_current(self, df):
+        """把结果的各列追加到当前 sheet 末尾（按行位置对齐，可撤销）。"""
+        if self.active_filters:
+            raise RuntimeError(tr("筛选状态下不支持此操作，请先清除筛选"))
+        pairs = [(str(c), df[c].to_numpy(copy=True)) for c in df.columns]
+        names = self.model.append_columns(pairs)
+        self._after_structure_change()
+        self.update_statusbar(tr("已追加 {} 列: {}").format(
+            len(names), ", ".join(names[:5]) + ("..." if len(names) > 5 else "")))
+        return names
+
     def _build_statusbar(self):
         self.statusBar().showMessage(tr("就绪"))
 

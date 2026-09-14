@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Python 数据分析窗口 - 对应 Tkinter 版 ui/python_analysis.py 的核心功能：
-代码编辑器（语法高亮）、预设片段、后台运行代码、结果 DataFrame 预览/保存为 Sheet。
-不包含 AI 代码生成与语音输入。
+Python 数据分析窗口：
+代码编辑器（语法高亮、列名补全）、带参数表单的预设片段、后台运行代码、
+结果 DataFrame / 图表内嵌展示、保存为 Sheet。
 """
 
 import builtins
@@ -19,21 +19,39 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRegularExpression, QRect, QSize
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QRegularExpression, QRect, QSize, QTimer,
+    QStringListModel,
+)
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QKeySequence, QSyntaxHighlighter,
     QTextCharFormat, QFontDatabase, QPainter, QPalette, QTextFormat,
+    QTextCursor, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QPushButton, QPlainTextEdit, QSplitter, QToolBar, QMessageBox,
     QInputDialog, QDialog, QTableView, QDialogButtonBox, QTextEdit,
+    QTabWidget, QScrollArea, QFormLayout, QLineEdit, QCheckBox, QCompleter,
+    QMenu, QToolButton, QFileDialog, QGroupBox, QListWidget, QListWidgetItem,
+    QApplication, QSizePolicy,
 )
 
 from .pandas_model import PandasTableModel
+from . import analysis_params
+from .analysis_params import (
+    KIND_COLUMN, KIND_COLUMNS, KIND_NUMBER, KIND_BOOL, KIND_TEXT,
+)
 from qtui.i18n import tr
 
-PRESETS_FILE = os.path.join(os.path.expanduser("~"), ".smart_table_hub", "qt_python_presets.json")
+_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".smart_table_hub")
+PRESETS_FILE = os.path.join(_CONFIG_DIR, "qt_python_presets.json")
+LAST_CODE_FILE = os.path.join(_CONFIG_DIR, "qt_python_last_code.py")   # 关窗时的编辑器内容
+HISTORY_FILE = os.path.join(_CONFIG_DIR, "qt_python_history.json")    # 最近运行过的代码
+HISTORY_LIMIT = 30
+
+# 带菜单的工具栏按钮：Qt 默认把下拉小箭头画在文字上，改成文字自带 ▾
+_MENU_BTN_STYLE = "QToolButton::menu-indicator { image: none; width: 0px; }"
 
 # 默认预设版本：新增默认预设时 +1，老用户的预设文件会做一次性合并
 # （用户同名预设优先；只补比文件版本更新的批次，删除过的旧默认预设不会复活）
@@ -403,7 +421,10 @@ class _LineNumberArea(QWidget):
 
 
 class CodeEditor(QPlainTextEdit):
-    """带行号栏、当前行高亮、自动缩进的代码编辑器；Tab 插入 4 空格。"""
+    """带行号栏、当前行高亮、自动缩进的代码编辑器；Tab 插入 4 空格。
+
+    在字符串字面量里打字时弹出列名补全（Ctrl+Space 可强制弹出）。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -413,6 +434,91 @@ class CodeEditor(QPlainTextEdit):
         self.cursorPositionChanged.connect(self._highlight_current_line)
         self._update_margin()
         self._highlight_current_line()
+
+        self._completion_model = QStringListModel(self)
+        self._completer = QCompleter(self._completion_model, self)
+        self._completer.setWidget(self)
+        self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._completer.activated.connect(self._insert_completion)
+
+    # ---- 列名补全 ----
+
+    def set_completion_words(self, words):
+        self._completion_model.setStringList([str(w) for w in words])
+
+    def string_prefix(self):
+        """光标若在未闭合的字符串里，返回 (引号, 引号后到光标的文本)；否则 None。"""
+        cursor = self.textCursor()
+        text = cursor.block().text()[:cursor.positionInBlock()]
+        quote, start = None, -1
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == "\\":
+                    i += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote, start = ch, i
+            elif ch == "#":
+                return None
+            i += 1
+        if quote is None:
+            return None
+        return quote, text[start + 1:]
+
+    def _maybe_complete(self, force=False):
+        popup = self._completer.popup()
+        if self._completion_model.rowCount() == 0:
+            popup.hide()
+            return
+        ctx = self.string_prefix()
+        if ctx is None or (not force and not ctx[1]):
+            popup.hide()
+            return
+        prefix = ctx[1]
+        self._completer.setCompletionPrefix(prefix)
+        count = self._completer.completionCount()
+        if count == 0 or (count == 1 and self._completer.currentCompletion() == prefix):
+            popup.hide()
+            return
+        popup.setCurrentIndex(self._completer.completionModel().index(0, 0))
+        rect = self.cursorRect()
+        rect.setWidth(max(220, popup.sizeHintForColumn(0)
+                          + popup.verticalScrollBar().sizeHint().width() + 8))
+        self._completer.complete(rect)
+
+    def _insert_completion(self, text):
+        ctx = self.string_prefix()
+        if ctx is None:
+            return
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Left,
+                            QTextCursor.MoveMode.KeepAnchor, len(ctx[1]))
+        cursor.insertText(text)
+        self.setTextCursor(cursor)
+
+    def insert_column_name(self, name):
+        """在光标处插入列名：已在字符串里就只插名字，否则连引号一起插。"""
+        ctx = self.string_prefix()
+        if ctx is not None:
+            self.insertPlainText(name)
+        else:
+            quote = '"' if "'" in name else "'"
+            self.insertPlainText(f"{quote}{name}{quote}")
+        self.setFocus()
+
+    def replace_line(self, line_no, text):
+        """只替换某一行的文本（不重置光标/撤销栈）。"""
+        block = self.document().findBlockByNumber(line_no)
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+        cursor.insertText(text)
 
     # ---- 行号栏 ----
 
@@ -474,10 +580,20 @@ class CodeEditor(QPlainTextEdit):
     # ---- 编辑行为 ----
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Tab and not event.modifiers():
+        key = event.key()
+        if self._completer.popup().isVisible() and key in (
+                Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape,
+                Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            event.ignore()   # 交给补全弹层处理
+            return
+        if key == Qt.Key.Key_Space and \
+                event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._maybe_complete(force=True)
+            return
+        if key == Qt.Key.Key_Tab and not event.modifiers():
             self.insertPlainText("    ")
             return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
                 and not event.modifiers():
             # 自动缩进：继承上一行缩进；行尾是冒号再加一级
             cursor = self.textCursor()
@@ -490,6 +606,9 @@ class CodeEditor(QPlainTextEdit):
                 self.insertPlainText(indent)
             return
         super().keyPressEvent(event)
+        # 只在打字（有可见字符或退格）时刷新补全，方向键等不动它
+        if event.text() or key == Qt.Key.Key_Backspace:
+            self._maybe_complete()
 
 
 # ---------------------------------------------------------------------------
@@ -553,13 +672,15 @@ class _StreamRouter:
 class CodeRunWorker(QThread):
     """在后台线程执行用户代码，结果通过信号回传主线程。"""
 
-    done = pyqtSignal(str, dict, list, list)  # 输出文本, DataFrame变量, sheet保存请求, 图片保存记录
+    # 输出文本, DataFrame变量, sheet保存请求, 图片保存记录, 图表 PNG [(标题, bytes)]
+    done = pyqtSignal(str, dict, list, list, list)
 
-    def __init__(self, code, df, current_file, parent=None):
+    def __init__(self, code, df, current_file, parent=None, extra=None):
         super().__init__(parent)
         self._code = code
         self._df = df
         self._current_file = current_file
+        self._extra = dict(extra or {})   # 额外注入命名空间的变量（sheets、selection 等）
         self._cancel = threading.Event()
 
     def cancel(self):
@@ -576,12 +697,14 @@ class CodeRunWorker(QThread):
         buf = io.StringIO()
         sheet_requests = []   # [(DataFrame, sheet_name)]
         figure_files = []
+        figure_images = []    # [(标题, PNG bytes)]，窗口内嵌展示
         result_dfs = {}
 
-        # 强制 matplotlib 使用 Agg，避免后台线程弹 GUI
+        # 强制 matplotlib 使用 Agg，避免后台线程弹 GUI；顺带配好中文字体
         try:
             import matplotlib
             matplotlib.use("Agg", force=True)
+            _configure_matplotlib_fonts(matplotlib)
         except Exception:
             pass
 
@@ -604,8 +727,15 @@ class CodeRunWorker(QThread):
                 filename = os.path.join(base_dir, filename)
             fig.savefig(filename, dpi=150, bbox_inches="tight")
             figure_files.append(filename)
+            figure_images.append((os.path.basename(filename), _fig_to_png(fig)))
             print(tr("✓ 图表已保存: {}").format(filename))
             # 保存即关闭，避免每次运行都在 pyplot 里累积图形（内存持续增长）
+            _close_figure(fig)
+
+        def show_figure(fig, title=None):
+            """只在窗口里显示，不落盘。"""
+            figure_images.append((str(title or tr("图 {}").format(len(figure_images) + 1)),
+                                  _fig_to_png(fig)))
             _close_figure(fig)
 
         def _exit(code=None):
@@ -617,10 +747,12 @@ class CodeRunWorker(QThread):
             "np": np,
             "save_as_sheet": save_as_sheet,
             "save_figure": save_figure,
+            "show_figure": show_figure,
             "exit": _exit,
             "quit": _exit,
             "__builtins__": builtins,
         }
+        namespace.update(self._extra)
 
         restore_out = _StreamRouter.capture("stdout", buf)
         restore_err = _StreamRouter.capture("stderr", buf)
@@ -636,23 +768,132 @@ class CodeRunWorker(QThread):
             code = e.code
             suffix = "" if code in (None, 0) else tr("（退出码 {}）").format(code)
             buf.write("\n" + tr("[执行结束] 代码调用了 exit()/sys.exit()") + suffix + "\n")
-        except BaseException:
+        except BaseException as e:
             buf.write("\n" + tr("[执行错误]") + "\n")
             buf.write(traceback.format_exc())
+            where = _user_code_location(e, self._code)
+            if where:
+                buf.write("\n" + where + "\n")
+            try:
+                hint = analysis_params.column_hint(e, list(self._df.columns), tr)
+            except Exception:
+                hint = None
+            if hint:
+                buf.write("\n💡 " + hint + "\n")
         finally:
             sys.settrace(None)
             restore_out()
             restore_err()
+            # 用户直接 df.plot() 没调 save_figure 的图也抓下来显示
+            figure_images.extend(_capture_open_figures(len(figure_images)))
             _close_all_figures()
 
         # 扫描命名空间中的 DataFrame 变量
         for name, value in namespace.items():
-            if name.startswith("__"):
+            if name.startswith("__") or name in self._extra:
                 continue
             if isinstance(value, pd.DataFrame):
                 result_dfs[name] = value
 
-        self.done.emit(buf.getvalue(), result_dfs, sheet_requests, figure_files)
+        self.done.emit(buf.getvalue(), result_dfs, sheet_requests,
+                       figure_files, figure_images)
+
+
+def _user_code_location(exc, code):
+    """从异常回溯里找到用户代码（exec 的 <string>）最后一帧，给出行号和那行内容。"""
+    try:
+        frames = [f for f in traceback.extract_tb(exc.__traceback__)
+                  if f.filename == "<string>"]
+    except Exception:
+        return None
+    if not frames:
+        return None
+    lineno = frames[-1].lineno
+    lines = code.split("\n")
+    text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ""
+    return tr("⚠ 出错位置：你的代码第 {} 行：{}").format(lineno, text)
+
+
+def flatten_frame(rdf):
+    """把分析结果整理成能放进表格/Sheet 的二维表。
+
+    透视表、groupby 的结果把分组值放在索引里，直接显示会丢掉行标签；
+    多级列名（agg 多个函数）也压成一层，用 "_" 连接。原对象不改。
+    """
+    out = rdf
+    if isinstance(out.columns, pd.MultiIndex):
+        out = out.copy()
+        out.columns = ["_".join(str(x) for x in tup if str(x) != "")
+                       for tup in out.columns.to_flat_index()]
+    idx = out.index
+    default_index = (isinstance(idx, pd.RangeIndex) and idx.start == 0
+                     and idx.step == 1 and idx.name is None)
+    if not default_index:
+        try:
+            out = out.reset_index()
+        except ValueError:
+            # 索引名和列名撞了：先改成不撞的名字
+            out = out.copy()
+            names = [n if n is not None else f"index{i}" for i, n in enumerate(out.index.names)]
+            names = [f"{n}_index" if n in out.columns else n for n in names]
+            out.index = out.index.set_names(names)
+            out = out.reset_index()
+    return out if out is not rdf else out.copy()
+
+
+_FONTS_CONFIGURED = False
+# 各平台常见的中文字体，按优先级；找不到就维持默认（只影响图里的中文显示）
+_CJK_FONT_CANDIDATES = [
+    "PingFang SC", "Hiragino Sans GB", "Heiti SC", "STHeiti", "Arial Unicode MS",   # macOS
+    "Microsoft YaHei", "SimHei", "SimSun",                                          # Windows
+    "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Micro Hei",  # Linux
+]
+
+
+def _configure_matplotlib_fonts(matplotlib):
+    """让图表里的中文不再显示成方块；只做一次。"""
+    global _FONTS_CONFIGURED
+    if _FONTS_CONFIGURED:
+        return
+    _FONTS_CONFIGURED = True
+    try:
+        from matplotlib import font_manager
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        chosen = [f for f in _CJK_FONT_CANDIDATES if f in available]
+        if chosen:
+            matplotlib.rcParams["font.sans-serif"] = chosen + list(
+                matplotlib.rcParams.get("font.sans-serif", []))
+            matplotlib.rcParams["font.family"] = "sans-serif"
+        matplotlib.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        pass
+
+
+def _fig_to_png(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    return buf.getvalue()
+
+
+def _capture_open_figures(start_index=0):
+    """把 pyplot 里仍打开的图渲染成 PNG（用户没显式调用 save_figure 的情况）。"""
+    plt = sys.modules.get("matplotlib.pyplot")
+    images = []
+    if plt is None:
+        return images
+    try:
+        nums = list(plt.get_fignums())
+    except Exception:
+        return images
+    for i, num in enumerate(nums):
+        try:
+            fig = plt.figure(num)
+            if not fig.get_axes():
+                continue
+            images.append((tr("图 {}").format(start_index + i + 1), _fig_to_png(fig)))
+        except Exception:
+            continue
+    return images
 
 
 def _close_figure(fig):
@@ -674,25 +915,389 @@ def _close_all_figures():
 
 
 # ---------------------------------------------------------------------------
+# 参数表单：预设开头的参数块渲染成控件，改控件即改代码
+# ---------------------------------------------------------------------------
+
+# 预设下拉按类别分组；不在这里的默认预设归入"其他"，用户自定义归入"我的预设"
+PRESET_CATEGORIES = [
+    ("概览与检查", ["数据概览", "描述统计", "数据类型", "缺失值统计",
+                   "重复值检查", "异常值检测"]),
+    ("清洗与加工", ["去重", "缺失值清洗", "文本清洗", "日期处理",
+                   "新增计算列", "条件筛选导出"]),
+    ("统计分析", ["频次统计", "分组聚合", "透视表", "TopN 排序", "相关性矩阵"]),
+    ("图表", ["直方图", "条形图", "散点图", "箱线图"]),
+]
+
+
+class _ColumnsPicker(QWidget):
+    """列名列表参数：文本框（逗号分隔，留空为 None）+ 勾选对话框。"""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._columns = []
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(tr("留空 = None；多个列名用逗号分隔"))
+        self.edit.editingFinished.connect(self.changed)
+        lay.addWidget(self.edit, 1)
+        btn = QPushButton(tr("选择…"))
+        btn.clicked.connect(self._pick)
+        lay.addWidget(btn)
+
+    def set_columns(self, columns):
+        self._columns = list(columns)
+
+    def value(self):
+        text = self.edit.text().strip()
+        if not text:
+            return None
+        return [c.strip() for c in text.split(",") if c.strip()]
+
+    def set_value(self, value):
+        self.edit.setText(", ".join(map(str, value)) if isinstance(value, (list, tuple)) else "")
+
+    def _pick(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("选择列"))
+        lay = QVBoxLayout(dlg)
+        lst = QListWidget()
+        chosen = set(self.value() or [])
+        for c in self._columns:
+            item = QListWidgetItem(c)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if c in chosen else Qt.CheckState.Unchecked)
+            lst.addItem(item)
+        lay.addWidget(lst)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        dlg.resize(320, 400)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        picked = [lst.item(i).text() for i in range(lst.count())
+                  if lst.item(i).checkState() == Qt.CheckState.Checked]
+        self.set_value(picked)
+        self.changed.emit()
+
+
+class ParamPanel(QWidget):
+    """参数块表单。列名参数下拉选列；数字/文本直接输入；布尔为勾选框。"""
+
+    value_changed = pyqtSignal(str, object)   # (参数名, 新值)
+
+    _BAD_STYLE = "QLineEdit { color: #c0392b; }"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._columns = []
+        self._params = []
+        self._widgets = {}      # name -> (kind, widget)
+        self._loading = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._box = QGroupBox(tr("参数（改这里即改代码）"))
+        self._form = QFormLayout(self._box)
+        self._form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self._form.setContentsMargins(8, 4, 8, 6)
+        self._form.setVerticalSpacing(4)
+        outer.addWidget(self._box)
+        self.hide()
+
+    # ---- 对外 ----
+
+    def set_columns(self, columns):
+        self._columns = [str(c) for c in columns]
+        self._loading = True
+        try:
+            for _name, (kind, w) in self._widgets.items():
+                if kind == KIND_COLUMN:
+                    self._fill_column_combo(w, w.currentText())
+                elif kind == KIND_COLUMNS:
+                    w.set_columns(self._columns)
+        finally:
+            self._loading = False
+
+    def load(self, code):
+        """按代码重建/刷新表单；返回是否有参数。"""
+        params = analysis_params.parse_params(code)
+        signature = [(p.name, p.kind) for p in params]
+        self._loading = True
+        try:
+            if signature != [(p.name, p.kind) for p in self._params]:
+                self._rebuild(params)
+            else:
+                for p in params:
+                    self._set_widget_value(p)
+        finally:
+            self._loading = False
+        self._params = params
+        self.setVisible(bool(params))
+        return bool(params)
+
+    def params(self):
+        return list(self._params)
+
+    def widget_for(self, name):
+        return self._widgets.get(name, (None, None))[1]
+
+    # ---- 内部 ----
+
+    def _rebuild(self, params):
+        while self._form.rowCount():
+            self._form.removeRow(0)
+        self._widgets = {}
+        for p in params:
+            w = self._make_widget(p)
+            self._widgets[p.name] = (p.kind, w)
+            label = QLabel(p.comment or p.name)
+            label.setToolTip(p.name)
+            w.setToolTip(p.name)
+            self._form.addRow(label, w)
+            self._set_widget_value(p)
+
+    def _fill_column_combo(self, combo, current):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(self._columns)
+        combo.setCurrentText(current)
+        combo.blockSignals(False)
+        self._mark_column_combo(combo)
+
+    def _mark_column_combo(self, combo):
+        # 值不在当前列里（多半还是占位符）→ 标红提醒
+        ok = combo.currentText() in self._columns or not self._columns
+        combo.lineEdit().setStyleSheet("" if ok else self._BAD_STYLE)
+
+    def _make_widget(self, p):
+        if p.kind == KIND_COLUMN:
+            w = QComboBox()
+            w.setEditable(True)
+            w.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._fill_column_combo(w, str(p.value))
+            w.currentTextChanged.connect(
+                lambda text, n=p.name, c=w: self._emit_column(n, c, text))
+            return w
+        if p.kind == KIND_COLUMNS:
+            w = _ColumnsPicker()
+            w.set_columns(self._columns)
+            w.changed.connect(lambda n=p.name, c=w: self._emit(n, c.value()))
+            return w
+        if p.kind == KIND_BOOL:
+            w = QCheckBox()
+            w.toggled.connect(lambda v, n=p.name: self._emit(n, bool(v)))
+            return w
+        w = QLineEdit()
+        if p.kind == KIND_NUMBER:
+            w.editingFinished.connect(lambda n=p.name, c=w: self._emit_number(n, c))
+        elif p.kind == KIND_TEXT:
+            w.editingFinished.connect(lambda n=p.name, c=w: self._emit(n, c.text()))
+        else:
+            w.editingFinished.connect(lambda n=p.name, c=w: self._emit_literal(n, c))
+        return w
+
+    def _set_widget_value(self, p):
+        kind, w = self._widgets.get(p.name, (None, None))
+        if w is None:
+            return
+        w.blockSignals(True)
+        try:
+            if kind == KIND_COLUMN:
+                w.setCurrentText(str(p.value))
+                self._mark_column_combo(w)
+            elif kind == KIND_COLUMNS:
+                w.set_value(p.value)
+            elif kind == KIND_BOOL:
+                w.setChecked(bool(p.value))
+            elif kind == KIND_TEXT:
+                w.setText(str(p.value))
+            else:
+                w.setText(repr(p.value))
+        finally:
+            w.blockSignals(False)
+
+    def _emit(self, name, value):
+        if not self._loading:
+            self.value_changed.emit(name, value)
+
+    def _emit_column(self, name, combo, text):
+        self._mark_column_combo(combo)
+        self._emit(name, text)
+
+    def _emit_number(self, name, edit):
+        text = edit.text().strip()
+        try:
+            value = int(text) if analysis_params.re.fullmatch(r"[+-]?\d+", text) else float(text)
+        except ValueError:
+            edit.setStyleSheet(self._BAD_STYLE)
+            return
+        edit.setStyleSheet("")
+        self._emit(name, value)
+
+    def _emit_literal(self, name, edit):
+        try:
+            value = analysis_params.ast.literal_eval(edit.text().strip())
+        except (ValueError, SyntaxError):
+            edit.setStyleSheet(self._BAD_STYLE)
+            return
+        edit.setStyleSheet("")
+        self._emit(name, value)
+
+
+# ---------------------------------------------------------------------------
+# 图表画廊：运行产生的图直接显示在窗口里
+# ---------------------------------------------------------------------------
+
+class _SheetAccessor:
+    """用户代码里的 sheets 对象：sheets['名字'] 按需读取某个 sheet 的完整数据。"""
+
+    def __init__(self, host, names):
+        self._host = host
+        self._names = list(names)
+
+    def keys(self):
+        return list(self._names)
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self):
+        return len(self._names)
+
+    def __contains__(self, name):
+        return name in self._names
+
+    def __getitem__(self, name):
+        if isinstance(name, int):
+            name = self._names[name]
+        getter = getattr(self._host, "get_sheet_df", None)
+        if getter is None:
+            raise KeyError(name)
+        try:
+            return getter(name)
+        except KeyError:
+            raise KeyError(tr("没有名为 {} 的 Sheet，可用: {}").format(
+                repr(name), ", ".join(repr(n) for n in self._names))) from None
+
+    def get(self, name, default=None):
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+    def __repr__(self):
+        return f"sheets{self._names!r}"
+
+
+class FigureGallery(QScrollArea):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self._container = QWidget()
+        self._layout = QVBoxLayout(self._container)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.setWidget(self._container)
+        self._images = []
+        self._empty = QLabel(tr("运行画图代码后，图表会显示在这里。\n"
+                                "预设里的 save_figure(fig, '文件名.png') 会同时保存文件；"
+                                "只想看不想存用 show_figure(fig)。"))
+        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty.setStyleSheet("color: gray;")
+        self._layout.addWidget(self._empty)
+
+    def clear(self):
+        self._images = []
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            w = item.widget()
+            if w is not None and w is not self._empty:
+                w.deleteLater()
+        self._layout.addWidget(self._empty)
+        self._empty.show()
+
+    def set_images(self, images):
+        self.clear()
+        self._images = list(images)
+        if not images:
+            return
+        self._empty.hide()
+        for title, png in images:
+            self._layout.addWidget(self._make_card(title, png))
+
+    def count(self):
+        return len(self._images)
+
+    def _make_card(self, title, png):
+        card = QWidget()
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(4, 4, 4, 12)
+        head = QHBoxLayout()
+        head.addWidget(QLabel(f"<b>{title}</b>"))
+        head.addStretch(1)
+        copy_btn = QPushButton(tr("复制"))
+        copy_btn.clicked.connect(lambda: self._copy(png))
+        head.addWidget(copy_btn)
+        save_btn = QPushButton(tr("保存图片…"))
+        save_btn.clicked.connect(lambda: self._save(title, png))
+        head.addWidget(save_btn)
+        lay.addLayout(head)
+        pix = QPixmap()
+        pix.loadFromData(png, "PNG")
+        img = QLabel()
+        img.setPixmap(pix)
+        img.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(img)
+        return card
+
+    def _copy(self, png):
+        pix = QPixmap()
+        pix.loadFromData(png, "PNG")
+        QApplication.clipboard().setPixmap(pix)
+
+    def _save(self, title, png):
+        name = title if title.lower().endswith(".png") else f"{title}.png"
+        path, _ = QFileDialog.getSaveFileName(self, tr("保存图片"), name, "PNG (*.png)")
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(png)
+        except OSError as e:
+            QMessageBox.critical(self, tr("错误"), tr("保存图片失败:\n{}").format(e))
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
 class PythonAnalysisWindow(QMainWindow):
     """Python 数据分析窗口（非模态）。host 为主窗口，提供 model.df 等接口。"""
 
+    TAB_OUTPUT, TAB_RESULT, TAB_FIGURES = 0, 1, 2
+
     def __init__(self, host, parent=None):
         super().__init__(parent)
         self.host = host
         self._worker = None
         self._result_dfs = {}
+        self._clean_code = ""      # 最近一次"应用预设/表单改参数"后的代码，用来判断编辑器是否被手改
 
         self.setWindowTitle(tr("Python 数据分析"))
-        self.resize(1000, 700)
+        self.resize(1100, 760)
 
         self.presets = self._load_presets()
 
         self._build_ui()
         self._update_preset_combo()
+        self.refresh_columns()
+        self._history = self._load_history()
+        self._restore_last_code()
 
     # ---------------- UI ----------------
 
@@ -703,7 +1308,8 @@ class PythonAnalysisWindow(QMainWindow):
 
         toolbar.addWidget(QLabel(tr(" 预设: ")))
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(180)
+        self.preset_combo.setMinimumWidth(200)
+        self.preset_combo.setPlaceholderText(tr("选择预设…"))
         # 选中即自动应用（编辑器有未保存的自定义内容时不覆盖）
         self.preset_combo.currentTextChanged.connect(self._on_preset_selected)
         toolbar.addWidget(self.preset_combo)
@@ -726,6 +1332,42 @@ class PythonAnalysisWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        # 插入列名：菜单列出当前表的列，点一下就插到光标处
+        self.insert_col_btn = QToolButton()
+        self.insert_col_btn.setText(tr("插入列名") + " ▾")
+        self.insert_col_btn.setStyleSheet(_MENU_BTN_STYLE)
+        self.insert_col_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._col_menu = QMenu(self.insert_col_btn)
+        self._col_menu.aboutToShow.connect(self._fill_column_menu)
+        self.insert_col_btn.setMenu(self._col_menu)
+        toolbar.addWidget(self.insert_col_btn)
+
+        # 历史：最近运行过的代码
+        self.history_btn = QToolButton()
+        self.history_btn.setText(tr("历史") + " ▾")
+        self.history_btn.setStyleSheet(_MENU_BTN_STYLE)
+        self.history_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._history_menu = QMenu(self.history_btn)
+        self._history_menu.aboutToShow.connect(self._fill_history_menu)
+        self.history_btn.setMenu(self._history_menu)
+        toolbar.addWidget(self.history_btn)
+
+        # AI：自然语言生成代码 / 修复报错 / 设置
+        self.ai_btn = QToolButton()
+        self.ai_btn.setText(tr("AI") + " ▾")
+        self.ai_btn.setStyleSheet(_MENU_BTN_STYLE)
+        self.ai_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        ai_menu = QMenu(self.ai_btn)
+        ai_menu.addAction(tr("生成代码…"), lambda: self._ai_generate(fix=False))
+        self.ai_fix_action = ai_menu.addAction(tr("修复上次报错…"), lambda: self._ai_generate(fix=True))
+        self.ai_fix_action.setEnabled(False)
+        ai_menu.addSeparator()
+        ai_menu.addAction(tr("AI 设置…"), self._ai_settings)
+        self.ai_btn.setMenu(ai_menu)
+        toolbar.addWidget(self.ai_btn)
+
+        toolbar.addSeparator()
+
         self.run_action = QAction(tr("▶ 运行"), self)
         # F5 与 Cmd/Ctrl+Enter 都能运行（后者是笔记本用户的肌肉记忆）
         self.run_action.setShortcuts([
@@ -741,10 +1383,10 @@ class PythonAnalysisWindow(QMainWindow):
         toolbar.addAction(self.stop_action)
 
         clear_action = QAction(tr("清空输出"), self)
-        clear_action.triggered.connect(lambda: self.output_edit.clear())
+        clear_action.triggered.connect(self._clear_outputs)
         toolbar.addAction(clear_action)
 
-        # 主区域：上代码编辑器、下输出
+        # 主区域：上 = 参数表单 + 代码编辑器；下 = 输出 / 结果表 / 图表 三个标签页
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -756,42 +1398,135 @@ class PythonAnalysisWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(splitter, 1)
 
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.setSpacing(4)
+
+        self.param_panel = ParamPanel()
+        self.param_panel.value_changed.connect(self._on_param_changed)
+        top_lay.addWidget(self.param_panel)
+
         self.code_edit = CodeEditor()
         self.code_edit.setFont(mono)
         self.code_edit.setPlaceholderText(tr(
-            "# 可用变量: df (当前数据副本), pd, np\n"
-            "# 可用函数: save_as_sheet(df, '名称'), save_figure(fig, '文件名.png')"
+            "# 可用变量: df (当前数据副本), df_full (筛选前全表), selection (当前选区),\n"
+            "#          sheets['名字'] (其他 Sheet), sheet_names, selected_columns, pd, np\n"
+            "# 可用函数: save_as_sheet(df, '名称'), save_figure(fig, '文件名.png'), show_figure(fig)\n"
+            "# 在引号里打字可补全列名（Ctrl+Space 强制弹出）"
         ))
         self._highlighter = PythonHighlighter(self.code_edit.document())
-        splitter.addWidget(self.code_edit)
+        # 手改代码后延迟刷新表单（避免每敲一个字就重解析）
+        self._param_sync_timer = QTimer(self)
+        self._param_sync_timer.setSingleShot(True)
+        self._param_sync_timer.setInterval(250)
+        self._param_sync_timer.timeout.connect(self._sync_params_from_code)
+        self.code_edit.textChanged.connect(self._param_sync_timer.start)
+        top_lay.addWidget(self.code_edit, 1)
+        splitter.addWidget(top)
 
+        self.tabs = QTabWidget()
+        splitter.addWidget(self.tabs)
+
+        # 输出
         self.output_edit = QPlainTextEdit()
         self.output_edit.setReadOnly(True)
         self.output_edit.setFont(mono)
         self.output_edit.setPlaceholderText(tr(
             "运行结果显示在这里（print 输出与错误信息）。\n"
-            "运行后代码里的 DataFrame 变量会出现在下方下拉框，可预览或保存为 Sheet。"))
-        splitter.addWidget(self.output_edit)
+            "运行后代码里的 DataFrame 变量会出现在「结果表」页，图表出现在「图表」页。"))
+        self.tabs.addTab(self.output_edit, tr("输出"))
 
-        splitter.setSizes([420, 220])
-
-        # 结果 DataFrame 行
+        # 结果表
+        result_page = QWidget()
+        result_lay = QVBoxLayout(result_page)
+        result_lay.setContentsMargins(0, 4, 0, 0)
         result_row = QHBoxLayout()
         result_row.addWidget(QLabel(tr("结果 DataFrame:")))
         self.result_combo = QComboBox()
-        self.result_combo.setMinimumWidth(160)
+        self.result_combo.setMinimumWidth(200)
+        self.result_combo.currentIndexChanged.connect(self._show_selected_result)
         result_row.addWidget(self.result_combo)
-
-        preview_btn = QPushButton(tr("预览"))
-        preview_btn.clicked.connect(self._preview_result)
-        result_row.addWidget(preview_btn)
-
         save_sheet_btn = QPushButton(tr("保存为Sheet"))
         save_sheet_btn.clicked.connect(self._save_result_as_sheet)
         result_row.addWidget(save_sheet_btn)
-
+        replace_btn = QPushButton(tr("替换当前Sheet"))
+        replace_btn.setToolTip(tr("用这个结果整表替换当前 Sheet（会先确认，可撤销）"))
+        replace_btn.clicked.connect(self._replace_current_sheet)
+        result_row.addWidget(replace_btn)
+        append_btn = QPushButton(tr("追加为新列"))
+        append_btn.setToolTip(tr("把结果的各列按行位置追加到当前 Sheet 末尾（会先确认，可撤销）"))
+        append_btn.clicked.connect(self._append_result_columns)
+        result_row.addWidget(append_btn)
         result_row.addStretch(1)
-        layout.addLayout(result_row)
+        result_lay.addLayout(result_row)
+        self.result_view = QTableView()
+        self.result_view.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
+        self.result_view.setAlternatingRowColors(True)
+        result_lay.addWidget(self.result_view, 1)
+        self.tabs.addTab(result_page, tr("结果表"))
+
+        # 图表
+        self.figure_gallery = FigureGallery()
+        self.tabs.addTab(self.figure_gallery, tr("图表"))
+
+        splitter.setSizes([440, 300])
+
+    # ---------------- 列名（补全 / 表单 / 插入菜单） ----------------
+
+    def host_columns(self):
+        df = getattr(getattr(self.host, "model", None), "df", None)
+        if isinstance(df, pd.DataFrame):
+            return [str(c) for c in df.columns]
+        return []
+
+    def refresh_columns(self):
+        cols = self.host_columns()
+        self.code_edit.set_completion_words(cols)
+        self.param_panel.set_columns(cols)
+
+    def _fill_column_menu(self):
+        self._col_menu.clear()
+        cols = self.host_columns()
+        if not cols:
+            self._col_menu.addAction(tr("（当前没有数据）")).setEnabled(False)
+            return
+        limit = 60
+        for c in cols[:limit]:
+            self._col_menu.addAction(c, lambda name=c: self.code_edit.insert_column_name(name))
+        if len(cols) > limit:
+            self._col_menu.addAction(
+                tr("…还有 {} 列，请在引号里打字补全").format(len(cols) - limit)).setEnabled(False)
+
+    def changeEvent(self, event):
+        # 切回本窗口时刷新列名：用户可能在主窗口改了表头
+        if event.type() == event.Type.ActivationChange and self.isActiveWindow():
+            self.refresh_columns()
+        super().changeEvent(event)
+
+    # ---------------- 参数表单 <-> 代码 ----------------
+
+    def _sync_params_from_code(self):
+        self.param_panel.load(self.code_edit.toPlainText())
+
+    def _on_param_changed(self, name, value):
+        code = self.code_edit.toPlainText()
+        new_code = analysis_params.set_param(code, name, value)
+        if new_code == code:
+            return
+        # 只替换那一行，编辑器的光标和撤销栈不受影响
+        for p in analysis_params.parse_params(code):
+            if p.name == name:
+                self.code_edit.replace_line(p.line_no, new_code.split("\n")[p.line_no])
+                break
+        self._clean_code = self.code_edit.toPlainText()
+
+    def _clear_outputs(self):
+        self.output_edit.clear()
+        self.result_combo.clear()
+        self.result_view.setModel(None)
+        self._result_dfs = {}
+        self.figure_gallery.clear()
 
     # ---------------- 预设 ----------------
 
@@ -869,22 +1604,53 @@ class PythonAnalysisWindow(QMainWindow):
             QMessageBox.critical(self, tr("错误"), tr("保存预设失败:\n{}").format(e))
 
     def _update_preset_combo(self, select_name=None):
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        self.preset_combo.addItems(list(self.presets.keys()))
+        """按类别分组填充下拉框：分组标题为不可选的灰项。"""
+        combo = self.preset_combo
+        combo.blockSignals(True)
+        combo.clear()
+
+        def header(text):
+            combo.addItem(f"── {text} ──")
+            item = combo.model().item(combo.count() - 1)
+            item.setEnabled(False)
+
+        categorized = set()
+        for cat, names in PRESET_CATEGORIES:
+            present = [n for n in names if n in self.presets]
+            if not present:
+                continue
+            header(tr(cat))
+            for n in present:
+                combo.addItem(n)
+            categorized.update(present)
+        others = [n for n in self.presets if n not in categorized]
+        defaults_left = [n for n in others if n in DEFAULT_PRESETS]
+        user_only = [n for n in others if n not in DEFAULT_PRESETS]
+        if defaults_left:
+            header(tr("其他"))
+            combo.addItems(defaults_left)
+        if user_only:
+            header(tr("我的预设"))
+            combo.addItems(user_only)
+
         if select_name and select_name in self.presets:
-            self.preset_combo.setCurrentText(select_name)
-        self.preset_combo.blockSignals(False)
+            combo.setCurrentText(select_name)
+        else:
+            combo.setCurrentIndex(-1)
+        combo.blockSignals(False)
+
+    def _editor_is_clean(self):
+        """编辑器为空、或与最近一次应用预设/表单改参数后的内容一致、或等于某个预设原文。"""
+        current = self.code_edit.toPlainText().strip()
+        if not current or current == self._clean_code.strip():
+            return True
+        return current in {c.strip() for c in self.presets.values()}
 
     def _on_preset_selected(self, name):
-        """下拉选中即自动应用；编辑器有自定义未保存内容时不覆盖。
-
-        判定"干净"：为空，或与任一预设完全一致（说明是上次应用后未改动）。
-        """
+        """下拉选中即自动应用；编辑器有自定义未保存内容时不覆盖。"""
         if not name or name not in self.presets:
             return
-        current = self.code_edit.toPlainText().strip()
-        if current and current not in {c.strip() for c in self.presets.values()}:
+        if not self._editor_is_clean():
             self._status(tr("编辑器有未保存内容，未自动应用；可点\"应用预设\"覆盖"))
             return
         self._apply_preset(append=False)
@@ -899,6 +1665,17 @@ class PythonAnalysisWindow(QMainWindow):
             self.code_edit.setPlainText((existing.rstrip() + "\n\n" + code) if existing.strip() else code)
         else:
             self.code_edit.setPlainText(code)
+        self._clean_code = self.code_edit.toPlainText()
+        self.refresh_columns()
+        self._param_sync_timer.stop()
+        self._sync_params_from_code()
+        # 列名参数还是占位符时，把焦点放到第一个参数上，提示用户先选列
+        for p in self.param_panel.params():
+            if p.kind == KIND_COLUMN and str(p.value) not in self.host_columns():
+                w = self.param_panel.widget_for(p.name)
+                if w is not None:
+                    w.setFocus()
+                break
 
     def _save_current_as_preset(self):
         code = self.code_edit.toPlainText().strip()
@@ -938,6 +1715,9 @@ class PythonAnalysisWindow(QMainWindow):
     def run_code(self):
         if self._worker is not None and self._worker.isRunning():
             return
+        # 表单与代码先对齐（延迟同步的定时器可能还没到点）
+        self._param_sync_timer.stop()
+        self._sync_params_from_code()
         code = self.code_edit.toPlainText().strip()
         if not code:
             QMessageBox.warning(self, tr("提示"), tr("请输入要运行的代码"))
@@ -945,25 +1725,62 @@ class PythonAnalysisWindow(QMainWindow):
 
         df = getattr(self.host.model, "df", None)
         df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        self.refresh_columns()
 
         self.output_edit.clear()
         self.output_edit.setPlainText(tr("正在运行...\n"))
+        self.tabs.setCurrentIndex(self.TAB_OUTPUT)
         self.run_action.setEnabled(False)
         self.stop_action.setEnabled(True)
         self._run_started = time.perf_counter()
+        self._run_code_text = code
 
-        self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None), self)
+        self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None),
+                                     self, extra=self._extra_namespace())
         self._worker.done.connect(self._on_run_done)
         self._worker.start()
+
+    def _extra_namespace(self):
+        """除 df 之外注入用户代码的变量：
+
+        - sheets['名字']：任意 sheet 的完整数据（按需读取）；sheet_names 为名字列表
+        - df_full：当前 sheet 筛选前的全表（没筛选时与 df 相同）
+        - selection：当前选区的数据块（没选就是 None）；selected_columns：选中列名
+        """
+        host = self.host
+        extra = {}
+        names = list(getattr(host, "sheet_names", None) or [])
+        extra["sheet_names"] = names
+        extra["sheets"] = _SheetAccessor(host, names)
+        full = None
+        if getattr(host, "original_df", None) is not None:
+            full = host.original_df
+        elif isinstance(getattr(getattr(host, "model", None), "df", None), pd.DataFrame):
+            full = host.model.df
+        extra["df_full"] = full.copy() if full is not None else pd.DataFrame()
+        sel, sel_cols = None, []
+        if hasattr(host, "selection_frame"):
+            try:
+                sel, sel_cols = host.selection_frame()
+            except Exception:
+                sel, sel_cols = None, []
+        extra["selection"] = sel
+        extra["selected_columns"] = list(sel_cols)
+        return extra
 
     def stop_code(self):
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._status(tr("正在停止..."))
 
-    def _on_run_done(self, output, result_dfs, sheet_requests, figure_files):
+    def _on_run_done(self, output, result_dfs, sheet_requests, figure_files, figure_images):
         self.run_action.setEnabled(True)
         self.stop_action.setEnabled(False)
+        had_error = tr("[执行错误]") in (output or "")
+        self._record_history(getattr(self, "_run_code_text", ""), ok=not had_error)
+        # 给「AI 修复上次报错」用：记住出错的代码和 traceback
+        self._last_error = (getattr(self, "_run_code_text", ""), output) if had_error else None
+        self.ai_fix_action.setEnabled(had_error)
         if figure_files:
             output = (output or "") + "\n" + tr("已保存图表:") + "\n" + "\n".join(
                 "  " + f for f in figure_files) + "\n"
@@ -971,12 +1788,25 @@ class PythonAnalysisWindow(QMainWindow):
         sb = self.output_edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-        # 结果 DataFrame 下拉框
+        # 结果 DataFrame 下拉框 + 表格
         self._result_dfs = result_dfs
+        preferred = self._preferred_result(result_dfs)
+        self.result_combo.blockSignals(True)
         self.result_combo.clear()
         for name, rdf in result_dfs.items():
             self.result_combo.addItem(
                 tr("{} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)), name)
+        if preferred is not None:
+            self.result_combo.setCurrentIndex(self.result_combo.findData(preferred))
+        self.result_combo.blockSignals(False)
+        self._show_selected_result()
+        self.tabs.setTabText(self.TAB_RESULT, tr("结果表") + (
+            f" ({len(result_dfs)})" if result_dfs else ""))
+
+        # 图表
+        self.figure_gallery.set_images(figure_images)
+        self.tabs.setTabText(self.TAB_FIGURES, tr("图表") + (
+            f" ({len(figure_images)})" if figure_images else ""))
 
         # save_as_sheet 队列在主线程统一执行（线程安全）
         for rdf, sheet_name in sheet_requests:
@@ -985,6 +1815,16 @@ class PythonAnalysisWindow(QMainWindow):
             except Exception as e:
                 self.output_edit.appendPlainText(
                     tr("[保存Sheet失败] {}: {}").format(sheet_name, e))
+
+        # 自动切到最有用的页：报错看输出，有图看图，有结果看表
+        if had_error:
+            self.tabs.setCurrentIndex(self.TAB_OUTPUT)
+        elif figure_images:
+            self.tabs.setCurrentIndex(self.TAB_FIGURES)
+        elif preferred is not None:
+            self.tabs.setCurrentIndex(self.TAB_RESULT)
+        else:
+            self.tabs.setCurrentIndex(self.TAB_OUTPUT)
 
         elapsed = time.perf_counter() - getattr(self, "_run_started", time.perf_counter())
         if sheet_requests:
@@ -998,6 +1838,22 @@ class PythonAnalysisWindow(QMainWindow):
         self._worker = None
         if worker is not None:
             worker.deleteLater()
+
+    def _preferred_result(self, result_dfs):
+        """默认展示哪个结果：最后一个非 df 的 DataFrame；没有就看 df 是否被改过。"""
+        names = [n for n in result_dfs if n != "df"]
+        if names:
+            return names[-1]
+        if "df" not in result_dfs:
+            return None
+        host_df = getattr(getattr(self.host, "model", None), "df", None)
+        if not isinstance(host_df, pd.DataFrame):
+            return "df"
+        try:
+            same = result_dfs["df"].shape == host_df.shape and result_dfs["df"].equals(host_df)
+        except Exception:
+            same = False
+        return None if same else "df"
 
     def _status(self, msg):
         try:
@@ -1014,24 +1870,16 @@ class PythonAnalysisWindow(QMainWindow):
             return None, None
         return name, self._result_dfs[name]
 
-    def _preview_result(self):
-        name, rdf = self._current_result_df()
+    def _show_selected_result(self):
+        name = self.result_combo.currentData()
+        rdf = self._result_dfs.get(name) if name else None
+        old = self.result_view.model()
         if rdf is None:
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle(tr("预览 - {} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)))
-        dlg.resize(800, 500)
-        layout = QVBoxLayout(dlg)
-        view = QTableView()
-        view.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
-        model = PandasTableModel(rdf.copy())
-        view.setModel(model)
-        layout.addWidget(view)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dlg.reject)
-        buttons.clicked.connect(dlg.accept)
-        layout.addWidget(buttons)
-        dlg.exec()
+            self.result_view.setModel(None)
+        else:
+            self.result_view.setModel(PandasTableModel(flatten_frame(rdf)))
+        if old is not None:
+            old.deleteLater()
 
     def _save_result_as_sheet(self):
         name, rdf = self._current_result_df()
@@ -1042,10 +1890,200 @@ class PythonAnalysisWindow(QMainWindow):
         if not ok or not sheet_name.strip():
             return
         try:
-            self.host.add_sheet_from_df(rdf.copy(), sheet_name.strip())
+            self.host.add_sheet_from_df(flatten_frame(rdf), sheet_name.strip())
             self._status(tr("已保存Sheet: {}").format(sheet_name.strip()))
         except Exception as e:
             QMessageBox.critical(self, tr("错误"), tr("保存Sheet失败:\n{}").format(e))
+
+    # ---------------- 结果回写当前 Sheet（都先弹窗确认，都可撤销） ----------------
+
+    def _replace_current_sheet(self):
+        name, rdf = self._current_result_df()
+        if rdf is None:
+            return
+        if not hasattr(self.host, "replace_current_sheet_df"):
+            return
+        flat = flatten_frame(rdf)
+        cur = getattr(getattr(self.host, "model", None), "df", None)
+        cur_desc = tr("{} 行 × {} 列").format(len(cur), len(cur.columns)) \
+            if isinstance(cur, pd.DataFrame) else "?"
+        ret = QMessageBox.question(
+            self, tr("替换当前Sheet"),
+            tr("用结果「{}」（{} 行 × {} 列）整表替换当前 Sheet（现有 {}）？\n\n"
+               "当前 Sheet 的公式和单元格颜色会一并清除。此操作可用撤销（Ctrl+Z）恢复。")
+            .format(name, len(flat), len(flat.columns), cur_desc),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.host.replace_current_sheet_df(flat)
+        except Exception as e:
+            QMessageBox.warning(self, tr("替换当前Sheet"), str(e))
+
+    def _append_result_columns(self):
+        name, rdf = self._current_result_df()
+        if rdf is None:
+            return
+        if not hasattr(self.host, "append_columns_to_current"):
+            return
+        flat = flatten_frame(rdf)
+        cur = getattr(getattr(self.host, "model", None), "df", None)
+        if isinstance(cur, pd.DataFrame) and len(flat) != len(cur):
+            QMessageBox.warning(
+                self, tr("追加为新列"),
+                tr("结果有 {} 行，当前 Sheet 有 {} 行，行数不一致无法按位置追加。\n"
+                   "提示：用 df.merge(...) 或 df.assign(...) 把结果对齐到 df 后再追加。")
+                .format(len(flat), len(cur)))
+            return
+        cols = [str(c) for c in flat.columns]
+        ret = QMessageBox.question(
+            self, tr("追加为新列"),
+            tr("把结果「{}」的 {} 列追加到当前 Sheet 末尾？\n{}\n\n"
+               "按行位置对齐（第 1 行对第 1 行）。此操作可用撤销（Ctrl+Z）恢复。")
+            .format(name, len(cols), ", ".join(cols[:8]) + ("..." if len(cols) > 8 else "")),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.host.append_columns_to_current(flat)
+        except Exception as e:
+            QMessageBox.warning(self, tr("追加为新列"), str(e))
+
+    # ---------------- 代码持久化与运行历史 ----------------
+
+    def _restore_last_code(self):
+        if self.code_edit.toPlainText().strip():
+            return
+        try:
+            if os.path.exists(LAST_CODE_FILE):
+                with open(LAST_CODE_FILE, "r", encoding="utf-8") as f:
+                    code = f.read()
+                if code.strip():
+                    self.code_edit.setPlainText(code)
+                    self._clean_code = code
+                    self._param_sync_timer.stop()
+                    self._sync_params_from_code()
+        except OSError:
+            pass
+
+    def _save_last_code(self):
+        try:
+            os.makedirs(_CONFIG_DIR, exist_ok=True)
+            with open(LAST_CODE_FILE, "w", encoding="utf-8") as f:
+                f.write(self.code_edit.toPlainText())
+        except OSError:
+            pass
+
+    def _load_history(self):
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [d for d in data if isinstance(d, dict) and d.get("code")]
+        except (OSError, ValueError):
+            pass
+        return []
+
+    def _record_history(self, code, ok=True):
+        code = (code or "").strip()
+        if not code:
+            return
+        # 同样的代码只留最新一条
+        self._history = [h for h in self._history if h.get("code") != code]
+        self._history.insert(0, {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code, "ok": bool(ok)})
+        del self._history[HISTORY_LIMIT:]
+        try:
+            os.makedirs(_CONFIG_DIR, exist_ok=True)
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._history, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+        self._save_last_code()
+
+    @staticmethod
+    def _history_label(entry):
+        first = ""
+        for line in entry.get("code", "").split("\n"):
+            s = line.strip()
+            if s and not s.startswith("#"):
+                first = s
+                break
+        if len(first) > 48:
+            first = first[:48] + "…"
+        mark = "" if entry.get("ok", True) else " ✗"
+        return f"{entry.get('time', '')}{mark}   {first}"
+
+    def _fill_history_menu(self):
+        self._history_menu.clear()
+        if not self._history:
+            self._history_menu.addAction(tr("（还没有运行记录）")).setEnabled(False)
+            return
+        for entry in self._history:
+            act = self._history_menu.addAction(self._history_label(entry))
+            act.setToolTip(entry.get("code", ""))
+            act.triggered.connect(lambda _=False, e=entry: self._load_history_entry(e))
+        self._history_menu.addSeparator()
+        self._history_menu.addAction(tr("清空历史"), self._clear_history)
+
+    def _load_history_entry(self, entry):
+        code = entry.get("code", "")
+        if not self._editor_is_clean() and self.code_edit.toPlainText().strip() != code.strip():
+            ret = QMessageBox.question(
+                self, tr("历史"), tr("编辑器里有未保存的改动，用这条历史记录覆盖？"))
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        self.code_edit.setPlainText(code)
+        self._clean_code = code
+        self._param_sync_timer.stop()
+        self._sync_params_from_code()
+
+    def _clear_history(self):
+        self._history = []
+        try:
+            if os.path.exists(HISTORY_FILE):
+                os.remove(HISTORY_FILE)
+        except OSError:
+            pass
+
+    # ---------------- AI 生成代码 ----------------
+
+    def _ai_settings(self):
+        from .ai_codegen import AiSettingsDialog
+        AiSettingsDialog(self).exec()
+
+    def _ai_generate(self, fix=False):
+        from .ai_codegen import AiGenerateDialog
+        df = getattr(getattr(self.host, "model", None), "df", None)
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        current = self.code_edit.toPlainText()
+        error_text = ""
+        if fix and getattr(self, "_last_error", None):
+            current, error_text = self._last_error
+        dlg = AiGenerateDialog(df, current_code=current, error_text=error_text,
+                               sheet_names=list(getattr(self.host, "sheet_names", None) or []),
+                               parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.code:
+            return
+        self._apply_generated_code(dlg.code, modify=dlg.modify_cb.isChecked())
+
+    def _apply_generated_code(self, code, modify=False):
+        """把生成的代码放进编辑器；会覆盖手改内容时先确认。"""
+        if not modify and not self._editor_is_clean():
+            ret = QMessageBox.question(
+                self, tr("AI 生成代码"), tr("编辑器里有未保存的改动，用生成的代码覆盖？"))
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+        self.code_edit.setPlainText(code)
+        self._clean_code = code
+        self._param_sync_timer.stop()
+        self._sync_params_from_code()
+        self._status(tr("已插入 AI 生成的代码，检查参数后按 F5 运行"))
 
     # ---------------- 关闭 ----------------
 
@@ -1061,4 +2099,5 @@ class PythonAnalysisWindow(QMainWindow):
                     tr("代码仍在运行，无法关闭窗口。\n请等待其结束，或点击「停止」后再试。"))
                 event.ignore()
                 return
+        self._save_last_code()
         super().closeEvent(event)

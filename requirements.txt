@@ -9,3 +9,4 @@ certifi>=2024.2.2  # 打包后应用的 HTTPS CA 证书（应用内检查更新�
 lxml>=5.0.0  # openpyxl 写 xlsx 的加速路径（大文件保存提速约 2-3 倍）
 matplotlib>=3.8.0  # Python 分析的图表预设（直方图/条形图/散点图/箱线图）
 pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"  # 图片队列"自动模式"全局 Cmd+V 监听（缺失时复选框隐藏）
+anthropic>=1.0.0  # Python 分析窗口的「AI 生成代码」（Claude）；缺失时该菜单会提示安装
