@@ -1390,6 +1390,28 @@ class MainWindow(QMainWindow):
         self.sheet_tabs.setDrawBase(False)
         self.sheet_tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        # 原生样式在深色模式下当前标签几乎看不出来：当前 sheet 用表头同款橙色
+        # 加粗高亮，其余标签用弱化的窗口色；颜色取自调色板，浅色/深色模式都适用
+        self.sheet_tabs.setStyleSheet("""
+            QTabBar::tab {
+                background: palette(window);
+                color: palette(text);
+                border: 1px solid palette(mid);
+                border-top: none;
+                padding: 3px 14px;
+                margin-right: 1px;
+                min-width: 48px;
+            }
+            QTabBar::tab:!selected { color: palette(placeholder-text); }
+            QTabBar::tab:hover { background: palette(midlight); color: palette(text); }
+            QTabBar::tab:selected {
+                background: palette(base);
+                color: rgb(230, 126, 34);
+                font-weight: bold;
+                border-top: 3px solid rgb(230, 126, 34);
+                border-bottom-color: palette(base);
+            }
+        """)
         self.sheet_tabs.currentChanged.connect(self._on_sheet_tab_changed)
         self.sheet_tabs.tabBarDoubleClicked.connect(self._on_sheet_tab_double_clicked)
         self.sheet_tabs.tabMoved.connect(self._on_sheet_tab_moved)
