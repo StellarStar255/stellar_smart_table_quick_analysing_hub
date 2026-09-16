@@ -287,3 +287,25 @@ class TestUserCodeCannotKillApp:
         assert buf.getvalue() == "from-main\n"
         assert "from-thread" in capsys.readouterr().out
         assert not isinstance(sys.stdout, _StreamRouter)   # 用完还原
+
+
+class TestTracerScope:
+    """停止用的追踪器只跟踪用户代码自己的帧，pandas/numpy 内部不逐行回调。"""
+
+    def test_only_user_frames_get_line_tracing(self):
+        holder = []
+        worker = CodeRunWorker("import sys\nholder.append(sys._getframe())",
+                               pd.DataFrame(), None, extra={"holder": holder})
+        worker.run()
+        user_frame = holder[0]
+        assert user_frame.f_code.co_filename == python_analysis._USER_CODE_FILENAME
+        assert worker._tracer(user_frame, "call", None) == worker._tracer   # 用户帧：继续逐行追踪
+        assert worker._tracer(sys._getframe(), "call", None) is None   # 本测试文件的帧：不追踪
+        worker.cancel()
+        assert worker._tracer(sys._getframe(), "call", None) is None   # 库帧里也不抛，等回到用户代码
+        with pytest.raises(python_analysis._Cancelled):
+            worker._tracer(user_frame, "line", None)
+
+    def test_error_location_still_found_with_named_filename(self):
+        output, *_ = run_worker("x = 1\ny = df['nope']", pd.DataFrame({'a': [1]}))
+        assert "2" in output and "df['nope']" in output

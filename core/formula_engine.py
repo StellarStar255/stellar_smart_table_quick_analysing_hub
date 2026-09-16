@@ -60,6 +60,17 @@ def _excel_round(value, digits, mode):
     return float(result)
 
 
+# 所有可能的错误返回值（对齐 Excel 错误码；#ERROR 为未分类兜底）
+_ERROR_VALUES = frozenset(
+    {"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!", "#REF!", "#N/A",
+     "#CIRC!"}   # 循环引用（本应用自定义，Excel 以警告代替）
+)
+
+
+def _is_error_value(value) -> bool:
+    return isinstance(value, str) and value in _ERROR_VALUES
+
+
 class _RangeValues(list):
     """区域引用的值：行的列表（每行一个元组），可当普通嵌套列表用。
 
@@ -67,7 +78,8 @@ class _RangeValues(list):
     直接取缓存，不必递归展平几十万个单元素行——整列公式的主要开销。
     """
 
-    __slots__ = ("_cols", "_numeric_cols", "_flat_all", "_flat_nonblank", "_flat_numeric")
+    __slots__ = ("_cols", "_numeric_cols", "_flat_all", "_flat_nonblank",
+                 "_flat_numeric", "_first_error")
 
     def __init__(self, cols, numeric_cols):
         # cols: 每列一个 Python 列表（空白为 None）；numeric_cols: 每列是否数值 dtype
@@ -75,6 +87,24 @@ class _RangeValues(list):
         self._cols = cols
         self._numeric_cols = numeric_cols
         self._flat_all = self._flat_nonblank = self._flat_numeric = None
+        self._first_error = False   # False = 尚未扫描；None = 无错误值
+
+    def first_error(self):
+        """区域内第一个错误值（如 "#DIV/0!"），没有则 None。
+
+        只扫描非数值列——数值 dtype 列不可能含错误文本；SUM 等聚合
+        遇到错误值要原样传播（同 Excel），而不是当文本悄悄跳过。
+        """
+        if self._first_error is False:
+            self._first_error = None
+            for col, is_numeric in zip(self._cols, self._numeric_cols):
+                if is_numeric:
+                    continue
+                err = next((v for v in col if _is_error_value(v)), None)
+                if err is not None:
+                    self._first_error = err
+                    break
+        return self._first_error
 
     def flat_all(self):
         """行主序展平，空白保留为 None（条件函数按位置配对用）。"""
@@ -100,6 +130,114 @@ class _RangeValues(list):
                     v for v in self.flat_all()
                     if isinstance(v, (int, float)) and not isinstance(v, bool)]
         return self._flat_numeric
+
+
+class _ExcelSemanticsLowering(ast.NodeTransformer):
+    """把 Python 表达式树改成 Excel 语义：
+
+    - 整数字面量转 float：Python 大整数乘方（=9^9^9^9）会无限膨胀卡死
+      界面，float 溢出则直接抛 OverflowError -> #NUM!
+    - ``-x ** y`` -> ``(-x) ** y``：Excel 里一元负号比 ^ 优先级高（=-2^2 是 4）
+    - ``a ** b ** c`` -> ``(a ** b) ** c``：Excel 的 ^ 左结合（=2^3^2 是 64），
+      Python 的 ** 右结合。AST 不保留括号，靠源码里两个操作数之间是否
+      出现 "(" 判断 ``a ^ (b ^ c)`` 这种显式分组（位置是 UTF-8 字节偏移）
+    - ``a & b`` -> ``_concat(a, b)``：Excel 文本连接符（Python 里是按位与）
+    - ``x[_pct_]`` -> ``x / 100``：后缀百分号，由 _normalize_operators 把 % 改写成
+      下标形式——下标是最高优先级，正好对应 Excel 里 % 紧贴操作数的语义
+    """
+
+    PCT_NAME = '_pct_'
+
+    def __init__(self, source: str):
+        super().__init__()
+        self._src = source.encode('utf-8')
+
+    @staticmethod
+    def _is_pow(node) -> bool:
+        return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow)
+
+    def _gap_has_paren(self, left, right) -> bool:
+        """left 结束到 right 开始之间的源码是否含 "("（即 right 被显式加了括号）。
+
+        位置信息缺失或跨行时保守地视为有括号（不改写结合性）。
+        """
+        end = getattr(left, 'end_col_offset', None)
+        start = getattr(right, 'col_offset', None)
+        if (end is None or start is None
+                or getattr(left, 'end_lineno', None) != getattr(right, 'lineno', None)):
+            return True
+        return b'(' in self._src[end:start]
+
+    def _left_parenthesized(self, node) -> bool:
+        """乘方节点的左操作数是否被括号包住：(a ** b) ** c 的外层节点从 "(" 开始，
+        左子节点则从 a 开始，两者列偏移不同。"""
+        if getattr(node, '_excel_fold', False):
+            return False   # 本类折叠出来的节点，左侧一定是未加括号的链
+        outer = getattr(node, 'col_offset', None)
+        inner = getattr(node.left, 'col_offset', None)
+        if outer is None or inner is None:
+            return True
+        return inner > outer
+
+    def _pow_chain(self, node):
+        """把左结合的乘方链拆成操作数列表：((a ** b) ** c) -> [a, b, c]。
+
+        只有"左操作数本身是乘方且未加括号"才继续下钻；(a ** b) ** c 里的
+        括号分组、(2.0) ** c 这类被括号包住的普通操作数都按整体保留。
+        """
+        if not self._is_pow(node):
+            return [node]
+        left = node.left
+        if self._is_pow(left) and not self._left_parenthesized(node):
+            return self._pow_chain(left) + [node.right]
+        return [left, node.right]
+
+    def visit_Constant(self, node):
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            # 保留位置信息：结合性判断要靠子节点的列偏移
+            return ast.copy_location(ast.Constant(value=float(node.value)), node)
+        return node
+
+    def visit_UnaryOp(self, node):
+        self.generic_visit(node)
+        operand = node.operand
+        if isinstance(node.op, ast.USub) and self._is_pow(operand):
+            # 负号落到乘方链最左端的底数上：-2^2^3 -> ((-2)^2)^3；
+            # 遇到括号分组停下：-(2^2)^3 -> (-(2^2))^3
+            target = operand
+            while self._is_pow(target.left) and not self._left_parenthesized(target):
+                target = target.left
+            target.left = ast.copy_location(
+                ast.UnaryOp(op=ast.USub(), operand=target.left), target.left)
+            return operand
+        return node
+
+    def visit_BinOp(self, node):
+        # 在子节点被改写（丢失位置信息）之前判断右操作数是否显式加了括号
+        chain_right = (isinstance(node.op, ast.Pow) and self._is_pow(node.right)
+                       and not self._gap_has_paren(node.left, node.right))
+        self.generic_visit(node)
+        if isinstance(node.op, ast.BitAnd):
+            return ast.copy_location(
+                ast.Call(func=ast.Name(id='_concat', ctx=ast.Load()),
+                         args=[node.left, node.right], keywords=[]), node)
+        if chain_right and self._is_pow(node.right):
+            # a ** (b ** c ...) 是 Python 右结合的解析结果，按 Excel 折成左结合
+            operands = [node.left] + self._pow_chain(node.right)
+            folded = operands[0]
+            for operand in operands[1:]:
+                folded = ast.BinOp(left=folded, op=ast.Pow(), right=operand)
+                folded._excel_fold = True
+            return folded
+        return node
+
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        if isinstance(node.slice, ast.Name) and node.slice.id == self.PCT_NAME:
+            return ast.copy_location(
+                ast.BinOp(left=node.value, op=ast.Div(), right=ast.Constant(value=100.0)),
+                node)
+        return node
 
 
 class _IfCallLowering(ast.NodeTransformer):
@@ -167,6 +305,18 @@ class FormulaRefError(ValueError):
     """引用越界（如 VLOOKUP 列号超出表格）-> #REF!"""
 
 
+class FormulaCellError(ValueError):
+    """引用的单元格/区域元素本身是错误值 -> 原样传播该错误码。
+
+    Excel 里 =A2+1、=SUM(A2:B3) 碰到 #DIV/0! 单元格，结果就是 #DIV/0!，
+    而不是 #VALUE! 或悄悄跳过。
+    """
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
 class FormulaEngine:
     """Excel 公式解析和计算引擎（解耦版本）"""
 
@@ -193,10 +343,7 @@ class FormulaEngine:
     _STRING_PLACEHOLDER_PATTERN = re.compile('\x00(\\d+)\x00')
 
     # 所有可能的错误返回值（对齐 Excel 错误码；#ERROR 为未分类兜底）
-    ERROR_VALUES = frozenset(
-        {"#ERROR", "#DIV/0!", "#NAME?", "#NUM!", "#VALUE!", "#REF!", "#N/A",
-         "#CIRC!"}   # 循环引用（本应用自定义，Excel 以警告代替）
-    )
+    ERROR_VALUES = _ERROR_VALUES
 
     @classmethod
     def is_error(cls, value: Any) -> bool:
@@ -267,24 +414,6 @@ class FormulaEngine:
             c0, c1 = c1, c0
         return r0, r1, c0, c1
 
-    def parse_range_ref(self, range_ref: str, df: Optional[pd.DataFrame] = None) -> List[Tuple[int, int]]:
-        """解析区域引用，返回所有单元格 (row_index, col_index) 列表。
-
-        传入 df 时裁剪到表格范围（含表头行 -1）；越界单元格不存在，
-        也不可能被编辑，无需登记依赖。
-        """
-        df = df if df is not None else self._df
-        match = self.RANGE_REF_PATTERN.match(range_ref)
-        if not match:
-            raise ValueError(tr("无效的区域引用: {}").format(range_ref))
-        r0, r1, c0, c1 = self._range_bounds(match)
-        if df is not None:
-            r0, r1 = max(r0, -1), min(r1, len(df) - 1)
-            c0, c1 = max(c0, 0), min(c1, len(df.columns) - 1)
-        return [(row, col)
-                for row in range(r0, r1 + 1)
-                for col in range(c0, c1 + 1)]
-
     def extract_dependency_spec(self, formula: str, df: Optional[pd.DataFrame] = None):
         """公式的依赖规格：(单格集合, 区域边界列表 [(r0, r1, c0, c1)])。
 
@@ -311,36 +440,29 @@ class FormulaEngine:
         return cells, ranges
 
     def extract_dependencies(self, formula: str, df: Optional[pd.DataFrame] = None) -> Set[Tuple[int, int]]:
-        """从公式中提取所有被引用的单元格 (row_index, col_index)。"""
-        df = df if df is not None else self._df
-        dependencies = set()
-        # 字符串字面量里的 "A1" 不是引用
-        expr = self.STRING_PATTERN.sub('', formula)
+        """从公式中提取所有被引用的单元格 (row_index, col_index)。
 
-        # 先处理区域引用
-        for match in self.RANGE_REF_PATTERN.finditer(expr):
-            try:
-                dependencies.update(self.parse_range_ref(match.group(), df))
-            except ValueError:
-                pass
-
-        # 移除区域引用后处理单个单元格引用
-        formula_without_ranges = self.RANGE_REF_PATTERN.sub('', expr)
-        for match in self.CELL_REF_PATTERN.finditer(formula_without_ranges):
-            try:
-                dependencies.add(self.parse_cell_ref(match.group(), df))
-            except ValueError:
-                pass
-
-        return dependencies
+        extract_dependency_spec 的展开版：区域展开成逐格集合。生产路径
+        （依赖登记）用 spec 的区域边界即可，这里仅为便利/测试保留。
+        """
+        cells, ranges = self.extract_dependency_spec(formula, df)
+        for r0, r1, c0, c1 in ranges:
+            cells.update((row, col)
+                         for row in range(r0, r1 + 1)
+                         for col in range(c0, c1 + 1))
+        return cells
 
     @staticmethod
     def _convert_scalar(value: Any) -> Any:
-        """原始单元格值 -> 引擎值：空为 None、数值为 float、日期为 ISO 文本。"""
+        """原始单元格值 -> 引擎值：空为 None、布尔保持布尔、数值为 float、日期为 ISO 文本。"""
         if value is None:
             return None
         if isinstance(value, str):
             return value
+        if isinstance(value, (bool, np.bool_)):
+            # 布尔不降级成 1.0：=C2 要显示 TRUE、CONCAT 要拼出 "TRUE"；
+            # 算术里 Python 本身就把 True/False 当 1/0
+            return bool(value)
         try:
             if pd.isna(value):
                 return None
@@ -479,12 +601,17 @@ class FormulaEngine:
                 row, col = self.parse_cell_ref(match.group(), df)
                 value = self.get_cell_value(row, col, df)
                 if isinstance(value, str):
+                    if value in self.ERROR_VALUES:
+                        # 错误值单元格：换成求值时抛该错误码的调用，
+                        # 惰性——IFERROR(A2, 0) / IF(FALSE, A2, 1) 仍能兜住
+                        return '_cellerr({})'.format(stash(repr(value)))
                     # 文本值同样占位保护，repr 保证引号和转义合法
                     return stash(repr(value))
                 if isinstance(value, float) and not math.isfinite(value):
                     # inf/nan 拼进表达式是非法名字；与 Excel 一样报 #NUM!
                     raise FormulaNumError("non-finite cell value")
-                return repr(value)
+                # 加括号：负数直接拼成 -3.0**2 会被 Python 解析成 -(3.0**2)
+                return '({})'.format(repr(value))
 
             expr = self.CELL_REF_PATTERN.sub(replace_cell, expr)
 
@@ -520,7 +647,9 @@ class FormulaEngine:
             if isinstance(result, float):
                 if not math.isfinite(result):
                     return "#NUM!"
-                if result == int(result):
+                # 只在安全整数范围内转 int：1E300 转成 301 位大整数会把
+                # 数值列降级成 object
+                if abs(result) < 2 ** 53 and result.is_integer():
                     return int(result)
                 return round(result, 10)
             return result
@@ -529,12 +658,14 @@ class FormulaEngine:
             return "#DIV/0!"
         except FormulaNameError:
             return "#NAME?"
-        except FormulaNumError:
+        except (FormulaNumError, OverflowError):
             return "#NUM!"
         except FormulaNAError:
             return "#N/A"
         except FormulaRefError:
             return "#REF!"
+        except FormulaCellError as exc:
+            return exc.code
         except TypeError:
             return "#VALUE!"
         except Exception:
@@ -553,7 +684,7 @@ class FormulaEngine:
         'MAX': '_max', 'MIN': '_min',
         'IF': '_if', 'AND': '_and', 'OR': '_or', 'NOT': '_not',
         'ABS': 'abs', 'ROUNDDOWN': '_rounddown', 'ROUNDUP': '_roundup',
-        'ROUND': '_round',
+        'ROUND': '_round', 'INT': '_int',
         'POWER': 'pow', 'SQRT': '_sqrt', 'MOD': '_mod',
         'VLOOKUP': '_vlookup', 'XLOOKUP': '_xlookup',
         'INDEX': '_index', 'MATCH': '_match',
@@ -764,8 +895,11 @@ class FormulaEngine:
 
     @staticmethod
     def _normalize_operators(expr: str) -> str:
-        """把 Excel 风格运算符转成 Python 风格：= -> ==, <> -> !=, ^ -> **
+        """把 Excel 风格运算符转成 Python 风格：= -> ==, <> -> !=, ^ -> **,
+        后缀 % -> [_pct_]（AST 阶段再改成 /100）。
 
+        & 保持原样：Python 里 & 的优先级恰好也在加减之下、比较之上，
+        AST 阶段把 BitAnd 改写成 _concat 调用即可。
         逐字符扫描并跳过字符串字面量，不会误改 "a=b" 这类文本；
         已经是 Python 风格的 ==, <=, >=, != 保持原样。
         （调用时字符串字面量已抽成占位符，引号分支只在残缺引号时触发。）
@@ -794,6 +928,13 @@ class FormulaEngine:
             if ch == '^':
                 # Excel 乘方；Python 的 ^ 是按位异或，=2^3 会算成 1
                 result.append('**')
+                i += 1
+                continue
+            if ch == '%':
+                # Excel 的 % 只有后缀百分号一种含义（=A3*10% 是 A3*0.1）。
+                # 改写成下标 x[_pct_]：下标优先级最高，紧贴操作数，
+                # 2^10% 与 10%^2 的结合都与 Excel 一致；AST 阶段再改成 x/100
+                result.append('[' + _ExcelSemanticsLowering.PCT_NAME + ']')
                 i += 1
                 continue
             if ch == '=':
@@ -905,14 +1046,28 @@ class FormulaEngine:
         def _is_num(v):
             return isinstance(v, (int, float)) and not isinstance(v, bool)
 
-        def _flat_numeric(args):
-            # 展平并只保留数值，供聚合函数使用；区域直接取缓存的数值视图
+        def _raise_if_error(v):
+            if _is_error_value(v):
+                raise FormulaCellError(v)
+
+        def _flat_numeric(args, propagate_errors=True):
+            # 展平并只保留数值，供聚合函数使用；区域直接取缓存的数值视图。
+            # propagate_errors：区域里的错误值（#DIV/0! 文本）向外传播，
+            # 与 Excel 的 SUM/AVERAGE 一致；COUNT 则跳过错误值
             values = []
             for a in args:
                 if isinstance(a, _RangeValues):
+                    if propagate_errors:
+                        err = a.first_error()
+                        if err is not None:
+                            raise FormulaCellError(err)
                     values.extend(a.flat_numeric())
                 else:
-                    values.extend(v for v in _flatten([a]) if _is_num(v))
+                    for v in _flatten([a]):
+                        if _is_num(v):
+                            values.append(v)
+                        elif propagate_errors:
+                            _raise_if_error(v)
             return values
 
         def _sum(*args):
@@ -929,16 +1084,22 @@ class FormulaEngine:
         def _avg(*args):
             values = _flat_numeric(args)
             if not values:
-                return 0
+                # 与 Excel（及 AVERAGEIF）一致：没有可平均的数值时报 #DIV/0!
+                raise ZeroDivisionError("AVERAGE: no numeric values")
             return sum(values) / len(values)
 
         def _concat(*args):
-            # 整数不显示小数点、布尔为 TRUE/FALSE、空白为空串；区域按行展平
-            return ''.join(_to_text(a) for a in _flatten(args))
+            # 整数不显示小数点、布尔为 TRUE/FALSE、空白为空串；区域按行展平；
+            # 错误值向外传播（="x"&A2 在 A2 为 #DIV/0! 时结果就是 #DIV/0!）
+            parts = []
+            for a in _flatten(args):
+                _raise_if_error(a)
+                parts.append(_to_text(a))
+            return ''.join(parts)
 
         def _count(*args):
-            # 与 Excel 一致：只数数值
-            return len(_flat_numeric(args))
+            # 与 Excel 一致：只数数值，错误值不计也不传播
+            return len(_flat_numeric(args, propagate_errors=False))
 
         def _counta(*args):
             # 数全部（含文本）
@@ -960,19 +1121,28 @@ class FormulaEngine:
             pred = self._criteria_predicate(criteria)
             return sum(1 for v in _flatten_keep_blank([rng]) if pred(v))
 
+        def _pick_numeric(values, hits):
+            """按命中掩码挑出数值；命中位置若是错误值则向外传播（同 Excel）。"""
+            picked = []
+            for v, hit in zip(values, hits):
+                if hit:
+                    if _is_num(v):
+                        picked.append(v)
+                    else:
+                        _raise_if_error(v)
+            return picked
+
         def _sumif(rng, criteria, sum_rng=None):
             pred = self._criteria_predicate(criteria)
             cond_values = _flatten_keep_blank([rng])
             sum_values = cond_values if sum_rng is None else _flatten_keep_blank([sum_rng])
-            return sum(v for cond, v in zip(cond_values, sum_values)
-                       if pred(cond) and _is_num(v))
+            return sum(_pick_numeric(sum_values, (pred(c) for c in cond_values)))
 
         def _averageif(rng, criteria, avg_rng=None):
             pred = self._criteria_predicate(criteria)
             cond_values = _flatten_keep_blank([rng])
             avg_values = cond_values if avg_rng is None else _flatten_keep_blank([avg_rng])
-            matched = [v for cond, v in zip(cond_values, avg_values)
-                       if pred(cond) and _is_num(v)]
+            matched = _pick_numeric(avg_values, (pred(c) for c in cond_values))
             if not matched:
                 # 与 Excel 一致：无匹配时报 #DIV/0!
                 raise ZeroDivisionError("AVERAGEIF: no matching values")
@@ -1006,14 +1176,14 @@ class FormulaEngine:
             mask = _multi_criteria_mask(pairs)
             if len(values) != len(mask):
                 raise TypeError("SUMIFS ranges must be the same size")
-            return sum(v for v, hit in zip(values, mask) if hit and _is_num(v))
+            return sum(_pick_numeric(values, mask))
 
         def _averageifs(avg_rng, *pairs):
             values = _flatten_keep_blank([avg_rng])
             mask = _multi_criteria_mask(pairs)
             if len(values) != len(mask):
                 raise TypeError("AVERAGEIFS ranges must be the same size")
-            matched = [v for v, hit in zip(values, mask) if hit and _is_num(v)]
+            matched = _pick_numeric(values, mask)
             if not matched:
                 raise ZeroDivisionError("AVERAGEIFS: no matching values")
             return sum(matched) / len(matched)
@@ -1031,10 +1201,19 @@ class FormulaEngine:
         def _referr():
             raise FormulaRefError("reference deleted or out of range")
 
+        def _cellerr(code):
+            raise FormulaCellError(code)
+
         # ---------- 查找函数 ----------
 
         def _as_grid(a):
-            """统一成行的列表（二维）；标量与一维列表按单行处理。"""
+            """统一成行的列表（二维）；标量与一维列表按单行处理。
+
+            区域值（_RangeValues）本身就是行元组列表，直接返回——
+            不必为每次 VLOOKUP 复制整张查找表。
+            """
+            if isinstance(a, _RangeValues) and a:
+                return a
             if not isinstance(a, (list, tuple)):
                 return [[a]]
             if not a:
@@ -1089,9 +1268,15 @@ class FormulaEngine:
         def _vlookup(value, table, col_index, range_lookup=True):
             grid = _as_grid(table)
             ci = int(col_index) - 1
-            if ci < 0 or any(ci >= len(row) for row in grid):
-                raise FormulaRefError("VLOOKUP col_index out of range")
-            first_col = [row[0] for row in grid if row]
+            if isinstance(grid, _RangeValues):
+                # 快路径：宽度就是列数，首列已按列缓存，免去逐行扫描/复制
+                if ci < 0 or ci >= len(grid._cols):
+                    raise FormulaRefError("VLOOKUP col_index out of range")
+                first_col = grid._cols[0]
+            else:
+                if ci < 0 or any(ci >= len(row) for row in grid):
+                    raise FormulaRefError("VLOOKUP col_index out of range")
+                first_col = [row[0] for row in grid if row]
             if range_lookup:
                 pos = _approx_pick(first_col, value, next_smaller=True)
             else:
@@ -1235,11 +1420,17 @@ class FormulaEngine:
                 return years
             raise TypeError("DATEDIF: unsupported unit {}".format(unit))
 
+        def _truthy(values):
+            # 错误值向外传播，而不是被当成非空文本算 TRUE
+            for v in values:
+                _raise_if_error(v)
+                yield bool(v)
+
         def _and(*args):
-            return all(bool(v) for v in _flatten(args))
+            return all(_truthy(_flatten(args)))
 
         def _or(*args):
-            return any(bool(v) for v in _flatten(args))
+            return any(_truthy(_flatten(args)))
 
         def _not(value):
             return not value
@@ -1247,16 +1438,34 @@ class FormulaEngine:
         def _if(condition, true_val, false_val):
             return true_val if condition else false_val
 
+        def _int_arg(value, minimum):
+            """文本函数的整数实参：截断小数；非数值或小于 minimum -> #VALUE!（同 Excel）。"""
+            try:
+                n = int(value)
+            except (TypeError, ValueError, OverflowError):
+                raise TypeError("expected a number")
+            if n < minimum:
+                raise TypeError("argument out of range")
+            return n
+
         def _left(text, num=1):
-            return _to_text(text)[:int(num)]
+            return _to_text(text)[:_int_arg(num, 0)]
 
         def _right(text, num=1):
-            num = int(num)
+            num = _int_arg(num, 0)
             return _to_text(text)[-num:] if num > 0 else ''
 
         def _mid(text, start, num):
-            start = int(start)
-            return _to_text(text)[start - 1:start - 1 + int(num)]
+            start = _int_arg(start, 1)
+            return _to_text(text)[start - 1:start - 1 + _int_arg(num, 0)]
+
+        def _int(value):
+            # Excel INT 是向下取整（INT(-1.5) = -2）；回 float 以走统一的结果格式化
+            if isinstance(value, bool):
+                value = int(value)
+            if not isinstance(value, (int, float)):
+                raise TypeError("INT expects a number")
+            return float(math.floor(value))
 
         def _round(value, digits=0):
             return _excel_round(value, digits, ROUND_HALF_UP)
@@ -1273,16 +1482,16 @@ class FormulaEngine:
                 raise FormulaNumError("SQRT of negative number")
             return value ** 0.5
 
+        # 只暴露 FUNC_MAP 映射到的实现名：abs/pow 是 ABS/POWER 的实现；
+        # 裸的 int/float/str 等 Python 内建不是 Excel 函数，不放进白名单
         allowed_names = {
-            'sum': sum, 'max': max, 'min': min, 'len': len,
-            'abs': abs, 'round': round, 'int': int, 'float': float,
-            'str': str, 'pow': pow,
+            'abs': abs, 'pow': pow,
             'True': True, 'False': False,
             '_avg': _avg, '_concat': _concat, '_count': _count,
             '_counta': _counta, '_countif': _countif,
             '_sumif': _sumif, '_averageif': _averageif,
             '_sumifs': _sumifs, '_countifs': _countifs, '_averageifs': _averageifs,
-            '_iferror': _iferror, '_referr': _referr,
+            '_iferror': _iferror, '_referr': _referr, '_cellerr': _cellerr,
             '_and': _and, '_or': _or, '_not': _not,
             '_vlookup': _vlookup, '_xlookup': _xlookup,
             '_index': _index, '_match': _match,
@@ -1296,16 +1505,17 @@ class FormulaEngine:
             '_lower': lambda text: _to_text(text).lower(),
             '_trim': lambda text: _to_text(text).strip(),
             '_round': _round, '_roundup': _roundup, '_rounddown': _rounddown,
-            '_sqrt': _sqrt,
+            '_int': _int, '_sqrt': _sqrt,
             '_mod': lambda num, divisor: num % divisor,
         }
 
         if extra_names:
             allowed_names.update(extra_names)
 
-        # 经 AST 把 _if 调用降为条件表达式、_iferror 实参包成 lambda，
-        # 保证分支惰性求值
+        # 经 AST 先套用 Excel 语义（整数转 float、-x^y、&、%），
+        # 再把 _if 调用降为条件表达式、_iferror 实参包成 lambda，保证分支惰性求值
         tree = ast.parse(expr, mode='eval')
+        tree = _ExcelSemanticsLowering(expr).visit(tree)
         tree = _IfErrorCallLowering().visit(_IfCallLowering().visit(tree))
         ast.fix_missing_locations(tree)
         code = compile(tree, '<formula>', 'eval')

@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -27,6 +28,11 @@ from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
 from version import __version__, APP_NAME, GITHUB_REPO
 from qtui.i18n import tr
+from qtui.paths import CONFIG_DIR
+
+# 临时脚本 / 下载目录的前缀；名字由 mkstemp/mkdtemp 随机生成、独占创建，
+# 不再是固定路径（固定名字可被同机其他用户预先放置或替换）
+_TEMP_PREFIX = "smart_table_hub_update_"
 
 API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 _HEADERS = {"User-Agent": f"{APP_NAME.replace(' ', '')}/{__version__}",
@@ -43,6 +49,28 @@ except ImportError:
 
 def _urlopen(request, timeout):
     return urllib.request.urlopen(request, timeout=timeout, context=_SSL_CTX)
+
+
+def _abort_response(resp):
+    """从另一个线程掐断一个正阻塞在 read() 上的响应：先 shutdown 底层 socket
+    （单靠 close() 未必能唤醒阻塞中的 recv），再 close。全部尽力而为。"""
+    try:
+        resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except Exception:                        # noqa: BLE001
+        pass
+    try:
+        resp.close()
+    except Exception:                        # noqa: BLE001
+        pass
+
+
+def _write_temp_script(content, suffix):
+    """把辅助脚本写进独占创建的随机临时文件，返回路径（可执行）。"""
+    fd, path = tempfile.mkstemp(prefix=_TEMP_PREFIX, suffix=suffix)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.chmod(path, 0o755)
+    return path
 
 
 def _parse_version(text):
@@ -110,11 +138,16 @@ class Downloader(QThread):
         self._release = release
         self._asset_name = asset_name
         self._cancelled = False
+        self._resp = None            # 进行中的响应，cancel() 用它掐断阻塞的 read()
         self.checksum_status = None
         self.checksum_error = ""
 
     def cancel(self):
         self._cancelled = True
+        # 只置标志的话，卡在 read() 里的线程要等到下一块数据或 30 秒超时才看得到
+        resp = self._resp
+        if resp is not None:
+            _abort_response(resp)
 
     def _remove_partial(self):
         try:
@@ -126,19 +159,23 @@ class Downloader(QThread):
     def run(self):
         try:
             req = urllib.request.Request(self.url, headers=_HEADERS)
-            with _urlopen(req, timeout=30) as resp, \
-                    open(self.dest, "wb") as fh:
-                total = int(resp.headers.get("Content-Length") or 0)
-                received = 0
-                while True:
-                    if self._cancelled:
-                        break
-                    chunk = resp.read(1024 * 256)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    received += len(chunk)
-                    self.progress.emit(received, total)
+            resp = _urlopen(req, timeout=30)
+            self._resp = resp
+            try:
+                with resp, open(self.dest, "wb") as fh:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    received = 0
+                    while True:
+                        if self._cancelled:
+                            break
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        received += len(chunk)
+                        self.progress.emit(received, total)
+            finally:
+                self._resp = None
             if self._cancelled:
                 self._remove_partial()   # 半截文件不留在临时目录
                 return
@@ -213,12 +250,10 @@ def _install_macos(installer_path):
         subprocess.Popen(["open", installer_path])
         return True
 
-    log_dir = os.path.expanduser("~/.smart_table_hub")
+    log_dir = CONFIG_DIR
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "update_error.log")
-    script = os.path.join(tempfile.gettempdir(), "smart_table_hub_update.sh")
-    with open(script, "w", encoding="utf-8") as fh:
-        fh.write(f"""#!/bin/bash
+    script = _write_temp_script(f"""#!/bin/bash
 # Smart Table Hub 自动升级脚本：先把新版复制到 TARGET.new，成功后再交换，
 # 任何一步失败都保留旧版本并弹窗告知（日志见 {log_path}）。
 DMG="{installer_path}"
@@ -257,11 +292,11 @@ fi
 rm -rf "$TARGET.old"
 hdiutil detach "$MOUNT" -quiet
 rm -f "$DMG"
+rmdir "$(dirname "$DMG")" 2>/dev/null || true
 echo "OK"
 open "$TARGET"
 rm -f "$0"
-""")
-    os.chmod(script, 0o755)
+""", ".sh")
     subprocess.Popen(["/bin/bash", script], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
@@ -278,9 +313,7 @@ def _install_windows(installer_path):
          "/RESTARTAPPLICATIONS", "/NORESTART"],
         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
     try:
-        cleaner = os.path.join(tempfile.gettempdir(), "smart_table_hub_cleanup.bat")
-        with open(cleaner, "w", encoding="utf-8") as fh:
-            fh.write(f"""@echo off
+        cleaner = _write_temp_script(f"""@echo off
 set /a tries=0
 :retry
 timeout /t 10 /nobreak >nul
@@ -289,8 +322,9 @@ if not exist "{installer_path}" goto done
 set /a tries+=1
 if %tries% lss 180 goto retry
 :done
+rd /q "{os.path.dirname(installer_path)}" 2>nul
 del /q "%~f0"
-""")
+""", ".bat")
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))
         subprocess.Popen(["cmd", "/c", cleaner], creationflags=flags,
@@ -303,19 +337,17 @@ del /q "%~f0"
 def _install_linux(installer_path):
     """通过 pkexec 提权安装 deb，然后重启应用。"""
     exe = sys.executable if getattr(sys, "frozen", False) else ""
-    script = os.path.join(tempfile.gettempdir(), "smart_table_hub_update.sh")
-    with open(script, "w", encoding="utf-8") as fh:
-        fh.write(f"""#!/bin/bash
+    script = _write_temp_script(f"""#!/bin/bash
 DEB="{installer_path}"
 PID={os.getpid()}
 while kill -0 "$PID" 2>/dev/null; do sleep 0.5; done
 pkexec sh -c "dpkg -i '$DEB' || apt-get -f install -y"
 rm -f "$DEB"
+rmdir "$(dirname "$DEB")" 2>/dev/null || true
 EXE="{exe}"
 [ -n "$EXE" ] && [ -x "$EXE" ] && "$EXE" &
 rm -f "$0"
-""")
-    os.chmod(script, 0o755)
+""", ".sh")
     subprocess.Popen(["/bin/bash", script], start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return True
@@ -430,7 +462,8 @@ class UpdateManager:
 
     def _download_once(self, release, asset, attempt):
         """跑一轮下载，阻塞到结束。返回 (本地路径, 错误文本, 下载器)。"""
-        dest = os.path.join(tempfile.gettempdir(), asset["name"])
+        # 每轮一个只有本用户可写的随机临时目录，包名保持原样（校验/安装器都认文件名）
+        dest = os.path.join(tempfile.mkdtemp(prefix=_TEMP_PREFIX), asset["name"])
         label = tr("正在下载 {} …").format(asset['name'])
         if attempt > 1:
             label = tr("正在重试下载（第 {}/{} 次）{} …").format(
@@ -481,7 +514,7 @@ class UpdateManager:
         deleteLater，Qt 会报 "QThread: Destroyed while thread is still
         running" 然后 abort——升级过程中闪退就是这么来的。
         """
-        downloader.wait(2000)
+        downloader.wait()          # finished 已发出，run() 马上返回，这里几乎不等
         if downloader in self._pending:
             self._pending.remove(downloader)
         if self._downloader is downloader:
@@ -489,7 +522,12 @@ class UpdateManager:
         downloader.deleteLater()
 
     def _stop_downloader(self):
-        """取消并等待当前下载线程结束，绝不在它还在跑时撒手。"""
+        """取消并等待当前下载线程结束。
+
+        cancel() 会掐断底层连接，线程通常立刻退出；万一没退干净，它仍留在
+        _pending 里（由 finished→_retire_downloader 或 shutdown 收尾），这里只是
+        不再把它当"当前下载"。
+        """
         current = self._downloader
         if current is None:
             return
@@ -498,23 +536,31 @@ class UpdateManager:
         self._downloader = None
 
     def shutdown(self):
-        """退出应用前调用：下载线程还在跑时被销毁，Qt 会 abort。"""
+        """退出应用前调用：一直等到线程真的结束。
+
+        带超时的 wait 一旦超时，线程还在跑，Qt 就会在销毁它时 abort 整个进程——
+        与其那样，不如多等一会。cancel() 已经掐断了连接，这个等待实际很短。
+        """
         self._user_cancelled = True
         self._stop_downloader()
         for downloader in list(self._pending):   # 还没退干净的也要等
             downloader.cancel()
-            downloader.wait(3000)
+            downloader.wait()
         self._pending.clear()
         checker = self._checker
         if checker is not None and checker.isRunning():
-            checker.wait(3000)
+            checker.wait()
         self._checker = None
 
     @staticmethod
     def _quiet_unlink(path):
-        """删不掉就算了——升级流程里抛异常会把整个应用带走。"""
+        """删不掉就算了——升级流程里抛异常会把整个应用带走。顺带清掉空的临时目录。"""
         try:
             os.unlink(path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(path))
         except OSError:
             pass
 

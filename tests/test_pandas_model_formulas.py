@@ -9,12 +9,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import pytest
-from PyQt6.QtCore import QCoreApplication, Qt
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
 
 from qtui.pandas_model import PandasTableModel
 
 # QAbstractTableModel 需要应用实例存在（无需事件循环）
-_app = QCoreApplication.instance() or QCoreApplication([])
+_app = QApplication.instance() or QApplication([])   # 须是 GUI 应用：同一进程里其他测试要建控件
 
 
 def make_model():
@@ -594,3 +595,73 @@ class TestDtypeHandling:
         m.setData(m.index(1, 1), '=A2*2')
         m.clear_formulas()
         assert not m.formulas and not m._dependents and not m._formula_deps
+
+
+class TestBatchedSignals:
+    """整片操作只发一次外接矩形的 dataChanged。"""
+
+    @staticmethod
+    def _collect(m, role):
+        seen = []
+        m.dataChanged.connect(
+            lambda tl, br, roles=None: seen.append((tl.row(), tl.column(), br.row(), br.column()))
+            if roles and role in roles else None)
+        return seen
+
+    def test_recalc_emits_one_rect_for_dependents(self):
+        m = PandasTableModel(pd.DataFrame({'X': [1.0, 2.0, 3.0], 'Y': 0.0, 'Z': 0.0}))
+        for i in range(3):
+            m.setData(m.index(i + 1, 1), '=A2*2')
+        m.setData(m.index(1, 2), '=B2+1')
+        seen = self._collect(m, Qt.ItemDataRole.DisplayRole)
+        m.setData(m.index(1, 0), '5')
+        # 编辑格自身一次 + 全部依赖公式一个矩形
+        assert seen == [(1, 0, 1, 0), (1, 1, 3, 2)]
+        assert m.df.iat[2, 1] == 10.0 and m.df.iat[0, 2] == 11.0
+
+    def test_apply_cell_colors_emits_one_background_rect_and_undo_too(self):
+        m = make_model()
+        seen = self._collect(m, Qt.ItemDataRole.BackgroundRole)
+        assert m.apply_cell_colors([(-1, 0), (0, 1), (2, 0)], '#ff0000')
+        assert seen == [(0, 0, 3, 1)]                  # 表头行 -1 -> 视图第 0 行
+        assert m.cell_colors == {(-1, 0): '#ff0000', (0, 1): '#ff0000', (2, 0): '#ff0000'}
+        colors = []
+        m.cellColorsChanged.connect(colors.append)
+        assert m.undo()
+        assert seen == [(0, 0, 3, 1)] * 2 and not m.cell_colors
+        assert colors == [[(-1, 0, None), (0, 1, None), (2, 0, None)]]
+        assert m.redo()
+        assert m.cell_colors == {(-1, 0): '#ff0000', (0, 1): '#ff0000', (2, 0): '#ff0000'}
+        assert colors[-1] == [(-1, 0, '#ff0000'), (0, 1, '#ff0000'), (2, 0, '#ff0000')]
+
+    def test_set_cell_color_single_still_emits(self):
+        m = make_model()
+        seen = self._collect(m, Qt.ItemDataRole.BackgroundRole)
+        m.set_cell_color(1, 1, '#00ff00')
+        assert seen == [(2, 1, 2, 1)] and m.cell_colors == {(1, 1): '#00ff00'}
+        assert not m._undo_stack                       # 不入撤销栈
+
+
+class TestSetDataframeIndex:
+    """模型假定行标签 == 位置：非连续索引进来要重置，否则排序/删行按标签错位。"""
+
+    def test_non_range_index_is_reset(self):
+        df = pd.DataFrame({'X': [3.0, 1.0, 2.0]}, index=[10, 20, 30])
+        m = PandasTableModel()
+        m.set_dataframe(df)
+        assert list(m.df.index) == [0, 1, 2]
+        assert m.sort_positions([(0, True)]) == [1, 2, 0]
+        m.remove_rows([0])
+        assert m.df['X'].tolist() == [1.0, 2.0]
+
+    def test_filtered_slice_index_is_reset(self):
+        base = pd.DataFrame({'X': [5.0, 6.0, 7.0, 8.0]})
+        m = PandasTableModel()
+        m.set_dataframe(base[base['X'] > 5.5])
+        assert list(m.df.index) == [0, 1, 2]
+
+    def test_clean_range_index_keeps_same_object(self):
+        df = pd.DataFrame({'X': [1.0, 2.0]})
+        m = PandasTableModel()
+        m.set_dataframe(df)
+        assert m.df is df                              # 宿主依赖 original_df 与模型共享对象

@@ -7,6 +7,7 @@ LoadingProgressDialog: 对应 Tkinter 版 ui/dialogs.py 的同名类。
 """
 
 import sys
+import threading
 import traceback
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -15,6 +16,34 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.i18n import tr
+
+# sys.setswitchinterval 是进程全局的：两个后台任务重叠时，先结束的那个若把
+# 它"还原"成自己进来时看到的 0.001，第二个结束时再还原也还是 0.001，
+# 原始值就永远丢了。用引用计数：第一个进来时记下原值，最后一个出去时还原。
+_FAST_SWITCH_INTERVAL = 0.001
+_switch_lock = threading.Lock()
+_switch_depth = 0
+_switch_saved = None
+
+
+def _enter_fast_switch():
+    global _switch_depth, _switch_saved
+    with _switch_lock:
+        if _switch_depth == 0:
+            _switch_saved = sys.getswitchinterval()
+            sys.setswitchinterval(_FAST_SWITCH_INTERVAL)
+        _switch_depth += 1
+
+
+def _exit_fast_switch():
+    global _switch_depth, _switch_saved
+    with _switch_lock:
+        if _switch_depth == 0:
+            return
+        _switch_depth -= 1
+        if _switch_depth == 0 and _switch_saved is not None:
+            sys.setswitchinterval(_switch_saved)
+            _switch_saved = None
 
 
 class _Worker(QThread):
@@ -29,15 +58,14 @@ class _Worker(QThread):
     def run(self):
         # 纯 Python 密集任务（如 openpyxl 写盘）会长时间占住 GIL，
         # 把主线程 UI 一起拖卡；缩短切换间隔让 UI 线程更容易抢到 GIL。
-        old_interval = sys.getswitchinterval()
-        sys.setswitchinterval(0.001)
+        _enter_fast_switch()
         try:
             result = self._func()
             self.finished_ok.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())
         finally:
-            sys.setswitchinterval(old_interval)
+            _exit_fast_switch()
             # 释放闭包引用（保存任务的闭包会持有所有 sheet 的 DataFrame）
             self._func = None
 

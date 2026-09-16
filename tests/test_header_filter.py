@@ -16,6 +16,7 @@ _app = QApplication.instance() or QApplication([])
 
 from qtui import filter_engine
 from qtui.header_filter import BLANK_LABEL, ColumnFilterPopup, FilterHeaderView
+from qtui.i18n import tr
 from qtui.main_window import MainWindow
 
 
@@ -173,7 +174,7 @@ class TestPopup:
 
     def test_blank_value_is_labelled(self):
         p = self._popup([("", 3)])
-        assert BLANK_LABEL in p.value_list.item(0).text()
+        assert tr(BLANK_LABEL) in p.value_list.item(0).text()   # 英文界面下是 (Blank)
         assert p.value_list.item(0).data(Qt.ItemDataRole.UserRole) == ""
 
     def test_nothing_checked_clears_when_filter_exists(self):

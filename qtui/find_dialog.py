@@ -7,13 +7,16 @@ import bisect
 import re
 
 import numpy as np
+import pandas as pd
 
 from PyQt6.QtWidgets import (
     QDialog, QGridLayout, QLabel, QLineEdit, QPushButton, QCheckBox,
     QMessageBox,
 )
 
+from qtui.filter_engine import display_text
 from qtui.i18n import tr
+from qtui.pandas_model import _format_cell
 
 
 class FindReplaceDialog(QDialog):
@@ -80,15 +83,27 @@ class FindReplaceDialog(QDialog):
         case = self.case_cb.isChecked()
         needle = text if case else text.lower()
         for col_idx in range(len(df.columns)):
-            series = df.iloc[:, col_idx].astype(str)
+            # 按表格里显示的文本搜索：缺失值是空串（不会因 "nan"/"None" 被
+            # 误命中），10.0 显示为 10
+            series = display_text(df.iloc[:, col_idx])
             if not case:
                 series = series.str.lower()
             mask = series.str.contains(needle, regex=False, na=False).to_numpy()
             # 用位置而非索引标签，确保与 iat/model.index 的 0 基行号一致
-            for row_pos in np.flatnonzero(mask):
-                matches.append((int(row_pos), col_idx))
+            matches.extend((int(row_pos), col_idx)
+                           for row_pos in np.flatnonzero(mask))
         matches.sort()
         return matches
+
+    @staticmethod
+    def _cell_text(value):
+        """被替换单元格的当前文本；缺失值返回 None（没有可替换的内容）。"""
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return _format_cell(value)
 
     def _in_bounds(self, row, col):
         df = self._host.model.df
@@ -129,7 +144,11 @@ class FindReplaceDialog(QDialog):
             self.find_next()
             return
         model = self._host.model
-        old = str(model.df.iat[row, col])
+        old = self._cell_text(model.df.iat[row, col])
+        if old is None:                       # 缺失值里没有可替换的文本
+            self._invalidate()
+            self.find_next()
+            return
         new = self._replace_in(old)
         model.setData(model.index(row + model.HEADER_ROWS, col), new)  # 视图行偏移表头行
         # 重新搜索后从"刚替换位置之后"继续，而不是跳回第一个匹配
@@ -147,7 +166,9 @@ class FindReplaceDialog(QDialog):
         for row, col in matches:
             if not self._in_bounds(row, col):
                 continue
-            old = str(model.df.iat[row, col])
+            old = self._cell_text(model.df.iat[row, col])
+            if old is None:                   # NaN/None 不是 "nan"/"None"，绝不改写
+                continue
             new = self._replace_in(old)
             if model.setData(model.index(row + model.HEADER_ROWS, col), new):  # 视图行偏移表头行
                 count += 1

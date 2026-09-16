@@ -135,3 +135,31 @@ class TestMainWindow:
         assert not win.model._undo_stack and not win.model._redo_stack
         win._sort_by_keys([(1, True)])
         assert not win.model._undo_stack
+
+
+class TestDatetimeSortKey:
+    """日期列 NaT 必须排最后：to_numeric 会把 NaT 变成 int64 最小值排到最前。"""
+
+    def test_nat_last_regardless_of_direction(self):
+        m = PandasTableModel(pd.DataFrame({
+            "d": pd.to_datetime(["2024-03-01", None, "2023-01-01", "2025-06-30"]),
+            "v": ["b", "nat", "a", "c"],
+        }))
+        asc = m.sort_positions([(0, True)])
+        desc = m.sort_positions([(0, False)])
+        assert [m.df.iat[p, 1] for p in asc] == ["a", "b", "c", "nat"]
+        assert [m.df.iat[p, 1] for p in desc] == ["c", "b", "a", "nat"]
+
+    def test_timedelta_nat_last(self):
+        m = PandasTableModel(pd.DataFrame({
+            "t": pd.to_timedelta(["2h", None, "1h"]),
+        }))
+        assert m.sort_positions([(0, True)]) == [2, 0, 1]
+        assert m.sort_positions([(0, False)]) == [0, 2, 1]
+
+    def test_datetime_as_secondary_key_after_group(self):
+        m = PandasTableModel(pd.DataFrame({
+            "g": ["x", "x", "y", "x"],
+            "d": pd.to_datetime(["2024-01-02", None, "2024-01-01", "2024-01-01"]),
+        }))
+        assert m.sort_positions([(0, True), (1, True)]) == [3, 0, 1, 2]

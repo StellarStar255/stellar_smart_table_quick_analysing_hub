@@ -15,7 +15,10 @@ import traceback
 
 import pandas as pd
 
-pd.set_option("future.no_silent_downcasting", True)
+try:
+    pd.set_option("future.no_silent_downcasting", True)
+except pd.errors.OptionError:
+    pass   # 旧版 pandas 没有这个选项（行为本就是不静默降型），不能因此启动失败
 
 # 环境变量可能指向其他 Python 安装的 Qt 插件（版本不匹配会导致启动失败），
 # 强制使用当前 PyQt6 自带的插件目录。打包后（PyInstaller）插件已内置，跳过。

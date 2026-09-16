@@ -2,14 +2,17 @@
 """Python 分析窗口的「AI 生成代码」：用自然语言描述需求，由 Claude 生成 pandas 代码。
 
 - 提示词只带表的结构（列名、类型、少量样例值），不上传整张表
-- 调用在后台线程，结果回到编辑器；API Key / 模型存在 QSettings（明文，本机）
+- 调用在后台线程，结果回到编辑器；模型 / Base URL 存在 QSettings；
+  API Key 优先存进系统钥匙串（keyring：macOS Keychain / Windows 凭据管理器），
+  没装 keyring 或钥匙串不可用时退回 QSettings（明文，本机）
 - 没配 Key 时走 anthropic SDK 的默认凭据（ANTHROPIC_API_KEY 环境变量或 ant auth login）
 """
 
+import inspect
 import re
 
 import pandas as pd
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, QCoreApplication
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QComboBox, QPlainTextEdit, QCheckBox, QPushButton, QDialogButtonBox,
@@ -18,26 +21,75 @@ from PyQt6.QtWidgets import (
 
 from qtui.i18n import tr
 
+try:
+    import keyring
+except ImportError:          # 可选依赖：没装就用 QSettings
+    keyring = None
+
 DEFAULT_MODEL = "claude-opus-5"
 MODEL_CHOICES = ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1", "claude-haiku-4-5"]
 MAX_TOKENS = 8000
 SAMPLE_VALUES = 5
 SAMPLE_ROWS = 200        # 取样例值时只看前这么多行，大表也很快
 MAX_COLUMNS_IN_PROMPT = 80
+# 生成一段 pandas 代码通常十几秒；SDK 默认 10 分钟超时 × 2 次重试会让
+# 一次断网把后台线程挂住二十多分钟
+API_TIMEOUT_SECONDS = 60.0
+API_MAX_RETRIES = 1
 
 
 # ---------------------------------------------------------------------------
 # 设置
 # ---------------------------------------------------------------------------
 
+_KEYRING_SERVICE = "SmartTableHub"
+_KEYRING_USER = "anthropic_api_key"
+
+
 def _settings():
     return QSettings("SmartTableHub", "SmartTableHubQt")
 
 
+def _keyring_get():
+    """钥匙串里的 Key；keyring 不可用（未安装 / 没有后端 / 被拒）返回 None。"""
+    if keyring is None:
+        return None
+    try:
+        return keyring.get_password(_KEYRING_SERVICE, _KEYRING_USER)
+    except Exception:            # noqa: BLE001 —— NoKeyringError、权限拒绝等都视为不可用
+        return None
+
+
+def _keyring_set(key):
+    """写入（key 为空则删除）钥匙串条目；成功返回 True。"""
+    if keyring is None:
+        return False
+    try:
+        if key:
+            keyring.set_password(_KEYRING_SERVICE, _KEYRING_USER, key)
+        else:
+            try:
+                keyring.delete_password(_KEYRING_SERVICE, _KEYRING_USER)
+            except Exception:    # noqa: BLE001 —— 本来就没有条目
+                pass
+        return True
+    except Exception:            # noqa: BLE001
+        return False
+
+
 def load_settings():
     s = _settings()
+    plain = (s.value("ai/api_key") or "").strip()
+    api_key = _keyring_get()
+    if api_key is None:
+        api_key = plain
+        # 首次读取：把旧版本明文存的 Key 迁进钥匙串，成功后抹掉明文
+        if plain and _keyring_set(plain):
+            s.remove("ai/api_key")
+    elif plain:
+        s.remove("ai/api_key")   # 钥匙串已有：残留的明文不再需要
     return {
-        "api_key": (s.value("ai/api_key") or "").strip(),
+        "api_key": (api_key or "").strip(),
         "model": (s.value("ai/model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
         "base_url": (s.value("ai/base_url") or "").strip(),
     }
@@ -45,7 +97,11 @@ def load_settings():
 
 def save_settings(values):
     s = _settings()
-    s.setValue("ai/api_key", values.get("api_key", ""))
+    key = values.get("api_key", "") or ""
+    if _keyring_set(key):
+        s.remove("ai/api_key")
+    else:
+        s.setValue("ai/api_key", key)
     s.setValue("ai/model", values.get("model", DEFAULT_MODEL))
     s.setValue("ai/base_url", values.get("base_url", ""))
 
@@ -94,10 +150,12 @@ def describe_frame(df):
         return tr("（当前没有数据）")
     lines = [tr("表：{} 行 × {} 列").format(len(df), len(df.columns)), tr("列（名称 | 类型 | 非空数 | 样例值）:")]
     cols = list(df.columns)
-    for c in cols[:MAX_COLUMNS_IN_PROMPT]:
-        s = df[c]
+    shown = df.iloc[:, :MAX_COLUMNS_IN_PROMPT]
+    counts = shown.count()          # 一次向量化统计非空数，不逐列 notna().sum()
+    for i, c in enumerate(cols[:MAX_COLUMNS_IN_PROMPT]):
+        s = shown.iloc[:, i]        # 按位置取，列名重复时也不会拿到一个 DataFrame
         samples = ", ".join(repr(v) for v in _sample_values(s))
-        lines.append(f"- {c!r} | {s.dtype} | {int(s.notna().sum())} | {samples}")
+        lines.append(f"- {c!r} | {s.dtype} | {int(counts.iloc[i])} | {samples}")
     if len(cols) > MAX_COLUMNS_IN_PROMPT:
         lines.append(tr("…还有 {} 列未列出").format(len(cols) - MAX_COLUMNS_IN_PROMPT))
     return "\n".join(lines)
@@ -159,7 +217,7 @@ class CodeGenWorker(QThread):
         except ImportError:
             raise RuntimeError(tr("未安装 anthropic SDK，请先执行: pip install anthropic"))
 
-        kwargs = {}
+        kwargs = {"timeout": API_TIMEOUT_SECONDS, "max_retries": API_MAX_RETRIES}
         if settings.get("api_key"):
             kwargs["api_key"] = settings["api_key"]
         if settings.get("base_url"):
@@ -169,16 +227,12 @@ class CodeGenWorker(QThread):
         messages = [{"role": "user", "content": user}]
 
         try:
-            if model.startswith(("claude-opus-5", "claude-fable")):
+            if _use_server_fallback(client, model, settings.get("base_url")):
                 # 安全分类器拒答时由服务端自动换模型重跑，不用自己维护列表
-                try:
-                    response = client.beta.messages.create(
-                        model=model, max_tokens=MAX_TOKENS,
-                        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-                        system=system, messages=messages)
-                except TypeError:   # 旧版 SDK 不认识 fallbacks 参数
-                    response = client.messages.create(
-                        model=model, max_tokens=MAX_TOKENS, system=system, messages=messages)
+                response = client.beta.messages.create(
+                    model=model, max_tokens=MAX_TOKENS,
+                    betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+                    system=system, messages=messages)
             else:
                 response = client.messages.create(
                     model=model, max_tokens=MAX_TOKENS, system=system, messages=messages)
@@ -202,6 +256,45 @@ class CodeGenWorker(QThread):
         if response.stop_reason == "max_tokens":
             raise RuntimeError(tr("生成的代码太长被截断，请把需求拆小一点"))
         return "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+
+
+def _use_server_fallback(client, model, base_url):
+    """是否走 beta 的服务端 fallbacks 路径。
+
+    只对支持它的模型开；配了 base_url（第三方网关）一律不开——网关多半
+    不认这个 beta；SDK 太旧、create 没有 fallbacks 参数时也不开。只看
+    签名，不再用 except TypeError 兜底：那会把别的 TypeError 也吞掉。
+    """
+    if base_url or not model.startswith(("claude-opus-5", "claude-fable")):
+        return False
+    try:
+        params = inspect.signature(client.beta.messages.create).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return "fallbacks" in params
+
+
+def _detach_worker(worker):
+    """对话框不再关心这个线程：让它跑完后自行销毁。
+
+    线程不挂在对话框下（父对象是 QApplication），对话框关了它也不会被
+    连带销毁——一个正在运行的 QThread 被销毁会直接 abort 整个进程。
+    """
+    if worker is None:
+        return
+    try:
+        worker.finished_ok.disconnect()
+        worker.failed.disconnect()
+    except TypeError:
+        pass                     # 本来就没连着
+    if worker.parent() is None:
+        # 没有 C++ 父对象时 Python 引用一断，sip 会立刻销毁这个还在跑的线程：
+        # 先攥住，等 finished→deleteLater 真正销毁后再放手
+        _DETACHED_WORKERS.add(worker)
+        worker.destroyed.connect(lambda *_: _DETACHED_WORKERS.discard(worker))
+
+
+_DETACHED_WORKERS = set()
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +323,11 @@ class AiSettingsDialog(QDialog):
         self.url_edit.setPlaceholderText(tr("可选，默认官方地址"))
         form.addRow(tr("Base URL:"), self.url_edit)
         lay.addLayout(form)
-        note = QLabel(tr("Key 明文保存在本机应用设置里，只用于本功能。生成时只发送列名、类型和少量样例值，不上传整张表。"))
+        if keyring is not None:
+            note_text = tr("Key 保存在系统钥匙串里（macOS 钥匙串 / Windows 凭据管理器），只用于本功能。生成时只发送列名、类型和少量样例值，不上传整张表。")
+        else:
+            note_text = tr("Key 明文保存在本机应用设置里，只用于本功能。生成时只发送列名、类型和少量样例值，不上传整张表。")
+        note = QLabel(note_text)
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
         lay.addWidget(note)
@@ -305,34 +402,36 @@ class AiGenerateDialog(QDialog):
         user = build_user_message(request, self._df, current, error, self._sheet_names)
         settings = load_settings()
         self.gen_btn.setEnabled(False)
-        self.status.setText(tr("正在生成（{}）…").format(settings["model"]))
-        self._worker = CodeGenWorker(settings, SYSTEM_PROMPT, user, self)
-        self._worker.finished_ok.connect(self._on_ok)
-        self._worker.failed.connect(self._on_fail)
-        self._worker.start()
+        self.status.setText(tr("正在生成（{}）… 点「取消」可放弃等待").format(settings["model"]))
+        # 父对象是应用而不是对话框：对话框先关掉时线程还能安全跑完；
+        # 线程结束后 finished→deleteLater 自行销毁
+        worker = CodeGenWorker(settings, SYSTEM_PROMPT, user, QCoreApplication.instance())
+        worker.finished.connect(worker.deleteLater)
+        worker.finished_ok.connect(self._on_ok)
+        worker.failed.connect(self._on_fail)
+        self._worker = worker
+        worker.start()
 
     def _on_ok(self, code):
         self.code = code
-        self._cleanup()
+        self._worker = None
         self.accept()
 
     def _on_fail(self, msg):
-        self._cleanup()
+        self._worker = None
         self.gen_btn.setEnabled(True)
         self.status.setText("")
         QMessageBox.warning(self, tr("AI 生成代码"), msg)
 
-    def _cleanup(self):
-        w, self._worker = self._worker, None
-        if w is not None:
-            w.deleteLater()
+    def _abandon_generation(self):
+        """用户在生成中取消：断开信号、放开引用，线程自己跑完后销毁（不阻塞、不销毁运行中的线程）。"""
+        worker, self._worker = self._worker, None
+        _detach_worker(worker)
 
     def reject(self):
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(2000)
+        self._abandon_generation()
         super().reject()
 
     def closeEvent(self, event):
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(2000)
+        self._abandon_generation()
         super().closeEvent(event)

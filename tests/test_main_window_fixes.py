@@ -13,7 +13,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
 import pandas as pd
 import pytest
 from PyQt6.QtGui import QAction
@@ -23,6 +22,15 @@ _app = QApplication.instance() or QApplication([])
 
 from qtui import main_window as mw_mod
 from qtui.main_window import MainWindow, MAX_SHEET_CACHE
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(tmp_path, monkeypatch):
+    """「复制列名」等偏好现在真的会持久化：测试里指到临时 ini，不污染用户设置。"""
+    from PyQt6.QtCore import QSettings
+    ini = str(tmp_path / "settings.ini")
+    monkeypatch.setattr(mw_mod, "_make_settings",
+                        lambda: QSettings(ini, QSettings.Format.IniFormat))
 
 
 @pytest.fixture

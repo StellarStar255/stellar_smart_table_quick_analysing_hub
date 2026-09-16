@@ -3,7 +3,8 @@
 PyQt6 版图片查看器 - 对应 Tkinter 版 ui/image_viewer.py。
 
 ImageViewer: 独立图片查看窗口，QGraphicsView 实现缩放和拖拽。
-copy_image_to_clipboard: 跨平台复制图片到剪贴板。
+copy_image_to_clipboard: 跨平台复制图片到剪贴板（同步）。
+copy_image_to_clipboard_async: 同上，但系统工具子进程在后台线程跑，不卡界面。
 """
 
 import mimetypes
@@ -11,7 +12,7 @@ import os
 import platform
 import subprocess
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QKeySequence, QPainter, QPixmap, QShortcut,
 )
@@ -24,11 +25,8 @@ from qtui.i18n import tr
 from qtui.image_utils import load_image
 
 
-def copy_image_to_clipboard(image_path):
-    """复制图片到剪贴板，成功返回 True"""
-    if not os.path.exists(image_path):
-        return False
-
+def _copy_via_system_tool(image_path):
+    """用系统工具把图片文件放进剪贴板（不碰 Qt，可在任意线程跑）；成功返回 True。"""
     system = platform.system()
     try:
         if system == 'Darwin':
@@ -37,7 +35,6 @@ def copy_image_to_clipboard(image_path):
             script = 'on run argv\nset the clipboard to (POSIX file (item 1 of argv))\nend run'
             subprocess.run(['osascript', '-e', script, image_path],
                            check=True, capture_output=True, timeout=10)
-            return True
         elif system == 'Windows':
             # PowerShell 单引号字符串不做插值，只需把 ' 写成 ''
             ps_path = image_path.replace("'", "''")
@@ -48,7 +45,6 @@ def copy_image_to_clipboard(image_path):
             '''
             subprocess.run(['powershell', '-NoProfile', '-Command', script],
                            check=True, capture_output=True, timeout=10)
-            return True
         else:
             mime = mimetypes.guess_type(image_path)[0]
             if not mime or not mime.startswith('image/'):
@@ -56,17 +52,77 @@ def copy_image_to_clipboard(image_path):
             subprocess.run(['xclip', '-selection', 'clipboard',
                             '-t', mime, '-i', image_path],
                            check=True, capture_output=True, timeout=10)
-            return True
-    except Exception:
-        # 系统工具失败时退回 Qt 剪贴板（粘贴为位图数据，已应用 EXIF 方向）
-        image = load_image(image_path)
-        if image.isNull():
-            return False
-        clipboard = QApplication.clipboard()
-        if clipboard is None:
-            return False
-        clipboard.setImage(image)
         return True
+    except Exception:                        # noqa: BLE001 —— 工具缺失/超时/报错都走 Qt 兜底
+        return False
+
+
+def _copy_via_qt(image_path):
+    """Qt 剪贴板兜底（粘贴为位图数据，已应用 EXIF 方向）。必须在 GUI 线程调用。"""
+    image = load_image(image_path)
+    if image.isNull():
+        return False
+    clipboard = QApplication.clipboard()
+    if clipboard is None:
+        return False
+    clipboard.setImage(image)
+    return True
+
+
+def copy_image_to_clipboard(image_path):
+    """复制图片到剪贴板，成功返回 True（同步：子进程最多阻塞 10 秒）。"""
+    if not os.path.exists(image_path):
+        return False
+    return _copy_via_system_tool(image_path) or _copy_via_qt(image_path)
+
+
+class _ClipboardSignals(QObject):
+    done = pyqtSignal(bool)
+
+
+class _ClipboardCopyTask(QRunnable):
+    def __init__(self, path, signals):
+        super().__init__()
+        self._path = path
+        self._signals = signals
+
+    def run(self):
+        self._signals.done.emit(_copy_via_system_tool(self._path))
+
+
+_clipboard_pool = None
+_clipboard_inflight = set()     # 任务完成前替 signals 对象保活
+
+
+def _pool():
+    global _clipboard_pool
+    if _clipboard_pool is None:
+        _clipboard_pool = QThreadPool()
+        # 串行：连续「下一张」时两个 osascript 并发跑，谁后完成谁进剪贴板，顺序会乱
+        _clipboard_pool.setMaxThreadCount(1)
+    return _clipboard_pool
+
+
+def copy_image_to_clipboard_async(image_path, callback):
+    """后台复制图片到剪贴板，完成后在 GUI 线程调用 callback(成功与否)。
+
+    osascript / powershell / xclip 偶尔要几秒（首次启动、系统卡顿），同步跑
+    会把整个界面冻住；这里放到单线程池里跑，Qt 兜底仍在 GUI 线程完成。
+    """
+    if not os.path.exists(image_path):
+        callback(False)
+        return
+    signals = _ClipboardSignals()
+    _clipboard_inflight.add(signals)
+
+    def _finish(ok):
+        _clipboard_inflight.discard(signals)
+        if not ok:
+            ok = _copy_via_qt(image_path)
+        callback(ok)
+
+    signals.done.connect(_finish)
+    _pool().start(_ClipboardCopyTask(image_path, signals))
 
 
 class _ZoomableView(QGraphicsView):
@@ -196,14 +252,22 @@ class ImageViewer(QMainWindow):
         menu.exec(event.globalPos())
 
     def _copy_image(self):
-        if copy_image_to_clipboard(self.image_path):
-            name = os.path.basename(self.image_path)
-            self.setWindowTitle(tr("{} (已复制)").format(name))
-            # 换图后恢复的是当前图片名，不是复制时那张
-            QTimer.singleShot(1500, lambda: self.setWindowTitle(
-                os.path.basename(self.image_path)))
-        else:
-            QMessageBox.warning(self, tr("错误"), tr("复制图片失败"))
+        path = self.image_path
+
+        def _done(ok):
+            try:
+                self.windowTitle()      # 窗口已被销毁（WA_DeleteOnClose）时这里抛 RuntimeError
+            except RuntimeError:
+                return
+            if ok:
+                self.setWindowTitle(tr("{} (已复制)").format(os.path.basename(path)))
+                # 换图后恢复的是当前图片名，不是复制时那张
+                QTimer.singleShot(1500, lambda: self.setWindowTitle(
+                    os.path.basename(self.image_path)))
+            else:
+                QMessageBox.warning(self, tr("错误"), tr("复制图片失败"))
+
+        copy_image_to_clipboard_async(path, _done)
 
     def _reveal_in_finder(self):
         system = platform.system()

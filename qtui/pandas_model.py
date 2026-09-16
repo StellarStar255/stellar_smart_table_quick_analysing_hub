@@ -119,6 +119,11 @@ class PandasTableModel(QAbstractTableModel):
         # 区域依赖只记边界：公式单元格 -> [(r0, r1, c0, c1), ...]。整列引用
         # 展开成几十万个键是清除筛选/打开文件时的主要卡顿来源
         self._formula_ranges = {}
+        # 区域反向索引：边界 -> 引用该区域的公式集合，再按列分桶
+        # （列 -> 触及该列的边界集合）。整列填充的公式共享同一边界，
+        # 查"谁依赖这个格"只需检查所在列的少数几个边界，而不是扫全部公式
+        self._range_formulas = {}
+        self._range_cols = {}
         self._engine = FormulaEngine()
         # 行列结构版本号：任何插入/删除/重排/整表替换都会递增，
         # 供公式剪贴板等按位置缓存的状态判断是否已失效
@@ -302,6 +307,101 @@ class PandasTableModel(QAbstractTableModel):
         self.modified = True
         return True
 
+    def set_cells(self, entries):
+        """批量写入单元格（粘贴/填充），语义等同对每条逐个调用 setData(EditRole)。
+
+        entries: (view_row, view_col, value) 的可迭代对象，坐标与 setData 收到的
+        index 一致：视图第 0 行是表头行（写入即重命名列，重名/空名与 setData
+        一样拒绝），数据行从 HEADER_ROWS 起；"=" 开头的字符串成为公式，数值
+        强转规则与 setData 相同；越界坐标忽略。与逐格 setData 的区别：
+        整批只记一条撤销记录（撤销一次全部恢复、重做一次全部重写，含表头重命名）、
+        只发一次外接矩形的 dataChanged、依赖登记与公式重算在最后只做一次
+        （公式按依赖拓扑序求值，结果与逐格写入一致）。返回是否有任何改动。
+        """
+        nrows, ncols = len(self._df), len(self._df.columns)
+        records = []      # 单格记录，格式同 setData 的撤销记录
+        renames = []      # (col, 旧名, 新名)
+        keys = set()
+        new_formulas = set()
+        for view_row, col, value in entries:
+            if not (0 <= col < ncols):
+                continue
+            if view_row == 0:
+                old_name = str(self._df.columns[col])
+                new_name = str(value).strip()
+                if not new_name or new_name == old_name:
+                    continue
+                if new_name in self._df.columns:
+                    self.renameFailed.emit(tr("列名无效或已存在"))
+                    continue
+                self._rename_column_impl(col, new_name)
+                renames.append((col, old_name, new_name))
+                continue
+            row = view_row - self.HEADER_ROWS
+            if not (0 <= row < nrows):
+                continue
+            key = (row, col)
+            old = self._df.iat[row, col]
+            old_dtype = self._df.iloc[:, col].dtype
+            old_formula = self.formulas.get(key)
+            text = str(value)
+            if text.startswith("=") and len(text) > 1:
+                if old_formula == text:
+                    continue
+                # 公式值不在此处求：最后把本批全部公式连同依赖闭包按拓扑序算一遍，
+                # 结果与逐格立即求值一致，且每个公式只算一次
+                new_formula = text
+                self.formulas[key] = text
+                new_formulas.add(key)
+            else:
+                new_formula = None
+                new = self._coerce(value, col)
+                old_str = "" if pd.isna(old) else str(old)
+                new_str = ("" if new is None or (isinstance(new, float) and pd.isna(new))
+                           else str(new))
+                if old_str == new_str and old_formula is None:
+                    continue
+                if old_formula:
+                    self.formulas.pop(key, None)
+                    self._unregister_deps(key)
+                    new_formulas.discard(key)
+                self._set_cell(row, col, new)
+            keys.add(key)
+            records.append([row, col, old, None, old_formula, new_formula, old_dtype])
+        if not records and not renames:
+            return False
+        if keys:
+            for key in new_formulas:
+                self._register_deps(key)
+            recalc = new_formulas | self._closure_of(keys)
+            self._recalc_cells(recalc, emit=False)
+            for rec in records:
+                rec[3] = self._df.iat[rec[0], rec[1]]
+            self._emit_cells_changed(keys | recalc)
+        self._push_undo(("__cells__", [tuple(r) for r in records], renames))
+        self.modified = True
+        return True
+
+    def _replay_cells(self, record, forward):
+        """撤销/重做一条 "__cells__" 批量记录：整批回放后重算一次、发一次信号。"""
+        _, records, renames = record
+        if forward:
+            for rec in records:
+                self._apply_cell_record(rec, forward=True)
+            for col, _old_name, new_name in renames:
+                self._rename_column_impl(col, new_name)
+        else:
+            for rec in reversed(records):
+                self._apply_cell_record(rec, forward=False)
+            for col, old_name, _new_name in reversed(renames):
+                self._rename_column_impl(col, old_name)
+        keys = {(rec[0], rec[1]) for rec in records}
+        if keys:
+            recalc = {k for k in keys if k in self.formulas} | self._closure_of(keys)
+            self._recalc_cells(recalc, emit=False)
+            self._emit_cells_changed(keys | recalc)
+        self.modified = True
+
     def clear_cells(self, cells):
         """批量清空数据单元格（Delete/Backspace）。
 
@@ -314,13 +414,22 @@ class PandasTableModel(QAbstractTableModel):
         for row, col in cells:
             if 0 <= row < nrows and 0 <= col < ncols:
                 by_col.setdefault(col, []).append(row)
+        # 公式按列分桶一次，避免每列都扫全部公式
+        formulas_by_col = {}
+        for (r, c), f in self.formulas.items():
+            if c in by_col:
+                formulas_by_col.setdefault(c, {})[r] = f
         entries = []
         for col, rows in by_col.items():
             rows = np.array(sorted(set(rows)), dtype=np.intp)
             series = self._df.iloc[:, col]
             old_vals = series.to_numpy(dtype=object)[rows]
-            formulas = {r: f for (r, c), f in self.formulas.items()
-                        if c == col and r in set(rows.tolist())}
+            col_formulas = formulas_by_col.get(col, {})
+            if len(col_formulas) <= len(rows):
+                row_set = set(rows.tolist())
+                formulas = {r: f for r, f in col_formulas.items() if r in row_set}
+            else:
+                formulas = {int(r): col_formulas[r] for r in rows.tolist() if r in col_formulas}
             blank = pd.isna(old_vals) | (old_vals == "")
             if formulas:
                 blank &= ~np.isin(rows, list(formulas))
@@ -370,19 +479,23 @@ class PandasTableModel(QAbstractTableModel):
         keys = set()
         for col, rows, *_ in entries:
             keys.update((int(r), col) for r in rows)
-        self._emit_cells_changed(keys)
         # 所有受影响的公式合并成一个闭包按依赖序算一遍，
         # 而不是每个被清的格各触发一轮（整列公式会被重算上千次）
-        self._recalc_cells(self._closure_of(keys))
+        closure = self._closure_of(keys)
+        self._recalc_cells(closure, emit=False)
+        self._emit_cells_changed(keys | closure)
         self.modified = True
 
-    def _emit_cells_changed(self, keys):
+    def _emit_cells_changed(self, keys, role=Qt.ItemDataRole.DisplayRole):
+        """对一片数据单元格（(数据行, 列)，-1 为表头行）发一次外接矩形的 dataChanged。"""
+        if not keys:
+            return
         rows = [r for r, _ in keys]
         cols = [c for _, c in keys]
         self.dataChanged.emit(
             self.index(min(rows) + self.HEADER_ROWS, min(cols)),
             self.index(max(rows) + self.HEADER_ROWS, max(cols)),
-            [Qt.ItemDataRole.DisplayRole])
+            [role])
 
     def _apply_cell_record(self, record, forward):
         """回放一条单元格编辑记录（forward=False 撤销 / True 重做），不动撤销栈。"""
@@ -420,6 +533,13 @@ class PandasTableModel(QAbstractTableModel):
             self._formula_deps[formula_cell] = keys
         if ranges:
             self._formula_ranges[formula_cell] = ranges
+            for bounds in ranges:
+                fcells = self._range_formulas.get(bounds)
+                if fcells is None:
+                    fcells = self._range_formulas[bounds] = set()
+                    for c in range(bounds[2], bounds[3] + 1):
+                        self._range_cols.setdefault(c, set()).add(bounds)
+                fcells.add(formula_cell)
 
     def _unregister_deps(self, formula_cell):
         for key in self._formula_deps.pop(formula_cell, ()):
@@ -428,27 +548,44 @@ class PandasTableModel(QAbstractTableModel):
                 deps.discard(formula_cell)
                 if not deps:
                     del self._dependents[key]
-        self._formula_ranges.pop(formula_cell, None)
+        for bounds in self._formula_ranges.pop(formula_cell, ()):
+            fcells = self._range_formulas.get(bounds)
+            if fcells is None:
+                continue
+            fcells.discard(formula_cell)
+            if not fcells:
+                del self._range_formulas[bounds]
+                for c in range(bounds[2], bounds[3] + 1):
+                    col_bounds = self._range_cols.get(c)
+                    if col_bounds is not None:
+                        col_bounds.discard(bounds)
+                        if not col_bounds:
+                            del self._range_cols[c]
 
-    def _rebuild_all_deps(self):
+    def _clear_dep_index(self):
         self._dependents.clear()
         self._formula_deps.clear()
         self._formula_ranges.clear()
+        self._range_formulas.clear()
+        self._range_cols.clear()
+
+    def _rebuild_all_deps(self):
+        self._clear_dep_index()
         for key in list(self.formulas):
             self._register_deps(key)
 
-    @staticmethod
-    def _in_ranges(cell, ranges):
-        r, c = cell
-        return any(r0 <= r <= r1 and c0 <= c <= c1 for r0, r1, c0, c1 in ranges)
-
     def _dependents_of(self, cell):
-        """直接依赖 cell 的公式单元格：单格登记的 + 区域包含它的。"""
+        """直接依赖 cell 的公式单元格：单格登记的 + 区域包含它的。
+
+        区域部分只看 cell 所在列的边界桶：O(该列不同区域数)，与公式总数无关。
+        """
         out = set(self._dependents.get(cell, ()))
-        if self._formula_ranges:
-            for fcell, ranges in self._formula_ranges.items():
-                if self._in_ranges(cell, ranges):
-                    out.add(fcell)
+        col_bounds = self._range_cols.get(cell[1])
+        if col_bounds:
+            r = cell[0]
+            for bounds in col_bounds:
+                if bounds[0] <= r <= bounds[1]:
+                    out.update(self._range_formulas[bounds])
         return out
 
     def _closure_of(self, seeds):
@@ -463,8 +600,16 @@ class PandasTableModel(QAbstractTableModel):
                     queue.append(fcell)
         return closure
 
-    def _dependent_closure(self, changed_cell):
-        return self._closure_of([changed_cell])
+    @staticmethod
+    def _cells_in_bounds(rows_by_col, bounds):
+        """集合内落在边界里的单元格。rows_by_col: 列 -> 升序行号列表（二分查找）。"""
+        r0, r1, c0, c1 = bounds
+        out = set()
+        for c, rows in rows_by_col.items():
+            if c0 <= c <= c1:
+                lo, hi = bisect.bisect_left(rows, r0), bisect.bisect_right(rows, r1)
+                out.update((r, c) for r in rows[lo:hi])
+        return out
 
     def _evaluation_order(self, cells):
         """对公式单元格集合做拓扑排序（被依赖者在前）。返回 (有序列表, 环上单元格集合)。
@@ -472,17 +617,36 @@ class PandasTableModel(QAbstractTableModel):
         Kahn 算法，只看集合内部的边；自引用/互引用的单元格入度永远不为零，
         留在环集合里。依赖顺序错误会让 B2=A2*2、C2=A2+B2 这类菱形依赖
         用旧 B2 算 C2（集合迭代顺序随机，错误不可复现）。
+
+        区域边：同一组区域边界（整列填充的公式完全相同）落在集合内的成员
+        只算一次并缓存，按列二分定位而不是逐格比对——否则千行区域公式是 O(N²)。
         """
         cells = set(cells)
+        rows_by_col = {}
+        for r, c in cells:
+            rows_by_col.setdefault(c, []).append(r)
+        for rows in rows_by_col.values():
+            rows.sort()
+        members_cache = {}
         indeg = {}
         for cell in cells:
+            ranges = self._formula_ranges.get(cell)
+            members = ()
+            if ranges:
+                key = tuple(ranges)
+                members = members_cache.get(key)
+                if members is None:
+                    members = set()
+                    for bounds in ranges:
+                        members |= self._cells_in_bounds(rows_by_col, bounds)
+                    members_cache[key] = members
             # 去重：同一依赖既被单格引用又落在区域里只算一条边，
             # 与下方按 _dependents_of（集合）递减的口径一致
-            deps = {dep for dep in self._formula_deps.get(cell, ()) if dep in cells}
-            ranges = self._formula_ranges.get(cell)
-            if ranges:
-                deps.update(other for other in cells if self._in_ranges(other, ranges))
-            indeg[cell] = len(deps)
+            n = len(members)
+            for dep in self._formula_deps.get(cell, ()):
+                if dep in cells and dep not in members:
+                    n += 1
+            indeg[cell] = n
         queue = deque(sorted(c for c in cells if indeg[c] == 0))
         order = []
         while queue:
@@ -495,28 +659,34 @@ class PandasTableModel(QAbstractTableModel):
                         queue.append(fcell)
         return order, cells.difference(order)
 
-    def _emit_cell_changed(self, row, col):
-        idx = self.index(row + self.HEADER_ROWS, col)
-        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
-
     def _recalc_dependents(self, changed_cell):
         """被引用单元格变化后，按依赖顺序重算所有（传递）依赖它的公式。
 
         迭代实现：千行以上的连锁公式（=A2+1 填充到底）递归会栈溢出。
         环上的公式写入 #CIRC!。
         """
-        self._recalc_cells(self._dependent_closure(changed_cell))
+        self._recalc_cells(self._closure_of([changed_cell]))
 
-    def _recalc_cells(self, closure):
+    def _recalc_cells(self, closure, emit=True, keep_unsupported=False):
+        """按依赖顺序重算 closure 中的公式单元格。
+
+        emit: 结束后对整片单元格发一次外接矩形的 dataChanged（结构操作在
+        begin/endResetModel 或 begin/endInsert* 之间调用时传 False，视图会整体刷新）。
+        keep_unsupported: #NAME?/#ERROR（引擎不支持的函数/语法）不覆盖现有值，
+        与 evaluate_all_formulas 的口径一致。
+        """
         if not closure:
             return
         order, cyclic = self._evaluation_order(closure)
         for fcell in order:
-            self._set_cell(fcell[0], fcell[1], self._evaluate(self.formulas[fcell]))
-            self._emit_cell_changed(*fcell)
+            result = self._evaluate(self.formulas[fcell])
+            if keep_unsupported and result in ("#NAME?", "#ERROR"):
+                continue
+            self._set_cell(fcell[0], fcell[1], result)
         for fcell in cyclic:
             self._set_cell(fcell[0], fcell[1], "#CIRC!")
-            self._emit_cell_changed(*fcell)
+        if emit:
+            self._emit_cells_changed(closure)
 
     def evaluate_all_formulas(self, keep_cached_on_error=False):
         """按依赖顺序重算全部公式并写入 df（载入公式/结构变更后调用）。
@@ -551,9 +721,7 @@ class PandasTableModel(QAbstractTableModel):
     def clear_formulas(self):
         """丢弃全部公式（df 中保留当前计算值），依赖索引一并清空。"""
         self.formulas.clear()
-        self._dependents.clear()
-        self._formula_deps.clear()
-        self._formula_ranges.clear()
+        self._clear_dep_index()
 
     def _coerce(self, value, col):
         """尽量保持列的数值类型；无法转换时整列转为 object。"""
@@ -608,74 +776,53 @@ class PandasTableModel(QAbstractTableModel):
             self._undo_stack.pop(0)
         self._redo_stack.clear()
 
-    def undo(self):
-        if not self._undo_stack:
-            return False
-        record = self._undo_stack.pop()
-        if record[0] == "__rename__":
-            _, col, old_name, new_name = record
-            self._rename_column_impl(col, old_name)
-            self._redo_stack.append(record)
-            return True
-        if record[0] == "__color__":
-            for row, col, old, _new in record[1]:
-                self.set_cell_color(row, col, old)
-            self._redo_stack.append(record)
-            self.modified = True
-            self.cellColorsChanged.emit(
-                [(r, c, old) for r, c, old, _new in record[1]])
-            return True
-        if record[0] == "__batch__":
+    # 撤销记录按首元素分派：带标记的批量/结构记录 -> 对应回放函数，
+    # 否则是单格编辑记录 (row, col, old, new, old_formula, new_formula, old_dtype)
+    def _replay_rename(self, record, forward):
+        _, col, old_name, new_name = record
+        self._rename_column_impl(col, new_name if forward else old_name)
+
+    def _replay_clear(self, record, forward):
+        if forward:
+            self._apply_clear_entries(record[1])
+        else:
             self._restore_clear_entries(record[1])
-            self._redo_stack.append(record)
-            self._after_batch(record[1])
-            return True
-        if record[0] == "__struct__":
-            self._replay_struct(record, forward=False)
-            self._redo_stack.append(record)
-            return True
+        self._after_batch(record[1])
+
+    def _replay_cell(self, record, forward):
         row, col = record[0], record[1]
-        self._apply_cell_record(record, forward=False)
-        self._redo_stack.append(record)
+        self._apply_cell_record(record, forward)
         idx = self.index(row + self.HEADER_ROWS, col)
         self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
         self._recalc_dependents((row, col))
         self.modified = True
+
+    _REPLAYERS = {
+        "__rename__": "_replay_rename",
+        "__color__": "_replay_colors",
+        "__batch__": "_replay_clear",
+        "__struct__": "_replay_struct",
+        "__cells__": "_replay_cells",
+    }
+
+    def _replay(self, record, forward):
+        """回放一条撤销记录（forward=False 撤销 / True 重做），不动撤销栈。"""
+        getattr(self, self._REPLAYERS.get(record[0], "_replay_cell"))(record, forward)
+
+    def undo(self):
+        if not self._undo_stack:
+            return False
+        record = self._undo_stack.pop()
+        self._replay(record, forward=False)
+        self._redo_stack.append(record)
         return True
 
     def redo(self):
         if not self._redo_stack:
             return False
         record = self._redo_stack.pop()
-        if record[0] == "__rename__":
-            _, col, old_name, new_name = record
-            self._rename_column_impl(col, new_name)
-            self._undo_stack.append(record)
-            return True
-        if record[0] == "__color__":
-            for row, col, _old, new in record[1]:
-                self.set_cell_color(row, col, new)
-            self._undo_stack.append(record)
-            self.modified = True
-            self.cellColorsChanged.emit(
-                [(r, c, new) for r, c, _old, new in record[1]])
-            return True
-        if record[0] == "__batch__":
-            self._apply_clear_entries(record[1])
-            self._undo_stack.append(record)
-            self._after_batch(record[1])
-            return True
-        if record[0] == "__struct__":
-            self._replay_struct(record, forward=True)
-            self._undo_stack.append(record)
-            return True
-        row, col = record[0], record[1]
-        self._apply_cell_record(record, forward=True)
+        self._replay(record, forward=True)
         self._undo_stack.append(record)
-        idx = self.index(row + self.HEADER_ROWS, col)
-        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
-        self._recalc_dependents((row, col))
-        self.modified = True
         return True
 
     def clear_history(self):
@@ -706,15 +853,18 @@ class PandasTableModel(QAbstractTableModel):
                       from_file=False):
         self.beginResetModel()
         self._invalidate_values()
+        index = df.index
+        if not (isinstance(index, pd.RangeIndex) and index.start == 0 and index.step == 1):
+            # 模型全程假定行标签 == 行位置（排序返回标签当位置用、删行按标签 drop），
+            # 筛选/切片得到的非连续索引直接进来会错位
+            df = df.reset_index(drop=True)
         self._df = df
         self.structure_version += 1
         self.highlight_row = -1
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.formulas = dict(formulas) if formulas else {}
-        self._dependents.clear()
-        self._formula_deps.clear()
-        self._formula_ranges.clear()
+        self._clear_dep_index()
         if self.formulas:
             # 纯公式行读回来是空行会被 pandas 裁掉，把表格补齐到公式覆盖的范围
             need_rows = max(r for r, _ in self.formulas) + 1 - len(self._df)
@@ -750,17 +900,21 @@ class PandasTableModel(QAbstractTableModel):
     def set_cell_color(self, row, col, color_hex):
         """设置/清除单元格背景色（row 为 0 基数据行，-1 表示表头行；
         color_hex 为 None 时清除）。不入撤销栈，批量入栈用 apply_cell_colors。"""
+        self._store_cell_color(row, col, color_hex)
+        idx = self.index(row + self.HEADER_ROWS, col)
+        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole])
+
+    def _store_cell_color(self, row, col, color_hex):
         if color_hex:
             self.cell_colors[(row, col)] = color_hex
         else:
             self.cell_colors.pop((row, col), None)
-        idx = self.index(row + self.HEADER_ROWS, col)
-        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole])
 
     def apply_cell_colors(self, cells, color_hex):
         """批量设置/清除背景色并记入撤销栈（一次操作 = 一条撤销记录）。
 
-        cells 为 (数据行, 列) 列表，行 -1 表示表头行。
+        cells 为 (数据行, 列) 列表，行 -1 表示表头行。整片只发一次
+        BackgroundRole 的 dataChanged（大选区逐格发信号会让视图刷新上万次）。
         """
         changes = []
         for row, col in cells:
@@ -768,13 +922,28 @@ class PandasTableModel(QAbstractTableModel):
             if old == (color_hex or None):
                 continue
             changes.append((row, col, old, color_hex))
-            self.set_cell_color(row, col, color_hex)
+            self._store_cell_color(row, col, color_hex)
         if changes:
+            self._emit_cells_changed([(r, c) for r, c, _o, _n in changes],
+                                     Qt.ItemDataRole.BackgroundRole)
             self._push_undo(("__color__", changes))
             self.modified = True
             self.cellColorsChanged.emit(
                 [(r, c, new) for r, c, _old, new in changes])
         return bool(changes)
+
+    def _replay_colors(self, record, forward):
+        """撤销/重做一条 "__color__" 记录：整片写回旧色/新色，只发一次信号。"""
+        changes = record[1]
+        applied = []
+        for row, col, old, new in changes:
+            color = new if forward else old
+            self._store_cell_color(row, col, color)
+            applied.append((row, col, color))
+        self._emit_cells_changed([(r, c) for r, c, _o, _n in changes],
+                                 Qt.ItemDataRole.BackgroundRole)
+        self.modified = True
+        self.cellColorsChanged.emit(applied)
 
     # ---------- 结构操作 ----------
 
@@ -948,6 +1117,12 @@ class PandasTableModel(QAbstractTableModel):
                     self._do_insert_column(start + i, name, values)
             else:
                 self._do_remove_columns(list(range(start, start + len(pairs))))
+        elif kind == "append_rows":
+            start, n = args[:-2]
+            if forward:
+                self._do_append_rows(n)
+            else:
+                self._do_remove_rows(list(range(start, start + n)))
         # 纯行重排不改变任何公式的值（引用随行一起移动），不必重算——
         # 整列填充了公式的表重算一遍要好几秒；其余结构操作照常重算
         self._restore_snapshot(after if forward else before, evaluate=(kind != "reorder"))
@@ -973,12 +1148,29 @@ class PandasTableModel(QAbstractTableModel):
         col_map = None
         if col_start is not None and col_delta:
             col_map = lambda i: i + col_delta if i >= col_start else i
+        self._rewrite_formulas(row_map, col_map)
+
+    def _rewrite_formulas(self, row_map, col_map):
+        """按行/列映射重写公式引用，只重算文本被改写的公式及其依赖闭包。
+
+        增删行列后其余公式引用的单元格位置和内容都没变，值不可能变化——
+        整表重算在整列填充公式的表上要好几秒。#NAME?/#ERROR 不覆盖现有值，
+        与 evaluate_all_formulas 口径一致。
+        """
+        changed = set()
         if self.formulas and (row_map or col_map):
-            self.formulas = {
-                key: self._engine.adjust_formula_refs(f, row_map, col_map)
-                for key, f in self.formulas.items()
-            }
-        self.evaluate_all_formulas()
+            adjust = self._engine.adjust_formula_refs
+            rewritten = {}
+            for key, f in self.formulas.items():
+                new_f = adjust(f, row_map, col_map)
+                if new_f != f:
+                    changed.add(key)
+                rewritten[key] = new_f
+            self.formulas = rewritten
+        self._rebuild_all_deps()
+        if changed:
+            self._recalc_cells(changed | self._closure_of(changed),
+                               emit=False, keep_unsupported=True)
 
     def _remove_keys(self, rows=None, cols=None):
         """删除行/列后丢弃对应键、压缩其余键位置，并重写公式引用。
@@ -1012,12 +1204,7 @@ class PandasTableModel(QAbstractTableModel):
 
         row_map = make_map(rows, sorted_rows) if rows else None
         col_map = make_map(cols, sorted_cols) if cols else None
-        if self.formulas and (row_map or col_map):
-            self.formulas = {
-                key: self._engine.adjust_formula_refs(f, row_map, col_map)
-                for key, f in self.formulas.items()
-            }
-        self.evaluate_all_formulas()
+        self._rewrite_formulas(row_map, col_map)
 
     def replace_dataframe(self, new_df: pd.DataFrame):
         """整表替换（可撤销）：分析结果回写当前 Sheet。
@@ -1031,9 +1218,7 @@ class PandasTableModel(QAbstractTableModel):
         self._df = new_df.reset_index(drop=True).copy()
         self.formulas = {}
         self.cell_colors = {}
-        self._dependents.clear()
-        self._formula_deps.clear()
-        self._formula_ranges.clear()
+        self._clear_dep_index()
         self.endResetModel()
         self._finish_structure()
         self._push_undo(("__struct__", "promote", old_df, self._df.copy(),
@@ -1064,11 +1249,61 @@ class PandasTableModel(QAbstractTableModel):
         self.beginInsertColumns(QModelIndex(), start, start + len(final) - 1)
         for i, (name, values) in enumerate(final):
             self._do_insert_column(start + i, name, values)
+        # 引用曾被裁剪在表格边缘之外的公式（=SUM(B2:Z2)、=D2）现在能读到新列，
+        # 重建依赖并重算它们，否则值永远过期
+        self._recalc_touching(col_from=start)
         self.endInsertColumns()
         self._finish_structure()
         self._push_undo(("__struct__", "add_columns", start, final,
                          before, self._snapshot()))
         return [n for n, _ in final]
+
+    def _do_append_rows(self, n):
+        pad = pd.DataFrame(np.full((n, len(self._df.columns)), np.nan),
+                           columns=self._df.columns)
+        self._df = pd.concat([self._df, pad]).reset_index(drop=True)
+
+    def append_rows(self, n: int) -> int:
+        """在表尾追加 n 个空行（可撤销的结构操作）。返回追加前的行数，即首个新行的数据行号。
+
+        既有单元格位置不变：公式、背景色、撤销栈全部保留（区别于用
+        set_dataframe 拼接空行——那会清空撤销栈）。整数列因 NaN 会升成
+        float，撤销时恢复原 dtype。引用范围曾被裁剪到表尾的公式会重算。
+        """
+        start = len(self._df)
+        if n <= 0:
+            return start
+        before = self._snapshot()
+        self._invalidate_values()
+        view_start = start + self.HEADER_ROWS
+        self.beginInsertRows(QModelIndex(), view_start, view_start + n - 1)
+        self._do_append_rows(n)
+        self._recalc_touching(row_from=start)
+        self.endInsertRows()
+        self._finish_structure()
+        self._push_undo(("__struct__", "append_rows", start, n, before, self._snapshot()))
+        return start
+
+    def _recalc_touching(self, row_from=None, col_from=None):
+        """表格向右/向下扩展后：重建依赖索引（区域按新边界裁剪），
+        重算引用到新增行/列的公式及其依赖闭包。不发信号（调用方在结构信号之间）。"""
+        self._rebuild_all_deps()
+        if not self.formulas:
+            return
+        touched = set()
+        for fcell, keys in self._formula_deps.items():
+            for r, c in keys:
+                if ((row_from is not None and r >= row_from)
+                        or (col_from is not None and c >= col_from)):
+                    touched.add(fcell)
+                    break
+        for (_r0, r1, _c0, c1), fcells in self._range_formulas.items():
+            if ((row_from is not None and r1 >= row_from)
+                    or (col_from is not None and c1 >= col_from)):
+                touched.update(fcells)
+        if touched:
+            self._recalc_cells(touched | self._closure_of(touched),
+                               emit=False, keep_unsupported=True)
 
     def promote_row_to_header(self, data_row: int):
         """把指定数据行提升为表头：该行值成为列名，其上方行连同该行移除。
@@ -1160,7 +1395,12 @@ class PandasTableModel(QAbstractTableModel):
         数值列按数值排；混合列（公式写入 #DIV/0! 后整列 object）数值在前、
         文本在后（同 Excel）——直接 sort_values 会在 str/float 比较时抛 TypeError。
         空值保持为 None，由 na_position 统一排到末尾。
+        日期/时间差列原样返回：to_numeric 会把 NaT 变成 int64 最小值排到最前，
+        na_position="last" 就失效了。
         """
+        if (pd.api.types.is_datetime64_any_dtype(series.dtype)
+                or pd.api.types.is_timedelta64_dtype(series.dtype)):
+            return series
         keys = pd.to_numeric(series, errors="coerce")
         if keys.notna().sum() < series.notna().sum():
             keys = pd.Series(

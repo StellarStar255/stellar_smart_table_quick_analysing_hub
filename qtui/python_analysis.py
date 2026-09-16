@@ -5,11 +5,13 @@ Python 数据分析窗口：
 结果 DataFrame / 图表内嵌展示、保存为 Sheet。
 """
 
+import ast
 import builtins
 import io
 import json
 import keyword
 import os
+import re
 import sys
 import threading
 import time
@@ -20,12 +22,12 @@ import pandas as pd
 import numpy as np
 
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QRegularExpression, QRect, QSize, QTimer,
-    QStringListModel,
+    Qt, QThread, QObject, QMetaObject, Q_ARG, pyqtSignal, pyqtSlot,
+    QRegularExpression, QRect, QSize, QTimer, QStringListModel,
 )
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QKeySequence, QSyntaxHighlighter,
-    QTextCharFormat, QFontDatabase, QPainter, QPalette, QTextFormat,
+    QTextCharFormat, QPainter, QPalette, QTextFormat,
     QTextCursor, QPixmap,
 )
 from PyQt6.QtWidgets import (
@@ -43,8 +45,9 @@ from .analysis_params import (
     KIND_COLUMN, KIND_COLUMNS, KIND_NUMBER, KIND_BOOL, KIND_TEXT,
 )
 from qtui.i18n import tr
+from qtui.paths import CONFIG_DIR
 
-_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".smart_table_hub")
+_CONFIG_DIR = CONFIG_DIR
 PRESETS_FILE = os.path.join(_CONFIG_DIR, "qt_python_presets.json")
 LAST_CODE_FILE = os.path.join(_CONFIG_DIR, "qt_python_last_code.py")   # 关窗时的编辑器内容
 HISTORY_FILE = os.path.join(_CONFIG_DIR, "qt_python_history.json")    # 最近运行过的代码
@@ -669,6 +672,10 @@ class _StreamRouter:
         return restore
 
 
+# 用户代码编译时的文件名：追踪器只跟踪这个文件里的帧，报错定位也按它找行号
+_USER_CODE_FILENAME = "<string>"
+
+
 class CodeRunWorker(QThread):
     """在后台线程执行用户代码，结果通过信号回传主线程。"""
 
@@ -687,8 +694,15 @@ class CodeRunWorker(QThread):
         """请求停止：用户代码下一次执行到任何一行时抛出 _Cancelled。"""
         self._cancel.set()
 
+    def cancel_requested(self):
+        return self._cancel.is_set()
+
     def _tracer(self, frame, event, arg):
-        # 只在工作线程生效（sys.settrace 是线程局部的）
+        # 只在工作线程生效（sys.settrace 是线程局部的）。
+        # 只给用户代码自己的帧装行级追踪：pandas/numpy 内部的帧返回 None，
+        # 否则用户的循环/apply 里每一行库代码都要回调一次 Python，慢好几倍。
+        if frame.f_code.co_filename != _USER_CODE_FILENAME:
+            return None
         if self._cancel.is_set():
             raise _Cancelled()
         return self._tracer
@@ -758,7 +772,7 @@ class CodeRunWorker(QThread):
         restore_err = _StreamRouter.capture("stderr", buf)
         sys.settrace(self._tracer)
         try:
-            exec(self._code, namespace)
+            exec(compile(self._code, _USER_CODE_FILENAME, "exec"), namespace)
         except _Cancelled:
             buf.write("\n" + tr("[已停止] 用户中断了代码执行") + "\n")
         except KeyboardInterrupt:
@@ -795,6 +809,8 @@ class CodeRunWorker(QThread):
             if isinstance(value, pd.DataFrame):
                 result_dfs[name] = value
 
+        # 线程对象本身在 finished→deleteLater 时整个销毁（见 run_code），
+        # 这一轮的 df 副本随之释放，不必在这里提前清空
         self.done.emit(buf.getvalue(), result_dfs, sheet_requests,
                        figure_files, figure_images)
 
@@ -803,7 +819,7 @@ def _user_code_location(exc, code):
     """从异常回溯里找到用户代码（exec 的 <string>）最后一帧，给出行号和那行内容。"""
     try:
         frames = [f for f in traceback.extract_tb(exc.__traceback__)
-                  if f.filename == "<string>"]
+                  if f.filename == _USER_CODE_FILENAME]
     except Exception:
         return None
     if not frames:
@@ -814,21 +830,31 @@ def _user_code_location(exc, code):
     return tr("⚠ 出错位置：你的代码第 {} 行：{}").format(lineno, text)
 
 
+def _is_default_index(idx):
+    return (isinstance(idx, pd.RangeIndex) and idx.start == 0
+            and idx.step == 1 and idx.name is None)
+
+
+def _flatten_columns(rdf):
+    """多级列名（agg 多个函数）压成一层，用 "_" 连接；没有多级列时原样返回。"""
+    if not isinstance(rdf.columns, pd.MultiIndex):
+        return rdf
+    out = rdf.copy()
+    out.columns = ["_".join(str(x) for x in tup if str(x) != "")
+                   for tup in out.columns.to_flat_index()]
+    return out
+
+
 def flatten_frame(rdf):
     """把分析结果整理成能放进表格/Sheet 的二维表。
 
     透视表、groupby 的结果把分组值放在索引里，直接显示会丢掉行标签；
-    多级列名（agg 多个函数）也压成一层，用 "_" 连接。原对象不改。
+    多级列名（agg 多个函数）也压成一层，用 "_" 连接。原对象不改——
+    不需要整理时直接返回原对象（调用方都是只读展示/复制进模型，不会改它），
+    省掉一次整表复制。
     """
-    out = rdf
-    if isinstance(out.columns, pd.MultiIndex):
-        out = out.copy()
-        out.columns = ["_".join(str(x) for x in tup if str(x) != "")
-                       for tup in out.columns.to_flat_index()]
-    idx = out.index
-    default_index = (isinstance(idx, pd.RangeIndex) and idx.start == 0
-                     and idx.step == 1 and idx.name is None)
-    if not default_index:
+    out = _flatten_columns(rdf)
+    if not _is_default_index(out.index):
         try:
             out = out.reset_index()
         except ValueError:
@@ -838,7 +864,34 @@ def flatten_frame(rdf):
             names = [f"{n}_index" if n in out.columns else n for n in names]
             out.index = out.index.set_names(names)
             out = out.reset_index()
-    return out if out is not rdf else out.copy()
+    return out
+
+
+def align_result_rows(rdf, target_index):
+    """把要「追加为新列」的结果按行对齐到当前表。
+
+    返回 (对齐后的表, None)，或 (None, 原因)：原因为 "rows"（行数不同）
+    或 "index"（行标签对不上）。
+
+    - 默认索引（0..n-1）或与当前表索引完全一致：按位置追加；
+    - 索引是当前表行标签的一个排列（例如 sort_values 后的结果）：先按当前表
+      的顺序 reindex，再按位置追加——不这样做会错行，还会多出一列 index；
+    - 其他情况（groupby 的分组标签、set_index 后的键等）：不猜，交给调用方提示用户。
+    """
+    out = _flatten_columns(rdf)
+    if len(out) != len(target_index):
+        return None, "rows"
+    idx = out.index
+    if _is_default_index(idx) or idx.equals(target_index):
+        return out.reset_index(drop=True), None
+    try:
+        same_labels = (idx.is_unique and target_index.is_unique
+                       and len(idx.difference(target_index)) == 0)
+    except Exception:
+        same_labels = False
+    if same_labels:
+        return out.reindex(target_index).reset_index(drop=True), None
+    return None, "index"
 
 
 _FONTS_CONFIGURED = False
@@ -1014,7 +1067,7 @@ class ParamPanel(QWidget):
         self._columns = [str(c) for c in columns]
         self._loading = True
         try:
-            for _name, (kind, w) in self._widgets.items():
+            for kind, w in self._widgets.values():
                 if kind == KIND_COLUMN:
                     self._fill_column_combo(w, w.currentText())
                 elif kind == KIND_COLUMNS:
@@ -1132,7 +1185,7 @@ class ParamPanel(QWidget):
     def _emit_number(self, name, edit):
         text = edit.text().strip()
         try:
-            value = int(text) if analysis_params.re.fullmatch(r"[+-]?\d+", text) else float(text)
+            value = int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text)
         except ValueError:
             edit.setStyleSheet(self._BAD_STYLE)
             return
@@ -1141,7 +1194,7 @@ class ParamPanel(QWidget):
 
     def _emit_literal(self, name, edit):
         try:
-            value = analysis_params.ast.literal_eval(edit.text().strip())
+            value = ast.literal_eval(edit.text().strip())
         except (ValueError, SyntaxError):
             edit.setStyleSheet(self._BAD_STYLE)
             return
@@ -1153,12 +1206,60 @@ class ParamPanel(QWidget):
 # 图表画廊：运行产生的图直接显示在窗口里
 # ---------------------------------------------------------------------------
 
-class _SheetAccessor:
-    """用户代码里的 sheets 对象：sheets['名字'] 按需读取某个 sheet 的完整数据。"""
+class _MainThreadSheetFetcher(QObject):
+    """替工作线程在主线程里执行 host.get_sheet_df。
 
-    def __init__(self, host, names):
+    sheets['名字'] 是在工作线程里被调用的，而 host.get_sheet_df 会读主线程
+    正在用的 model.df / sheet 缓存 / 共享的 ExcelFile——主线程此时可能正在
+    编辑单元格或切 sheet，直接读会撞上。这里用 BlockingQueuedConnection 把
+    读取（含复制）投递到主线程排队执行，工作线程阻塞等结果；每次运行前
+    把所有 sheet 都预先复制一份的做法则太贵（多 sheet 大文件每次运行都要
+    全量读盘）。对象本身必须在主线程创建（在 _extra_namespace 里）。
+    """
+
+    def __init__(self, host, parent=None):
+        super().__init__(parent)
+        self._host = host
+        self._result = None
+        self._error = None
+        self._owner_ident = threading.get_ident()   # 创建它的线程（主线程）
+
+    @pyqtSlot(str)
+    def _fetch(self, name):
+        try:
+            self._result = self._host.get_sheet_df(name)
+            self._error = None
+        except BaseException as exc:      # noqa: BLE001 —— 原样带回工作线程重新抛出
+            self._result, self._error = None, exc
+
+    def get(self, name):
+        if threading.get_ident() == self._owner_ident:
+            # 已在主线程（同步测试直接调 worker.run()）：直接调用。
+            # 这里不能用 QThread.currentThread() is self.thread() 判断——同一个
+            # C++ 线程可能对应两个 Python 包装对象，误判后 BlockingQueuedConnection
+            # 会等自己，整个进程卡死
+            self._fetch(name)
+        else:
+            QMetaObject.invokeMethod(
+                self, "_fetch", Qt.ConnectionType.BlockingQueuedConnection,
+                Q_ARG(str, name))
+        result, error = self._result, self._error
+        self._result = self._error = None
+        if error is not None:
+            raise error
+        return result
+
+
+class _SheetAccessor:
+    """用户代码里的 sheets 对象：sheets['名字'] 按需读取某个 sheet 的完整数据。
+
+    读取本身经 _MainThreadSheetFetcher 在主线程完成（见其说明）。
+    """
+
+    def __init__(self, host, names, fetcher=None):
         self._host = host
         self._names = list(names)
+        self._fetcher = fetcher
 
     def keys(self):
         return list(self._names)
@@ -1175,11 +1276,12 @@ class _SheetAccessor:
     def __getitem__(self, name):
         if isinstance(name, int):
             name = self._names[name]
-        getter = getattr(self._host, "get_sheet_df", None)
-        if getter is None:
+        if getattr(self._host, "get_sheet_df", None) is None:
             raise KeyError(name)
         try:
-            return getter(name)
+            if self._fetcher is not None:
+                return self._fetcher.get(str(name))
+            return self._host.get_sheet_df(name)
         except KeyError:
             raise KeyError(tr("没有名为 {} 的 Sheet，可用: {}").format(
                 repr(name), ", ".join(repr(n) for n in self._names))) from None
@@ -1287,6 +1389,13 @@ class PythonAnalysisWindow(QMainWindow):
         self._worker = None
         self._result_dfs = {}
         self._clean_code = ""      # 最近一次"应用预设/表单改参数"后的代码，用来判断编辑器是否被手改
+        self._sheet_fetcher = None  # 工作线程读其他 sheet 时的主线程代办（懒建，见 _MainThreadSheetFetcher）
+        # 点了「停止」但用户代码卡在一次 C 层调用里（settrace 插不进去）：
+        # 超过这个时间还没停下来就提示用户只能等
+        self._stop_pending_timer = QTimer(self)
+        self._stop_pending_timer.setSingleShot(True)
+        self._stop_pending_timer.setInterval(3000)
+        self._stop_pending_timer.timeout.connect(self._on_stop_pending)
 
         self.setWindowTitle(tr("Python 数据分析"))
         self.resize(1100, 760)
@@ -1714,6 +1823,8 @@ class PythonAnalysisWindow(QMainWindow):
 
     def run_code(self):
         if self._worker is not None and self._worker.isRunning():
+            # 运行按钮已禁用，但 F5 / Ctrl+Enter 仍能触发：别静默吞掉
+            self._status(tr("代码正在运行，请等待完成或点击「停止」"))
             return
         # 表单与代码先对齐（延迟同步的定时器可能还没到点）
         self._param_sync_timer.stop()
@@ -1723,6 +1834,9 @@ class PythonAnalysisWindow(QMainWindow):
             QMessageBox.warning(self, tr("提示"), tr("请输入要运行的代码"))
             return
 
+        # 上一轮的结果表（含那一轮的 df 副本）先放掉，再复制这一轮的数据
+        self._result_dfs = {}
+        self._show_selected_result()      # 卸下旧结果模型（它还引用着上一轮的 df）
         df = getattr(self.host.model, "df", None)
         df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
         self.refresh_columns()
@@ -1735,29 +1849,42 @@ class PythonAnalysisWindow(QMainWindow):
         self._run_started = time.perf_counter()
         self._run_code_text = code
 
-        self._worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None),
-                                     self, extra=self._extra_namespace())
-        self._worker.done.connect(self._on_run_done)
-        self._worker.start()
+        worker = CodeRunWorker(code, df, getattr(self.host, "current_file", None),
+                               self, extra=self._extra_namespace(df))
+        worker.done.connect(self._on_run_done)
+        # 线程真正退出后再销毁：done 发出时 run() 可能还没返回，
+        # 在 done 的槽里 deleteLater 有机会销毁一个仍在跑的 QThread
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
 
-    def _extra_namespace(self):
+    def _extra_namespace(self, df_copy=None):
         """除 df 之外注入用户代码的变量：
 
-        - sheets['名字']：任意 sheet 的完整数据（按需读取）；sheet_names 为名字列表
-        - df_full：当前 sheet 筛选前的全表（没筛选时与 df 相同）
+        - sheets['名字']：任意 sheet 的完整数据（按需读取，读取在主线程完成）；
+          sheet_names 为名字列表
+        - df_full：当前 sheet 筛选前的全表；没在筛选时就是 df 本身（同一个副本，
+          不再多复制一份整表）
         - selection：当前选区的数据块（没选就是 None）；selected_columns：选中列名
         """
         host = self.host
         extra = {}
         names = list(getattr(host, "sheet_names", None) or [])
         extra["sheet_names"] = names
-        extra["sheets"] = _SheetAccessor(host, names)
-        full = None
+        if getattr(host, "get_sheet_df", None) is not None:
+            if self._sheet_fetcher is None:
+                self._sheet_fetcher = _MainThreadSheetFetcher(host, self)
+            extra["sheets"] = _SheetAccessor(host, names, self._sheet_fetcher)
+        else:
+            extra["sheets"] = _SheetAccessor(host, names)
         if getattr(host, "original_df", None) is not None:
-            full = host.original_df
+            extra["df_full"] = host.original_df.copy()
+        elif df_copy is not None:
+            extra["df_full"] = df_copy
         elif isinstance(getattr(getattr(host, "model", None), "df", None), pd.DataFrame):
-            full = host.model.df
-        extra["df_full"] = full.copy() if full is not None else pd.DataFrame()
+            extra["df_full"] = host.model.df.copy()
+        else:
+            extra["df_full"] = pd.DataFrame()
         sel, sel_cols = None, []
         if hasattr(host, "selection_frame"):
             try:
@@ -1772,49 +1899,24 @@ class PythonAnalysisWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._status(tr("正在停止..."))
+            self._stop_pending_timer.start()
+
+    def _on_stop_pending(self):
+        # settrace 只能在用户代码的下一行插入中断；一次长时间的 C 层调用
+        # （大表 merge、读文件、time.sleep）中间停不下来，只能等它返回
+        if self._worker is not None and self._worker.isRunning() \
+                and self._worker.cancel_requested():
+            self._status(tr("当前操作无法中断，请等待完成"))
 
     def _on_run_done(self, output, result_dfs, sheet_requests, figure_files, figure_images):
+        self._stop_pending_timer.stop()
         self.run_action.setEnabled(True)
         self.stop_action.setEnabled(False)
         had_error = tr("[执行错误]") in (output or "")
-        self._record_history(getattr(self, "_run_code_text", ""), ok=not had_error)
-        # 给「AI 修复上次报错」用：记住出错的代码和 traceback
-        self._last_error = (getattr(self, "_run_code_text", ""), output) if had_error else None
-        self.ai_fix_action.setEnabled(had_error)
-        if figure_files:
-            output = (output or "") + "\n" + tr("已保存图表:") + "\n" + "\n".join(
-                "  " + f for f in figure_files) + "\n"
-        self.output_edit.setPlainText(output if output else tr("✓ 代码执行完成（无输出）\n"))
-        sb = self.output_edit.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-        # 结果 DataFrame 下拉框 + 表格
-        self._result_dfs = result_dfs
-        preferred = self._preferred_result(result_dfs)
-        self.result_combo.blockSignals(True)
-        self.result_combo.clear()
-        for name, rdf in result_dfs.items():
-            self.result_combo.addItem(
-                tr("{} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)), name)
-        if preferred is not None:
-            self.result_combo.setCurrentIndex(self.result_combo.findData(preferred))
-        self.result_combo.blockSignals(False)
-        self._show_selected_result()
-        self.tabs.setTabText(self.TAB_RESULT, tr("结果表") + (
-            f" ({len(result_dfs)})" if result_dfs else ""))
-
-        # 图表
-        self.figure_gallery.set_images(figure_images)
-        self.tabs.setTabText(self.TAB_FIGURES, tr("图表") + (
-            f" ({len(figure_images)})" if figure_images else ""))
-
-        # save_as_sheet 队列在主线程统一执行（线程安全）
-        for rdf, sheet_name in sheet_requests:
-            try:
-                self.host.add_sheet_from_df(rdf, sheet_name)
-            except Exception as e:
-                self.output_edit.appendPlainText(
-                    tr("[保存Sheet失败] {}: {}").format(sheet_name, e))
+        code = getattr(self, "_run_code_text", "")
+        self._record_run_history(code, output, had_error)
+        preferred = self._update_run_ui(output, result_dfs, figure_files, figure_images)
+        self._apply_sheet_requests(sheet_requests)
 
         # 自动切到最有用的页：报错看输出，有图看图，有结果看表
         if had_error:
@@ -1833,14 +1935,65 @@ class PythonAnalysisWindow(QMainWindow):
                 len(sheet_requests), names, elapsed))
         else:
             self._status(tr("代码执行完成（耗时 {:.2f} 秒）").format(elapsed))
-
-        worker = self._worker
+        # 线程对象由 finished→deleteLater 自行销毁（见 run_code），这里只放开引用
         self._worker = None
-        if worker is not None:
-            worker.deleteLater()
+
+    def _record_run_history(self, code, output, had_error):
+        """运行历史 + 给「AI 修复上次报错」记住出错的代码和 traceback。"""
+        self._record_history(code, ok=not had_error)
+        self._last_error = (code, output) if had_error else None
+        self.ai_fix_action.setEnabled(had_error)
+
+    def _update_run_ui(self, output, result_dfs, figure_files, figure_images):
+        """输出页、结果表下拉框/表格、图表页。返回默认选中的结果名（可能为 None）。"""
+        if figure_files:
+            output = (output or "") + "\n" + tr("已保存图表:") + "\n" + "\n".join(
+                "  " + f for f in figure_files) + "\n"
+        self.output_edit.setPlainText(output if output else tr("✓ 代码执行完成（无输出）\n"))
+        sb = self.output_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+        self._result_dfs = result_dfs
+        preferred = self._preferred_result(result_dfs)
+        self.result_combo.blockSignals(True)
+        self.result_combo.clear()
+        for name, rdf in result_dfs.items():
+            self.result_combo.addItem(
+                tr("{} ({}行×{}列)").format(name, len(rdf), len(rdf.columns)), name)
+        if preferred is not None:
+            self.result_combo.setCurrentIndex(self.result_combo.findData(preferred))
+        self.result_combo.blockSignals(False)
+        self._show_selected_result()
+        self.tabs.setTabText(self.TAB_RESULT, tr("结果表") + (
+            f" ({len(result_dfs)})" if result_dfs else ""))
+
+        self.figure_gallery.set_images(figure_images)
+        self.tabs.setTabText(self.TAB_FIGURES, tr("图表") + (
+            f" ({len(figure_images)})" if figure_images else ""))
+        return preferred
+
+    def _apply_sheet_requests(self, sheet_requests):
+        """save_as_sheet 队列在主线程统一执行（线程安全）。
+
+        与「保存为Sheet」按钮走同一套整理：groupby/透视表的行标签展开成列，
+        多级列名压平——否则 groupby(...).sum().to_frame() 存出来会丢掉分组列。
+        """
+        for rdf, sheet_name in sheet_requests:
+            try:
+                self.host.add_sheet_from_df(flatten_frame(rdf), sheet_name)
+            except Exception as e:
+                self.output_edit.appendPlainText(
+                    tr("[保存Sheet失败] {}: {}").format(sheet_name, e))
+
+    # 超过这么多单元格就不再逐值比较 df 是否被改过（整表 .equals 在大表上要好几秒）
+    _EQUALS_MAX_CELLS = 2_000_000
 
     def _preferred_result(self, result_dfs):
-        """默认展示哪个结果：最后一个非 df 的 DataFrame；没有就看 df 是否被改过。"""
+        """默认展示哪个结果：最后一个非 df 的 DataFrame；没有就看 df 是否被改过。
+
+        先比形状和列名（几乎免费），都一样才做逐值比较；大表跳过逐值比较，
+        形状列名一致就当没改——用户仍可从下拉框手动选 df 查看。
+        """
         names = [n for n in result_dfs if n != "df"]
         if names:
             return names[-1]
@@ -1849,8 +2002,11 @@ class PythonAnalysisWindow(QMainWindow):
         host_df = getattr(getattr(self.host, "model", None), "df", None)
         if not isinstance(host_df, pd.DataFrame):
             return "df"
+        rdf = result_dfs["df"]
         try:
-            same = result_dfs["df"].shape == host_df.shape and result_dfs["df"].equals(host_df)
+            same = rdf.shape == host_df.shape and rdf.columns.equals(host_df.columns)
+            if same and rdf.size <= self._EQUALS_MAX_CELLS:
+                same = rdf.equals(host_df)
         except Exception:
             same = False
         return None if same else "df"
@@ -1927,15 +2083,25 @@ class PythonAnalysisWindow(QMainWindow):
             return
         if not hasattr(self.host, "append_columns_to_current"):
             return
-        flat = flatten_frame(rdf)
         cur = getattr(getattr(self.host, "model", None), "df", None)
-        if isinstance(cur, pd.DataFrame) and len(flat) != len(cur):
-            QMessageBox.warning(
-                self, tr("追加为新列"),
-                tr("结果有 {} 行，当前 Sheet 有 {} 行，行数不一致无法按位置追加。\n"
-                   "提示：用 df.merge(...) 或 df.assign(...) 把结果对齐到 df 后再追加。")
-                .format(len(flat), len(cur)))
-            return
+        if isinstance(cur, pd.DataFrame):
+            flat, why = align_result_rows(rdf, cur.index)
+            if why == "rows":
+                QMessageBox.warning(
+                    self, tr("追加为新列"),
+                    tr("结果有 {} 行，当前 Sheet 有 {} 行，行数不一致无法按位置追加。\n"
+                       "提示：用 df.merge(...) 或 df.assign(...) 把结果对齐到 df 后再追加。")
+                    .format(len(rdf), len(cur)))
+                return
+            if why == "index":
+                QMessageBox.warning(
+                    self, tr("追加为新列"),
+                    tr("结果的行索引与当前 Sheet 的行对不上，无法按行对齐追加。\n"
+                       "结果若是从 df 筛选/排序得来的可以直接追加；分组汇总等结果请先"
+                       "用 df.merge(...) 对齐到 df，或 reset_index() 后再追加。"))
+                return
+        else:
+            flat = flatten_frame(rdf)
         cols = [str(c) for c in flat.columns]
         ret = QMessageBox.question(
             self, tr("追加为新列"),
@@ -2088,8 +2254,13 @@ class PythonAnalysisWindow(QMainWindow):
     # ---------------- 关闭 ----------------
 
     def closeEvent(self, event):
-        # 正在运行的代码先请求停止并等待；仍停不下来就不关窗口——
-        # 挂在主窗口下的 QThread 若在运行中被销毁会直接崩溃整个程序
+        """用户点关闭、或主窗口退出时调用 self._analysis_win.close() 都走这里。
+
+        - 没有代码在跑：保存编辑器内容到 LAST_CODE_FILE，接受事件（close() 返回 True）。
+        - 有代码在跑：先请求停止并最多等 3 秒；停下来了同上；仍停不下来
+          （卡在 C 层调用里）则弹一次提示、event.ignore()，窗口不关（close() 返回
+          False）——挂在主窗口下的 QThread 若在运行中被销毁会直接崩溃整个程序。
+        """
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)
@@ -2099,5 +2270,6 @@ class PythonAnalysisWindow(QMainWindow):
                     tr("代码仍在运行，无法关闭窗口。\n请等待其结束，或点击「停止」后再试。"))
                 event.ignore()
                 return
+        self._stop_pending_timer.stop()
         self._save_last_code()
         super().closeEvent(event)

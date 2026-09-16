@@ -56,6 +56,68 @@ class _RectSelection:
         return self.r0 <= r <= self.r1 and self.c0 <= c <= self.c1
 
 
+class _RangeSelection:
+    """多个矩形选区的 (row, col) 成员判断（不连续选区，同样不逐格展开）。"""
+
+    __slots__ = ("rects",)
+
+    def __init__(self, rects):
+        self.rects = [_RectSelection(*r) for r in rects]
+
+    def __contains__(self, rc):
+        return any(rc in rect for rect in self.rects)
+
+
+def _selection_ranges(sel_model):
+    """选区里有效且非空的 QItemSelectionRange 列表。
+
+    整列/全选时 selectedIndexes() 会为每一格生成 QModelIndex（百万行时
+    直接耗尽内存），所有批量操作都应从这些范围推导行列，而不是逐格枚举。
+    """
+    if sel_model is None:
+        return []
+    return [r for r in sel_model.selection() if r.isValid() and not r.isEmpty()]
+
+
+def _rows_in_ranges(ranges, min_row=0, max_row=None):
+    """范围覆盖的视图行号（升序去重），可裁到 [min_row, max_row]。"""
+    rows = set()
+    for rg in ranges:
+        bottom = rg.bottom() if max_row is None else min(rg.bottom(), max_row)
+        rows.update(range(max(rg.top(), min_row), bottom + 1))
+    return sorted(rows)
+
+
+def _cols_in_ranges(ranges, max_col=None):
+    """范围覆盖的列号（升序去重），可裁到 max_col。"""
+    cols = set()
+    for rg in ranges:
+        right = rg.right() if max_col is None else min(rg.right(), max_col)
+        cols.update(range(rg.left(), right + 1))
+    return sorted(cols)
+
+
+def _iter_range_cells(ranges, min_row=0):
+    """逐格遍历范围（视图坐标），不经过 QModelIndex。"""
+    for rg in ranges:
+        for r in range(max(rg.top(), min_row), rg.bottom() + 1):
+            for c in range(rg.left(), rg.right() + 1):
+                yield r, c
+
+
+# 可直接打开的文件后缀（打开对话框 / 拖拽 / 粘贴文件共用）
+TEXT_EXTS = (".csv", ".tsv", ".txt")
+_OPENABLE_EXTS = (".xlsx", ".xls") + TEXT_EXTS
+
+
+def _is_text_format(path):
+    """CSV/TSV/TXT 等按文本表格读写的文件。优先用 file_io 的判定。"""
+    fn = getattr(file_io, "is_text_format", None)
+    if fn is not None:
+        return bool(fn(path))
+    return os.path.splitext(str(path))[1].lower() in TEXT_EXTS
+
+
 def _widget_alive(w):
     """底层 C++ 对象是否还在（窗口被销毁后访问会抛 RuntimeError）。"""
     try:
@@ -90,6 +152,11 @@ FILE_CONFIG_PATH = os.path.expanduser("~/.smart_table_hub/qt_file_config.json")
 MAX_SHEET_CACHE = 5
 AUTO_SAVE_DELAY_MS = 30000
 DEFAULT_ROWS, DEFAULT_COLS = 100, 26
+
+
+def _make_settings():
+    """用户偏好（窗口布局、复制列名开关等）的存储；测试可替换为临时 ini。"""
+    return QSettings("SmartTableHub", "SmartTableHubQt")
 
 
 def _file_config_entry(path):
@@ -442,14 +509,14 @@ class _ExcelTableView(QTableView):
         if m is None or sm is None or not cur.isValid():
             return
         is_formula = text.startswith("=") and len(text) > 1
-        filled = 0
-        for idx in sm.selectedIndexes():
-            if idx == cur or idx.row() == 0:
-                continue
-            val = (m.shift_formula(text, idx.row() - cur.row(), idx.column() - cur.column())
-                   if is_formula else text)
-            if m.setData(idx, val):
-                filled += 1
+        cur_rc = (cur.row(), cur.column())
+        entries = [
+            (r, c, m.shift_formula(text, r - cur.row(), c - cur.column())
+             if is_formula else text)
+            for r, c in _iter_range_cells(_selection_ranges(sm), min_row=1)
+            if (r, c) != cur_rc]
+        # 整批写入：一条撤销记录、一次 dataChanged、一次重算
+        filled = len(entries) if entries and m.set_cells(entries) else 0
         sm.setCurrentIndex(cur, QItemSelectionModel.SelectionFlag.NoUpdate)
         win = self.window()
         if filled and hasattr(win, "update_statusbar"):
@@ -671,13 +738,13 @@ class _ExcelTableView(QTableView):
             self.viewport().update()
 
     def _perform_fill(self):
-        """把源区公式/值循环填充到目标区（公式平移相对引用，逐格可撤销）。"""
+        """把源区公式/值循环填充到目标区（公式平移相对引用，整批一次可撤销）。"""
         src, tgt = self._fill_source, self._fill_target
         if not src or not tgt or tgt == src:
             return
         m = self.model()
         t, l, b, r = src
-        filled = 0
+        entries = []
         for row in range(tgt[0], tgt[2] + 1):
             for col in range(tgt[1], tgt[3] + 1):
                 if (t <= row <= b and l <= col <= r) or row == 0:
@@ -691,8 +758,10 @@ class _ExcelTableView(QTableView):
                 else:
                     val = m.data(m.index(src_row, src_col),
                                  Qt.ItemDataRole.EditRole)
-                if m.setData(m.index(row, col), val):
-                    filled += 1
+                entries.append((row, col, val))
+        # 整批写入：一条撤销记录、一次 dataChanged、一次重算（源区值已读完再写，
+        # 不会读到本批刚写入的结果）
+        filled = len(entries) if entries and m.set_cells(entries) else 0
         sm = self.selectionModel()
         if sm is not None:
             sm.select(QItemSelection(m.index(tgt[0], tgt[1]),
@@ -954,8 +1023,14 @@ class MainWindow(QMainWindow):
         self._image_queue_win = None
         self._image_viewers = []
         self._lossy_confirmed = set()   # 已确认过"保存会丢失X"的文件
+        self._auto_save_declined = set()  # 用户拒绝有损自动保存的文件（不再反复弹窗）
+        self._coord_marker_cache = {}   # 文件路径 -> 是否带本应用坐标标记（避免反复解压扫描）
+        self._active_image_col = None   # 图片面板当前生效的图片列名
+        self._image_synced_df = None    # 图片面板最近同步到的 df 对象
         self._analysis_win = None
         self.recent_files, self.auto_save = file_io.load_recent_files()
+        # 用户偏好（复制列名开关等）在构建工具栏时就要读取，必须先于 UI 创建
+        self._settings = _make_settings()
 
         # ---------- 模型与视图 ----------
         self.model = PandasTableModel()
@@ -1021,6 +1096,9 @@ class MainWindow(QMainWindow):
                     self.model.rowsRemoved, self.model.columnsInserted,
                     self.model.columnsRemoved):
             sig.connect(self._sync_image_panel)
+        # 整表替换（换 sheet/筛选/新建）后旧的预览坐标已无意义：
+        # modelReset 不会触发 currentChanged，必须单独作废未落盘的预览编辑
+        self.model.modelReset.connect(self._on_model_reset_preview)
 
         # ---------- 自动保存 ----------
         self._auto_save_timer = QTimer(self)
@@ -1036,7 +1114,6 @@ class MainWindow(QMainWindow):
         self._preview_cell = None        # 内容预览框对应的视图坐标
 
         # ---------- 恢复上次的窗口布局（面板位置/大小、工具栏、窗口几何） ----------
-        self._settings = QSettings("SmartTableHub", "SmartTableHubQt")
         geo = self._settings.value("window/geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -1129,6 +1206,7 @@ class MainWindow(QMainWindow):
         lang_menu = view_menu.addMenu("语言 / Language")
         from qtui import i18n
         current = i18n.current_language()
+        self._lang_actions = {}   # 语言代码 -> 菜单项（刷新勾选状态用，不按文字查找）
         for code, label in ((i18n.LANG_ZH, "中文"), (i18n.LANG_EN, "English")):
             action = QAction(label, self)
             action.setCheckable(True)
@@ -1136,6 +1214,7 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda checked=False, c=code: self._switch_language(c))
             lang_menu.addAction(action)
+            self._lang_actions[code] = action
 
         # 分析
         analysis_menu = menubar.addMenu(tr("分析"))
@@ -1192,25 +1271,27 @@ class MainWindow(QMainWindow):
 
     def _build_menu_refresh_language_checks(self, lang):
         """让语言子菜单的勾选状态反映已保存的选择。"""
-        from qtui import i18n
-        for action in self.findChildren(QAction):
-            if action.text() in ("中文", "English"):
-                action.setChecked(
-                    (action.text() == "中文") == (lang == i18n.LANG_ZH))
+        for code, action in getattr(self, "_lang_actions", {}).items():
+            action.setChecked(code == lang)
+
+    @staticmethod
+    def _restart_command():
+        """重启用的命令行：打包版直接重跑可执行文件，源码版重跑当前入口脚本。"""
+        import sys as _sys
+        if getattr(_sys, "frozen", False):
+            return [_sys.executable]
+        script = os.path.abspath(_sys.argv[0]) if _sys.argv and _sys.argv[0] else ""
+        if not os.path.isfile(script):
+            # 交互式/-c 启动时 argv[0] 不是文件，退回项目入口脚本
+            script = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "smart_table_quick_analysing_hub.py")
+        return [_sys.executable, script]
 
     def _restart_app(self):
         import subprocess
-        import sys as _sys
         if not self.close():   # 用户在"未保存"提示里取消
             return
-        if getattr(_sys, "frozen", False):
-            args = [_sys.executable]
-        else:
-            args = [_sys.executable,
-                    os.path.join(os.path.dirname(os.path.dirname(
-                        os.path.abspath(__file__))),
-                        "smart_table_quick_analysing_hub.py")]
-        subprocess.Popen(args, start_new_session=True)
+        subprocess.Popen(self._restart_command(), start_new_session=True)
         QTimer.singleShot(0, QApplication.quit)
 
     def _show_about(self):
@@ -1239,25 +1320,18 @@ class MainWindow(QMainWindow):
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         self.addToolBar(tb)
-        for text, slot in (("新建", self.new_file), ("打开", self.open_file_dialog),
-                           ("保存", self.save_file), ("保存为", self.save_as_copy),
-                           ("关闭文件", self.close_file)):
-            btn = QPushButton(tr(text))
-            btn.clicked.connect(lambda *_a, _s=slot: _s())
-            tb.addWidget(btn)
+        self._add_toolbar_buttons(tb, (
+            ("新建", self.new_file), ("打开", self.open_file_dialog),
+            ("保存", self.save_file), ("保存为", self.save_as_copy),
+            ("关闭文件", self.close_file)))
         tb.addSeparator()
-        for text, slot in (("撤销", self.undo), ("重做", self.redo),
-                           ("查找", self.open_find_dialog)):
-            btn = QPushButton(tr(text))
-            btn.clicked.connect(lambda *_a, _s=slot: _s())
-            tb.addWidget(btn)
+        self._add_toolbar_buttons(tb, (
+            ("撤销", self.undo), ("重做", self.redo), ("查找", self.open_find_dialog)))
         tb.addSeparator()
-        for text, slot in (("插入行", self.insert_row), ("删除行", self.delete_selected_rows),
-                           ("排序", self.sort_dialog), ("筛选", self.open_filter_dialog),
-                           ("统计", self.show_statistics)):
-            btn = QPushButton(tr(text))
-            btn.clicked.connect(lambda *_a, _s=slot: _s())
-            tb.addWidget(btn)
+        self._add_toolbar_buttons(tb, (
+            ("插入行", self.insert_row), ("删除行", self.delete_selected_rows),
+            ("排序", self.sort_dialog), ("筛选", self.open_filter_dialog),
+            ("统计", self.show_statistics)))
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Sheet: "))
@@ -1275,17 +1349,23 @@ class MainWindow(QMainWindow):
         self.copy_headers_cb.setToolTip(tr(
             "复制时在第一行附带列名，方便粘贴到 Excel 等外部软件。\n"
             "在本应用内粘贴时会自动去掉这一行，不会把列名粘进单元格。"))
-        settings = getattr(self, "_settings", None)
         self.copy_headers_cb.setChecked(
-            bool(settings.value("copy/headers", False, type=bool)) if settings else False)
+            bool(self._settings.value("copy/headers", False, type=bool)))
         self.copy_headers_cb.toggled.connect(
-            lambda on: self._settings.setValue("copy/headers", bool(on))
-            if getattr(self, "_settings", None) else None)
+            lambda on: self._settings.setValue("copy/headers", bool(on)))
         tb.addWidget(self.copy_headers_cb)
         self.auto_save_cb = QCheckBox(tr("自动保存"))
         self.auto_save_cb.setChecked(self.auto_save)
         self.auto_save_cb.toggled.connect(self._on_auto_save_toggled)
         tb.addWidget(self.auto_save_cb)
+
+    @staticmethod
+    def _add_toolbar_buttons(tb, pairs):
+        """按 (中文文案, 槽) 批量加按钮；丢弃 clicked(bool) 参数（见 _add_action）。"""
+        for text, slot in pairs:
+            btn = QPushButton(tr(text))
+            btn.clicked.connect(lambda *_a, _s=slot: _s())
+            tb.addWidget(btn)
 
     def _build_filter_bar(self):
         self.filter_bar = QWidget()
@@ -1372,6 +1452,7 @@ class MainWindow(QMainWindow):
         import traceback
         buf = _io.StringIO()
         env = {"df": self.model.df.copy(), "pd": pd, "np": np}
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 try:
@@ -1383,8 +1464,11 @@ class MainWindow(QMainWindow):
                     exec(code, env)
         except Exception:
             buf.write(traceback.format_exc())
+        finally:
+            QApplication.restoreOverrideCursor()
         output = buf.getvalue().strip() or tr("(无输出)")
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)  # 关掉即释放
         dialog.setWindowTitle(tr("Python 快速分析"))
         dialog.resize(760, 480)
         layout = QVBoxLayout(dialog)
@@ -1434,7 +1518,8 @@ class MainWindow(QMainWindow):
     def get_sheet_df(self, name):
         """按名取某个 sheet 的完整数据副本（当前 sheet 取筛选前的全表）。
 
-        未缓存的 sheet 直接从文件读，不写缓存（可能在分析工作线程里被调用）。
+        未缓存的 sheet 直接从文件读，不写缓存。只能在主线程调用：分析窗口的
+        sheets[] 访问器会通过 BlockingQueuedConnection 把调用投递到主线程。
         """
         if name == self.current_sheet or (not self.sheet_names and name in (None, "")):
             full = self.original_df if self.original_df is not None else self.model.df
@@ -1447,14 +1532,11 @@ class MainWindow(QMainWindow):
 
     def selection_frame(self):
         """当前选区的数据块 (DataFrame, 选中列名列表)；没有选中数据格时为 (None, [])。"""
-        sm = self.table.selectionModel()
-        if sm is None:
-            return None, []
-        indexes = sm.selectedIndexes()
+        ranges = _selection_ranges(self.table.selectionModel())
         df = self.model.df
-        cols = sorted({i.column() for i in indexes if i.column() < len(df.columns)})
-        rows = sorted({i.row() - HEADER_ROWS for i in indexes
-                       if i.row() >= HEADER_ROWS and i.row() - HEADER_ROWS < len(df)})
+        cols = _cols_in_ranges(ranges, max_col=len(df.columns) - 1)
+        rows = [r - HEADER_ROWS for r in
+                _rows_in_ranges(ranges, min_row=HEADER_ROWS, max_row=len(df))]
         names = [str(df.columns[c]) for c in cols]
         if not rows or not cols:
             return None, names
@@ -1493,12 +1575,13 @@ class MainWindow(QMainWindow):
     # ================= 文件操作 =================
 
     def new_file(self, confirm=True):
+        self._flush_preview()   # 预览框里未落盘的编辑先写回当前表，再决定是否保存
         if confirm and not self._check_save_before_discard():
             return
         cols = [_col_letter(i) for i in range(10)]
         df = pd.DataFrame(np.full((DEFAULT_ROWS, len(cols)), np.nan), columns=cols)
         self.current_file = None
-        self._excel_file = None
+        self._release_excel_file()
         self.sheet_names = []
         self.current_sheet = None
         self._sheet_cache.clear()
@@ -1508,26 +1591,31 @@ class MainWindow(QMainWindow):
         self._sheet_formulas.clear()
         self._sheet_colors.clear()
         self.model.cell_colors.clear()
+        self.image_columns = set()   # 先清图片列，modelReset 触发的面板同步才不会沿用旧列
         self.model.set_dataframe(df)
         self.model.modified = False
-        self.image_columns = set()
-        self._update_image_context()
         self.image_dock.hide()
         self._refresh_sheet_combo()
         self._update_title()
         self.update_statusbar(tr("新建空白表格"))
 
+    def _release_excel_file(self):
+        """关闭并丢弃当前工作簿句柄（重开/换文件前调用，避免句柄泄漏）。"""
+        excel_file, self._excel_file = self._excel_file, None
+        if excel_file is not None:
+            try:
+                excel_file.close()  # 释放文件句柄，关闭后文件可被移动/覆盖
+            except Exception:
+                pass
+
     def close_file(self):
         """关闭当前文件回到空白表格，程序保持运行。"""
+        self._flush_preview()
         if not self._check_save_before_discard():
             return
         name = os.path.basename(self.current_file) if self.current_file else None
         self._auto_save_timer.stop()
-        if self._excel_file is not None:
-            try:
-                self._excel_file.close()  # 释放文件句柄，关闭后文件可被移动/覆盖
-            except Exception:
-                pass
+        self._release_excel_file()
         self.new_file(confirm=False)
         if name:
             self.update_statusbar(tr("已关闭 {}").format(name))
@@ -1535,9 +1623,16 @@ class MainWindow(QMainWindow):
     def open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
             self, tr("打开文件"), "",
-            tr("支持的文件 (*.xlsx *.xls *.csv *.tsv);;Excel (*.xlsx *.xls);;CSV (*.csv *.tsv);;所有文件 (*)"))
+            tr("支持的文件 (*.xlsx *.xls *.csv *.tsv *.txt);;Excel (*.xlsx *.xls);;CSV/TSV (*.csv *.tsv *.txt);;所有文件 (*)"))
         if path:
             self.load_file(path)
+
+    def _file_has_coord_marker(self, path):
+        """xlsx 是否带本应用坐标标记；每个文件只解压扫描一次。"""
+        cache = self._coord_marker_cache
+        if path not in cache:
+            cache[path] = file_io.xlsx_has_coord_marker(path)
+        return cache[path]
 
     def load_file(self, path):
         if not os.path.exists(path):
@@ -1545,6 +1640,7 @@ class MainWindow(QMainWindow):
             self.recent_files = [p for p in self.recent_files if p != path]
             self._save_recent()
             return
+        self._flush_preview()
         if not self._check_save_before_discard():
             return
 
@@ -1558,21 +1654,22 @@ class MainWindow(QMainWindow):
                 # 恢复上次停留的 sheet
                 target = _file_config_entry(path).get("last_sheet")
                 active = target if target in sheets else sheets[0]
-                df = file_io.read_sheet(excel_file, active)
-                formulas = file_io.read_sheet_formulas(path, active)
-                colors = file_io.read_sheet_colors(path, active)
-                return ("excel", excel_file, sheets, active, df, formulas, colors)
+                df, formulas, colors = self._read_sheet_bundle(active, excel_file, path)
+                marker = file_io.xlsx_has_coord_marker(path)
+                return ("excel", excel_file, sheets, active, df, formulas, colors, marker)
             df = file_io.read_csv_any_encoding(path)
-            return ("csv", None, [], None, df, {}, {})
+            return ("csv", None, [], None, df, {}, {}, False)
 
         def done(result):
             if result is None:
                 self._show_error(tr("打开文件"), tr("加载失败:\n{}").format(path),
                                  dialog.last_error)
                 return
-            kind, excel_file, sheets, active_sheet, df, formulas, colors = result
+            kind, excel_file, sheets, active_sheet, df, formulas, colors, marker = result
             self.current_file = path
+            self._release_excel_file()
             self._excel_file = excel_file
+            self._coord_marker_cache = {path: marker}
             self.sheet_names = sheets
             self.current_sheet = active_sheet if sheets else None
             self._sheet_cache.clear()
@@ -1584,14 +1681,13 @@ class MainWindow(QMainWindow):
             if self.current_sheet:
                 self._cache_sheet(self.current_sheet, df)
             self.model.cell_colors = dict(colors)   # 文件里的背景色
+            # 图片列配置要在模型重置前就位：modelReset 触发的面板同步才能拿到正确的列
+            self._load_file_config()
             # 本应用（新坐标系）保存的文件带标记，公式结果可放心写入；
             # 无标记（Excel/旧版来源）保守处理：错误不覆盖文件缓存值
-            self.model.set_dataframe(
-                df, formulas=formulas,
-                from_file=not file_io.xlsx_has_coord_marker(path))
+            self.model.set_dataframe(df, formulas=formulas, from_file=not marker)
             self.model.modified = False
-            self._load_file_config()
-            self._update_image_context()
+            self._refresh_image_dock()
             self._refresh_sheet_combo()
             self._update_title()
             self.recent_files = file_io.add_recent_file(self.recent_files, path)
@@ -1617,27 +1713,38 @@ class MainWindow(QMainWindow):
     def save_as_copy(self):
         return self._save_as(switch_to=False)
 
-    def _save_as(self, switch_to):
+    def _ask_save_path(self, switch_to):
+        """另存对话框；返回带合法后缀的路径，取消返回 None。"""
         default = ""
         if self.current_file:
             base, ext = os.path.splitext(self.current_file)
-            ext = ext.lower() if ext.lower() in (".xlsx", ".csv") else ".xlsx"
+            ext = ext.lower() if ext.lower() in (".xlsx",) + TEXT_EXTS else ".xlsx"
             default = base + ext if switch_to else tr("{}_副本{}").format(base, ext)
         path, _ = QFileDialog.getSaveFileName(
-            self, tr("保存为"), default, "Excel (*.xlsx);;CSV (*.csv)")
+            self, tr("保存为"), default,
+            "Excel (*.xlsx);;CSV (*.csv);;TSV (*.tsv);;" + tr("文本 (*.txt)"))
+        if not path:
+            return None
+        if os.path.splitext(path)[1].lower() not in (".xlsx",) + TEXT_EXTS:
+            path += ".xlsx"
+        return path
+
+    def _save_as(self, switch_to):
+        path = self._ask_save_path(switch_to)
         if not path:
             return False
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in (".xlsx", ".csv"):
-            path += ".xlsx"
-            ext = ".xlsx"
-        if ext == ".csv" and len(self.sheet_names) > 1:
+        if _is_text_format(path) and len(self.sheet_names) > 1:
+            # 多 sheet 工作簿写成 CSV/TSV 只能装下当前 sheet：按"导出"处理——
+            # 当前文件、修改标记、其他 sheet 全部保持原样，绝不把工作簿
+            # 静默换成一个只剩一张表的文本文件
             ret = QMessageBox.question(
                 self, tr("保存为"),
-                tr("CSV 只能保存当前 Sheet，其他 {} 个 Sheet 不会写入。是否继续？").format(
+                tr("CSV/TSV 只能装下当前 Sheet，其他 {} 个 Sheet 不会写入。\n"
+                   "将只导出当前 Sheet，工作簿本身仍保持打开且未保存。是否继续？").format(
                     len(self.sheet_names) - 1))
             if ret != QMessageBox.StandardButton.Yes:
                 return False
+            switch_to = False
         return self._do_save(path, switch_to=switch_to)
 
     def _show_error(self, title, text, details=None):
@@ -1712,18 +1819,20 @@ class MainWindow(QMainWindow):
 
     def _do_save(self, path, switch_to=True):
         """同步等待后台保存完成（进度框模态），返回是否成功。"""
-        ext = os.path.splitext(path)[1].lower()
+        text_format = _is_text_format(path)
+        # 多 sheet 工作簿写成文本只是导出当前 sheet，文档本身不算已保存
+        export_only = text_format and len(self.sheet_names) > 1
         saved = [False]
         kept_header = [0]      # 就地保存时原样保留下来的表头公式数
         dialog = LoadingProgressDialog(self, tr("保存中"), tr("正在保存 {} ...").format(os.path.basename(path)))
         dialog.set_indeterminate()
 
-        if ext == ".csv":
+        if text_format:
             df = self.original_df if self.original_df is not None else self.model.df
             work = lambda: file_io.save_csv(path, df)
-            if self._current_colors():
-                self.update_statusbar(tr("提示：CSV 格式不保存背景色，用 xlsx 可保留"))
+            colors_dropped = bool(self._current_colors())
         else:
+            colors_dropped = False
             sheets, order, missing = self._collect_all_sheets()
             excel_file = self._excel_file
             formulas_map = dict(self._sheet_formulas)
@@ -1796,10 +1905,13 @@ class MainWindow(QMainWindow):
                                  dialog.last_error)
                 return
             saved[0] = True
-            if switch_to or path == self.current_file:
+            if not export_only and (switch_to or path == self.current_file):
                 self.current_file = path
-                if ext != ".csv":
+                if not text_format:
+                    self._release_excel_file()
                     self._excel_file, self.sheet_names = file_io.load_workbook_lazy(path)
+                    # 刚由本应用写出，坐标标记以磁盘为准，下次切 sheet 时重新读取
+                    self._coord_marker_cache.pop(path, None)
                     if self.current_sheet not in self.sheet_names:
                         self.current_sheet = self.sheet_names[0]
                     self._refresh_sheet_combo()
@@ -1811,7 +1923,13 @@ class MainWindow(QMainWindow):
             self._save_recent()
             self._rebuild_recent_menu()
             self._save_file_config()   # 记住当前 sheet，重开时恢复
-            msg = tr("已保存: {}").format(path)
+            if export_only:
+                msg = tr("已导出当前 Sheet: {}（其他 {} 个 Sheet 未写入，工作簿本身仍未保存）").format(
+                    path, len(self.sheet_names) - 1)
+            else:
+                msg = tr("已保存: {}").format(path)
+            if colors_dropped:
+                msg += tr("；") + tr("提示：CSV 格式不保存背景色，用 xlsx 可保留")
             if self.active_filters and self.model.formulas:
                 msg += tr("；") + tr("筛选中输入的 {} 个公式已按静态值保存").format(
                     len(self.model.formulas))
@@ -1825,12 +1943,15 @@ class MainWindow(QMainWindow):
         return saved[0]
 
     def import_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, tr("导入CSV"), "", tr("CSV (*.csv *.tsv);;所有文件 (*)"))
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("导入CSV"), "", tr("CSV/TSV (*.csv *.tsv *.txt);;所有文件 (*)"))
         if path:
             self.load_file(path)
 
     def export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, tr("导出CSV"), "", "CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("导出CSV"), "",
+            "CSV (*.csv);;TSV (*.tsv);;" + tr("文本 (*.txt)"))
         if not path:
             return
         df = self.original_df if self.original_df is not None else self.model.df
@@ -1875,19 +1996,51 @@ class MainWindow(QMainWindow):
     def _mark_modified(self):
         self.model.modified = True
         self._update_title()
-        if self.auto_save_cb.isChecked() and self.current_file:
+        if self._auto_save_enabled_for(self.current_file):
             self._auto_save_timer.start()
+
+    def _auto_save_enabled_for(self, path):
+        return bool(self.auto_save_cb.isChecked() and path
+                    and path not in self._auto_save_declined)
 
     def _on_auto_save_toggled(self, checked):
         self.auto_save = checked
         self._save_recent()
         if not checked:
             self._auto_save_timer.stop()
+            return
+        # 重新勾选 = 用户想再试：有损文件此刻问一次，而不是等 30 秒后在输入中弹窗
+        if self.current_file:
+            self._auto_save_declined.discard(self.current_file)
+            if self._auto_save_lossy_ok(self.current_file) and self.model.modified:
+                self._auto_save_timer.start()
+
+    def _auto_save_lossy_ok(self, path):
+        """就地保存会丢内容的文件，自动保存前只确认一次；拒绝则停用该文件的自动保存。"""
+        if path in self._auto_save_declined:
+            return False
+        if path in self._lossy_confirmed or self._patch_source(path) is None:
+            return True
+        if self._confirm_lossy_save(path):
+            return True
+        self._auto_save_declined.add(path)
+        self._auto_save_timer.stop()
+        self.update_statusbar(tr("已停用 {} 的自动保存（手动保存不受影响，重新勾选可再次开启）").format(
+            os.path.basename(path)))
+        return False
 
     def _do_auto_save(self):
-        if (self.model.modified and self.current_file
-                and not self.current_file.lower().endswith(".xls")):
-            self._do_save(self.current_file)
+        path = self.current_file
+        if not (self.model.modified and path and not path.lower().endswith(".xls")):
+            return
+        if not self._auto_save_enabled_for(path):
+            return
+        if (self.table.state() == QAbstractItemView.State.EditingState
+                or self._preview_save_timer.isActive()):
+            self._auto_save_timer.start()   # 正在输入，别弹窗打断，稍后再试
+            return
+        if self._auto_save_lossy_ok(path):
+            self._do_save(path)
 
     def _check_save_before_discard(self):
         """返回 False 表示用户取消操作。"""
@@ -1900,8 +2053,9 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.StandardButton.Cancel:
             return False
         if ret == QMessageBox.StandardButton.Save:
-            # 另存对话框被取消或保存失败时，不能继续丢弃数据
-            return bool(self.save_file())
+            # 另存对话框被取消、保存失败、或只是把当前 sheet 导出成了 CSV
+            # （工作簿仍处于修改状态）时，都不能继续丢弃数据
+            return bool(self.save_file()) and not self.model.modified
         return True
 
     # ================= Sheet 管理 =================
@@ -1937,7 +2091,60 @@ class MainWindow(QMainWindow):
             return
         self.switch_sheet(name)
 
+    def _run_blocking(self, title, message, func):
+        """后台线程跑 func，模态进度框等待；返回 (ok, 结果或 traceback 文本)。"""
+        dialog = LoadingProgressDialog(self, title, message)
+        dialog.set_indeterminate()
+        box = []
+        # 用单元素元组包住结果：run_in_background 以 None 表示失败，结果本身可能为 None
+        dialog.run_in_background(lambda: (func(),), box.append)
+        if not box or box[0] is None:
+            return False, dialog.last_error
+        return True, box[0][0]
+
+    def _read_sheet_bundle(self, name, excel_file=None, path=None,
+                           df=None, formulas=None, colors=None):
+        """读一个 sheet 的 (数据, 公式, 背景色)，已给出的部分不重复读。
+
+        纯 IO、不碰 UI，供工作线程调用。公式/背景色只有 .xlsx 才有，其它
+        格式（如 .xls）返回空表。
+        """
+        excel_file = self._excel_file if excel_file is None else excel_file
+        path = self.current_file if path is None else path
+        if df is None:
+            df = file_io.read_sheet(excel_file, name)
+        if formulas is None:
+            formulas = file_io.read_sheet_formulas(path, name) if path else {}
+        if colors is None:
+            colors = file_io.read_sheet_colors(path, name) if path else {}
+        return df, formulas, colors
+
+    def _load_sheet_bundle(self, name, formulas, colors):
+        """切换 sheet 时取目标 sheet 的 (df, formulas, colors)；缺的部分在后台
+        线程读盘（每一步都要重新打开工作簿，大文件放 UI 线程会冻结界面）。
+        读取失败返回 None（已提示用户）。"""
+        cached = self._sheet_cache.get(name)
+        excel_file, path = self._excel_file, self.current_file
+        on_disk = excel_file is not None and name in excel_file.sheet_names
+        if not (path and on_disk):
+            formulas = formulas if formulas is not None else {}
+            colors = colors if colors is not None else {}
+        need_df = cached is None and excel_file is not None
+        if not need_df and formulas is not None and colors is not None:
+            return (cached if cached is not None else pd.DataFrame()), formulas, colors
+        ok, result = self._run_blocking(
+            tr("切换Sheet"), tr("正在读取 {} ...").format(name),
+            lambda: self._read_sheet_bundle(name, excel_file, path,
+                                            df=cached, formulas=formulas, colors=colors))
+        if not ok:
+            self._show_error(tr("切换Sheet"), tr("读取 sheet 失败: {}").format(name), result)
+            return None
+        if need_df:
+            self._cache_sheet(name, result[0])
+        return result
+
     def switch_sheet(self, name):
+        self._flush_preview()   # 预览框里的编辑属于当前 sheet，换表前先写回
         # 保存当前 sheet 状态（含筛选和公式）
         dropped_view_formulas = 0
         if self.current_sheet:
@@ -1961,28 +2168,15 @@ class MainWindow(QMainWindow):
             else:
                 self.sheet_filters.pop(self.current_sheet, None)
 
-        # 加载目标 sheet
-        formulas = self._sheet_formulas.get(name)
-        colors = self._sheet_colors.get(name)
-        if name in self._sheet_cache:
-            df = self._sheet_cache[name]
-        elif self._excel_file is not None:
-            try:
-                df = file_io.read_sheet(self._excel_file, name)
-                self._cache_sheet(name, df)
-            except Exception as e:
-                QMessageBox.critical(self, tr("切换Sheet"), tr("读取 sheet 失败: {}").format(e))
-                self._refresh_sheet_combo()   # 下拉框回到实际停留的 sheet
-                return
-        else:
-            df = pd.DataFrame()
-        # 公式/背景色首次访问时从文件读（删除 sheet 时预载进缓存的 sheet 也需要）
-        on_disk = (self._excel_file is not None and name in self._excel_file.sheet_names)
-        if self.current_file and on_disk:
-            if formulas is None:
-                formulas = file_io.read_sheet_formulas(self.current_file, name)
-            if colors is None:
-                colors = file_io.read_sheet_colors(self.current_file, name)
+        # 加载目标 sheet；公式/背景色首次访问时从文件读
+        # （删除 sheet 时预载进缓存的 sheet 也需要）
+        bundle = self._load_sheet_bundle(
+            name, self._sheet_formulas.get(name), self._sheet_colors.get(name))
+        if bundle is None:
+            self._refresh_sheet_combo()   # 下拉框回到实际停留的 sheet
+            return
+        df, formulas, colors = bundle
+        formulas = formulas or None
         colors = colors or {}
 
         self.current_sheet = name
@@ -2006,11 +2200,11 @@ class MainWindow(QMainWindow):
             self.model.set_dataframe(
                 df, formulas=formulas,
                 from_file=bool(self.current_file)
-                and not file_io.xlsx_has_coord_marker(self.current_file))
+                and not self._file_has_coord_marker(self.current_file))
             self.model.cell_colors = dict(colors)
         self._refresh_sheet_combo()
         self._rebuild_filter_bar()
-        self._update_image_context()
+        self._refresh_image_dock()
         self._save_file_config()   # 记住最后停留的 sheet
         if dropped_view_formulas:
             self.update_statusbar(
@@ -2092,11 +2286,21 @@ class MainWindow(QMainWindow):
         if len(to_delete) >= len(self.sheet_names):
             QMessageBox.warning(self, tr("删除Sheet"), tr("不能删除所有 Sheet"))
             return
-        # 删除前确保保留的 sheet 数据都在内存里（保存时不再依赖原文件）
-        for name in self.sheet_names:
-            if name not in to_delete and name != self.current_sheet \
-                    and name not in self._sheet_cache and self._excel_file is not None:
-                self._sheet_cache[name] = file_io.read_sheet(self._excel_file, name)
+        # 删除前确保保留的 sheet 数据都在内存里（保存时不再依赖原文件）；
+        # 读盘放后台线程，UI 不冻结
+        excel_file = self._excel_file
+        to_preload = [n for n in self.sheet_names
+                      if n not in to_delete and n != self.current_sheet
+                      and n not in self._sheet_cache and excel_file is not None]
+        if to_preload:
+            ok, loaded = self._run_blocking(
+                tr("删除Sheet"), tr("正在读取保留的 Sheet ..."),
+                lambda: {n: file_io.read_sheet(excel_file, n) for n in to_preload})
+            if not ok:
+                self._show_error(tr("删除Sheet"), tr("读取 sheet 失败: {}").format(
+                    ", ".join(to_preload)), loaded)
+                return
+            self._sheet_cache.update(loaded)
         self.sheet_names = [n for n in self.sheet_names if n not in to_delete]
         for name in to_delete:
             self._sheet_cache.pop(name, None)
@@ -2121,7 +2325,7 @@ class MainWindow(QMainWindow):
         if self.model.undo():
             self._mark_modified()
             if self.model.structure_version != version:
-                self._update_image_context()
+                self._refresh_image_dock()
             self.update_statusbar(tr("已撤销"))
 
     def redo(self):
@@ -2132,7 +2336,7 @@ class MainWindow(QMainWindow):
         if self.model.redo():
             self._mark_modified()
             if self.model.structure_version != version:
-                self._update_image_context()
+                self._refresh_image_dock()
             self.update_statusbar(tr("已重做"))
 
     def _text_editor_focused(self):
@@ -2452,9 +2656,10 @@ class MainWindow(QMainWindow):
         self._insert_col_at(pos, name.strip() or None)
 
     def delete_selected_rows(self):
-        # 视图行 0 是表头行，不可删除；转换为数据行坐标
-        rows = sorted({i.row() - HEADER_ROWS for i in self.table.selectionModel().selectedIndexes()
-                       if i.row() > 0})
+        # 视图行 0 是表头行，不可删除；转换为数据行坐标（按选区范围推导，不逐格枚举）
+        rows = [r - HEADER_ROWS for r in _rows_in_ranges(
+            _selection_ranges(self.table.selectionModel()),
+            min_row=HEADER_ROWS, max_row=len(self.model.df))]
         if not rows:
             return
         ret = QMessageBox.question(self, tr("删除行"), tr("确定删除选中的 {} 行？").format(len(rows)))
@@ -2485,7 +2690,8 @@ class MainWindow(QMainWindow):
         self._after_structure_change()
 
     def delete_selected_columns(self):
-        cols = sorted({i.column() for i in self.table.selectionModel().selectedIndexes()})
+        cols = _cols_in_ranges(_selection_ranges(self.table.selectionModel()),
+                               max_col=len(self.model.df.columns) - 1)
         if not cols:
             return
         names = [str(self.model.df.columns[c]) for c in cols]
@@ -2696,6 +2902,7 @@ class MainWindow(QMainWindow):
         return mapped
 
     def _reapply_filters(self):
+        self._flush_preview()   # 视图即将整表替换，预览框里的编辑先写回原格
         frozen_view = 0
         if self.original_df is None:
             # 首次进入筛选：挂起公式（original_df 坐标），清除筛选后恢复。
@@ -2721,7 +2928,7 @@ class MainWindow(QMainWindow):
             self._orig_cell_colors or {}, idx_map)
         self.model.set_dataframe(filtered)
         self._rebuild_filter_bar()
-        self._update_image_context()
+        self._refresh_image_dock()
         message = tr("筛选结果: {} 行（共 {} 个筛选条件）").format(
             len(filtered), len(self.active_filters))
         if self._suspended_formulas:
@@ -2740,6 +2947,7 @@ class MainWindow(QMainWindow):
                 self.clear_all_filters()
 
     def clear_all_filters(self):
+        self._flush_preview()   # 筛选视图里的编辑先经 dataChanged 同步回 original_df
         # 筛选中输入的公式是视图坐标，恢复原表时转为静态值（值已同步）
         frozen_view = len(self.model.formulas) if self.original_df is not None else 0
         if self.original_df is not None:
@@ -2750,7 +2958,7 @@ class MainWindow(QMainWindow):
                                      formulas=self._suspended_formulas)
         restored = len(self._suspended_formulas) if self._suspended_formulas else 0
         self._reset_filter_state()
-        self._update_image_context()
+        self._refresh_image_dock()
         parts = []
         if restored:
             parts.append(tr("已恢复 {} 个公式").format(restored))
@@ -2804,22 +3012,22 @@ class MainWindow(QMainWindow):
         matrix = []
         if with_headers is None:
             with_headers = self.copy_headers_cb.isChecked()
-        if len(ranges) == 1:
-            # 单个矩形选区（含全选）：直接切片，避免为每格生成 QModelIndex
-            # ——百万行全选时逐格枚举会耗尽内存
-            rg = ranges[0]
-            r0, r1 = rg.top(), min(rg.bottom(), len(df))
-            c0, c1 = rg.left(), min(rg.right(), len(df.columns) - 1)
-            if r1 < r0 or c1 < c0:
-                return
+        # 选区一律按矩形范围处理，不为每格生成 QModelIndex
+        # ——百万行全选/整列时逐格枚举会耗尽内存
+        rects = [(rg.top(), min(rg.bottom(), len(df)),
+                  rg.left(), min(rg.right(), len(df.columns) - 1)) for rg in ranges]
+        rects = [r for r in rects if r[1] >= r[0] and r[3] >= r[2]]
+        if not rects:
+            return
+        if len(rects) == 1:
+            r0, r1, c0, c1 = rects[0]
             rows = list(range(r0, r1 + 1))
             cols = list(range(c0, c1 + 1))
             selected = _RectSelection(r0, r1, c0, c1)
         else:
-            indexes = sel_model.selectedIndexes()
-            rows = sorted({i.row() for i in indexes})
-            cols = sorted({i.column() for i in indexes})
-            selected = {(i.row(), i.column()) for i in indexes}
+            rows = sorted({r for r0, r1, _c0, _c1 in rects for r in range(r0, r1 + 1)})
+            cols = sorted({c for _r0, _r1, c0, c1 in rects for c in range(c0, c1 + 1)})
+            selected = _RangeSelection(rects)
         # 选区含视图表头行（行 0）时它本身就是列名行：与"复制列名"选项
         # 合并，保证列名在剪贴板里最多出现一次。勾选选项输出全部列名；
         # 只选中部分表头单元格时，未选中的列留空占位
@@ -2835,8 +3043,8 @@ class MainWindow(QMainWindow):
         if isinstance(selected, _RectSelection) and rows:
             block = df.iloc[rows[0] - 1:rows[-1], cols[0]:cols[-1] + 1]
             arr = block.to_numpy(dtype=object)
-            for row_arr in arr:
-                matrix.append(["" if _isna_scalar(v) else str(v) for v in row_arr])
+            matrix.extend(["" if _isna_scalar(v) else str(v) for v in row_arr]
+                          for row_arr in arr)
         else:
             for r in rows:
                 row_vals = []
@@ -2857,20 +3065,12 @@ class MainWindow(QMainWindow):
         # 与矩阵行列一一对应），并带上源单元格视图坐标供逐格计算平移量
         row_rank = {r: i for i, r in enumerate(rows)}
         col_rank = {c: i for i, c in enumerate(cols)}
-        formula_cells = {}
-        if isinstance(selected, _RectSelection):
-            # 公式通常远少于单元格：遍历公式表而不是选区
-            cells = ((dr + HEADER_ROWS, dc) for (dr, dc) in self.model.formulas
-                     if (dr + HEADER_ROWS, dc) in selected)
-        else:
-            cells = selected
-        for r, c in cells:
-            if r == 0:
-                continue
-            f = self.model.formulas.get((r - HEADER_ROWS, c))
-            if f:
-                formula_cells[(row_rank[r] + header_line, col_rank[c])] = {
-                    "text": f, "src": (r, c)}
+        # 公式通常远少于单元格：遍历公式表而不是选区
+        formula_cells = {
+            (row_rank[dr + HEADER_ROWS] + header_line, col_rank[dc]): {
+                "text": f, "src": (dr + HEADER_ROWS, dc)}
+            for (dr, dc), f in self.model.formulas.items()
+            if f and (dr + HEADER_ROWS, dc) in selected}
         # 应用内粘贴时用来识别自己复制的内容：选项附带的列名行不该粘进表格
         self._own_clipboard = {
             "text": clip_text,
@@ -2897,7 +3097,7 @@ class MainWindow(QMainWindow):
         if mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
-                if path and path.lower().endswith((".xlsx", ".xls", ".csv", ".tsv")):
+                if path and path.lower().endswith(_OPENABLE_EXTS):
                     self.load_file(path)
                     return
             if not mime.hasText():
@@ -2946,12 +3146,7 @@ class MainWindow(QMainWindow):
                 self.model.insert_column(len(df.columns),
                                          self.model._unique_col_name(_col_letter(len(df.columns))))
         if need_rows > 0:
-            empty = pd.DataFrame(np.full((need_rows, len(self.model.df.columns)), np.nan),
-                                 columns=self.model.df.columns)
-            # 追加空行不改变既有位置，必须把公式传回去，否则会被 set_dataframe 清空
-            self.model.set_dataframe(
-                pd.concat([self.model.df, empty]).reset_index(drop=True),
-                mark_modified=True, formulas=self.model.formulas)
+            self._append_empty_rows(need_rows)
         if start_row == 0 and rows:
             # 表头行粘贴预处理：目标名被"本次同样会被改名的列"占用时
             # （如互换/轮换列名），先把占名列挪到临时名，避免误判重名加后缀
@@ -2968,10 +3163,10 @@ class MainWindow(QMainWindow):
                     self.model.rename_column(
                         col_pos, self.model._unique_col_name("__重命名中转"))
 
+        entries = []
         for r_off, row_vals in enumerate(rows):
             for c_off, val in enumerate(row_vals):
                 target_row = start_row + r_off
-                index = self.model.index(target_row, start_col + c_off)
                 formula = clip_cells.get((r_off, c_off))
                 if formula and target_row > 0:
                     # 逐格计算平移量（不连续选区各格偏移不同）
@@ -2989,9 +3184,22 @@ class MainWindow(QMainWindow):
                             and name != str(self.model.df.columns[col_pos])
                             and name in self.model.df.columns):
                         val = self.model._unique_col_name(name)
-                self.model.setData(index, val)
+                entries.append((target_row, start_col + c_off, val))
+        # 整批写入：一条撤销记录（Ctrl+Z 一次撤掉整次粘贴）、一次外接矩形的
+        # dataChanged（筛选中由 _on_cell_edited 按矩形整块镜像回 original_df）、
+        # 一次公式重算；_mark_modified 也只在批后触发一次
+        self.model.set_cells(entries)
         self._mark_modified()
         self.update_statusbar(tr("已粘贴 {} 行").format(len(rows)))
+
+    def _append_empty_rows(self, n):
+        """在表尾追加 n 个空行——走可撤销的结构操作，而不是 set_dataframe
+        （后者会把整个撤销栈清空，粘贴前的编辑就再也撤不回去了）。"""
+        if hasattr(self.model, "append_rows"):
+            self.model.append_rows(n)
+            return
+        for _ in range(n):
+            self.model.insert_row(len(self.model.df))
 
     @staticmethod
     def _parse_clipboard_text(text, keep_blank=False):
@@ -3080,28 +3288,34 @@ class MainWindow(QMainWindow):
         df = self.model.df
         if df.empty:
             return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # 大表 describe 要几秒
+        try:
+            report = df.describe(include="all").to_string()
+        except Exception as e:
+            report = tr("统计失败: {}").format(e)
+        finally:
+            QApplication.restoreOverrideCursor()
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.setWindowTitle(tr("描述性统计"))
         dialog.resize(720, 480)
         layout = QVBoxLayout(dialog)
         text = QPlainTextEdit()
         text.setReadOnly(True)
         text.setFont(QFont("Menlo", 12))
-        try:
-            text.setPlainText(df.describe(include="all").to_string())
-        except Exception as e:
-            text.setPlainText(tr("统计失败: {}").format(e))
+        text.setPlainText(report)
         layout.addWidget(text)
         dialog.exec()
 
     def apply_function(self, func):
-        indexes = self.table.selectionModel().selectedIndexes()
         df = self.model.df
-        if indexes:
-            values = pd.to_numeric(
-                pd.Series([df.iat[i.row() - HEADER_ROWS, i.column()]
-                           for i in indexes if i.row() > 0]),  # 跳过表头行
-                errors="coerce")
+        # 按选区范围整块切片（跳过表头行），不为每格生成 QModelIndex
+        blocks = [df.iloc[max(rg.top(), HEADER_ROWS) - HEADER_ROWS:rg.bottom(),
+                          rg.left():rg.right() + 1].to_numpy(dtype=object).ravel()
+                  for rg in _selection_ranges(self.table.selectionModel())]
+        blocks = [b for b in blocks if b.size]
+        if blocks:
+            values = pd.to_numeric(pd.Series(np.concatenate(blocks)), errors="coerce")
         else:
             values = pd.Series(dtype=float)
         if values.notna().sum() == 0:
@@ -3132,11 +3346,32 @@ class MainWindow(QMainWindow):
 
     # ================= 单元格内容预览 =================
 
+    def _flush_preview(self):
+        """预览框里还没落盘的编辑立即写回原单元格。
+
+        400ms 延迟保存期间若发生换 sheet / 新建 / 筛选 / 关窗，模型整表重置
+        但不会发 currentChanged，定时器到点会把文字写进新表的同一坐标；
+        所有整表替换的入口都必须先调用这里。
+        """
+        timer = getattr(self, "_preview_save_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+            self._save_cell_preview()
+
+    def _on_model_reset_preview(self):
+        """模型整表重置后旧的预览坐标已失效：作废未落盘的编辑并清空预览框。"""
+        timer = getattr(self, "_preview_save_timer", None)
+        if timer is None:
+            return
+        timer.stop()
+        self._preview_cell = None
+        self._preview_loading = True
+        self.cell_preview_text.clear()
+        self._preview_loading = False
+
     def _on_current_cell_changed(self, current, previous):
         # 400ms 延迟保存还没触发就切换单元格：先写回原单元格，否则编辑丢失
-        if self._preview_save_timer.isActive():
-            self._preview_save_timer.stop()
-            self._save_cell_preview()
+        self._flush_preview()
         if current.isValid():
             self._preview_loading = True
             # EditRole：公式单元格显示公式本身，可直接编辑
@@ -3178,11 +3413,21 @@ class MainWindow(QMainWindow):
                 active_col = str(col)
                 break
         self.image_panel.set_context(self.model.df, active_col, self._base_image_dir())
+        self._active_image_col = active_col
+        self._image_synced_df = self.model.df
         return active_col
 
     def _update_image_context(self):
-        """数据或图片列变化后刷新图片面板。"""
+        """图片列设置变化后强制刷新图片面板并按需显示。"""
         if self._sync_image_panel():
+            self.image_dock.show()
+
+    def _refresh_image_dock(self):
+        """整表替换后只决定面板是否显示：内容已由 modelReset 等信号同步过，
+        不再重建一遍（大表时面板重建不便宜）。"""
+        if self._image_synced_df is not self.model.df:
+            self._sync_image_panel()   # 兜底：没有走信号的路径
+        if self._active_image_col:
             self.image_dock.show()
 
     def _set_image_column(self, colname):
@@ -3274,8 +3519,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("图片队列"), tr("请先把某一列设为图片列"))
             return
         # 从选中行（或全部行）收集图片路径（视图行 -> 数据行，跳过表头行）
-        rows = sorted({i.row() - HEADER_ROWS for i in self.table.selectionModel().selectedIndexes()
-                       if i.row() > 0})
+        rows = [r - HEADER_ROWS for r in _rows_in_ranges(
+            _selection_ranges(self.table.selectionModel()),
+            min_row=HEADER_ROWS, max_row=len(self.model.df))]
         if len(rows) <= 1:
             rows = range(len(self.model.df))
         col_idx = list(self.model.df.columns).index(colname)
@@ -3329,8 +3575,9 @@ class MainWindow(QMainWindow):
     # ================= 背景颜色 =================
 
     def _set_selection_color(self, color_hex):
-        cells = [(i.row() - HEADER_ROWS, i.column())   # -1 = 表头行（同样支持着色）
-                 for i in self.table.selectionModel().selectedIndexes()]
+        cells = [(r - HEADER_ROWS, c)   # -1 = 表头行（同样支持着色）
+                 for r, c in _iter_range_cells(
+                     _selection_ranges(self.table.selectionModel()))]
         # 批量应用并记入撤销栈；筛选底账经 cellColorsChanged 信号统一同步
         if cells and self.model.apply_cell_colors(cells, color_hex):
             self._mark_modified()
@@ -3353,30 +3600,59 @@ class MainWindow(QMainWindow):
 
     # ================= 右键菜单 =================
 
+    def _add_row_actions(self, menu, view_row):
+        """行相关动作：上/下插入、删除选中行、设为表头（表头行本身除外）。
+
+        视图行 -> 数据行（-1）；表头行（视图 0）上两个插入都落到数据行 0。
+        """
+        data_row = max(0, view_row - HEADER_ROWS)
+        below = data_row + (1 if view_row > 0 else 0)
+        menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
+        menu.addAction(tr("向下插入一行"), lambda: self.insert_row(below))
+        menu.addAction(tr("删除选中行"), self.delete_selected_rows)
+        if view_row > 0:
+            menu.addAction(tr("将此行设为表头"),
+                           lambda: self.promote_row_to_header(view_row - 1))
+
+    def _add_column_actions(self, menu, col, header_menu=False):
+        """列相关动作。header_menu=True 是字母列头的右键菜单：筛选走列头箭头
+        同一个弹层、删除只删这一列；单元格菜单则打开筛选对话框、删除选中列。"""
+        colname = str(self.model.df.columns[col])
+        if header_menu:
+            filter_slot = lambda: self.open_column_filter(col)
+        else:
+            filter_slot = lambda: self.open_filter_dialog(preset_col=colname)
+        menu.addAction(tr("筛选此列 ({})...").format(colname), filter_slot)
+        menu.addAction(tr("升序排序"), lambda: self._sort_by(col, True))
+        menu.addAction(tr("降序排序"), lambda: self._sort_by(col, False))
+        menu.addSeparator()
+        menu.addAction(tr("重命名列"), lambda: self._rename_column_at(col))
+        menu.addAction(tr("向左插入一列"), lambda: self._insert_col_at(col))
+        menu.addAction(tr("向右插入一列"), lambda: self._insert_col_at(col + 1))
+        if header_menu:
+            menu.addAction(tr("删除此列"), lambda: self._delete_col_at(col))
+        else:
+            menu.addAction(tr("删除选中列"), self.delete_selected_columns)
+
+    def _add_image_actions(self, menu, colname, index=None):
+        """图片列相关动作：设为/取消图片列、（有单元格时）查看图片、队列复制。"""
+        is_image_col = colname in self.image_columns
+        if is_image_col and index is not None:
+            menu.addAction(tr("查看图片"), lambda: self._view_cell_image(index))
+        if is_image_col:
+            menu.addAction(tr("取消图片列"), lambda: self._unset_image_column(colname))
+        else:
+            menu.addAction(tr("设为图片列"), lambda: self._set_image_column(colname))
+        menu.addAction(tr("图片队列复制..."), lambda: self._open_image_queue(
+            colname if is_image_col else None))
+
     def _show_cell_menu(self, pos):
         index = self.table.indexAt(pos)
         menu = QMenu(self)
         if index.isValid():
-            # 视图行 -> 数据行（-1）；表头行上"向上插入"落到数据行 0
-            data_row = max(0, index.row() - HEADER_ROWS)
-            menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
-            menu.addAction(tr("向下插入一行"), lambda: self.insert_row(
-                data_row + (1 if index.row() > 0 else 0)))
-            menu.addAction(tr("删除选中行"), self.delete_selected_rows)
-            if index.row() > 0:
-                menu.addAction(tr("将此行设为表头"),
-                               lambda: self.promote_row_to_header(index.row() - 1))
+            self._add_row_actions(menu, index.row())
             menu.addSeparator()
-            menu.addAction(tr("向左插入一列"), lambda: self._insert_col_at(index.column()))
-            menu.addAction(tr("向右插入一列"), lambda: self._insert_col_at(index.column() + 1))
-            menu.addAction(tr("重命名列"), lambda: self._rename_column_at(index.column()))
-            menu.addAction(tr("删除选中列"), self.delete_selected_columns)
-            menu.addSeparator()
-            colname = str(self.model.df.columns[index.column()])
-            menu.addAction(tr("筛选此列 ({})...").format(colname),
-                           lambda: self.open_filter_dialog(preset_col=colname))
-            menu.addAction(tr("升序排序"), lambda: self._sort_by(index.column(), True))
-            menu.addAction(tr("降序排序"), lambda: self._sort_by(index.column(), False))
+            self._add_column_actions(menu, index.column())
             menu.addSeparator()
         else:
             # 空白区域：支持直接在末尾追加行/列
@@ -3391,14 +3667,8 @@ class MainWindow(QMainWindow):
         menu.addAction(tr("复制后转置"), self.copy_selection_transposed)
         menu.addAction(tr("粘贴"), self.paste_selection)
         if index.isValid():
-            colname = str(self.model.df.columns[index.column()])
             menu.addSeparator()
-            if colname in self.image_columns:
-                menu.addAction(tr("查看图片"), lambda: self._view_cell_image(index))
-                menu.addAction(tr("取消图片列"), lambda: self._unset_image_column(colname))
-            else:
-                menu.addAction(tr("设为图片列"), lambda: self._set_image_column(colname))
-            menu.addAction(tr("图片队列复制..."), lambda: self._open_image_queue())
+            self._add_image_actions(menu, str(self.model.df.columns[index.column()]), index)
             menu.addSeparator()
             color_menu = menu.addMenu(tr("设置背景颜色"))
             for label, color_hex in CELL_COLORS:
@@ -3425,17 +3695,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, tr("查看图片"), tr("图片不存在:\n{}").format(path))
 
     def copy_selection_transposed(self):
-        indexes = self.table.selectionModel().selectedIndexes()
-        if not indexes:
+        ranges = _selection_ranges(self.table.selectionModel())
+        if not ranges:
             return
-        # 视图行 -> 数据行；表头行由列名行独立提供，选中它不再重复
-        rows = sorted({i.row() - HEADER_ROWS for i in indexes if i.row() > 0})
-        cols = sorted({i.column() for i in indexes})
         df = self.model.df
+        # 视图行 -> 数据行；表头行由列名行独立提供，选中它不再重复
+        rows = [r - HEADER_ROWS for r in
+                _rows_in_ranges(ranges, min_row=HEADER_ROWS, max_row=len(df))]
+        cols = _cols_in_ranges(ranges, max_col=len(df.columns) - 1)
+        if not cols:
+            return
         matrix = [[str(df.columns[c]) for c in cols]]
-        for r in rows:
-            matrix.append(["" if pd.isna(df.iat[r, c]) else str(df.iat[r, c])
-                           for c in cols])
+        matrix.extend(["" if pd.isna(df.iat[r, c]) else str(df.iat[r, c]) for c in cols]
+                      for r in rows)
         transposed = list(zip(*matrix))
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter="\t", quotechar='"',
@@ -3462,25 +3734,10 @@ class MainWindow(QMainWindow):
                            lambda: self._insert_col_at(len(self.model.df.columns)))
             menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
             return
-        colname = str(self.model.df.columns[col])
         menu = QMenu(self)
-        # 和点列头箭头是同一个弹层，两条路进来行为一致
-        menu.addAction(tr("筛选此列 ({})...").format(colname),
-                       lambda: self.open_column_filter(col))
-        menu.addAction(tr("升序排序"), lambda: self._sort_by(col, True))
-        menu.addAction(tr("降序排序"), lambda: self._sort_by(col, False))
+        self._add_column_actions(menu, col, header_menu=True)
         menu.addSeparator()
-        menu.addAction(tr("重命名列"), lambda: self._rename_column_at(col))
-        menu.addAction(tr("向左插入一列"), lambda: self._insert_col_at(col))
-        menu.addAction(tr("向右插入一列"), lambda: self._insert_col_at(col + 1))
-        menu.addAction(tr("删除此列"), lambda: self._delete_col_at(col))
-        menu.addSeparator()
-        if colname in self.image_columns:
-            menu.addAction(tr("取消图片列"), lambda: self._unset_image_column(colname))
-        else:
-            menu.addAction(tr("设为图片列"), lambda: self._set_image_column(colname))
-        menu.addAction(tr("图片队列复制..."), lambda: self._open_image_queue(
-            colname if colname in self.image_columns else None))
+        self._add_image_actions(menu, str(self.model.df.columns[col]))
         menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
 
     def _delete_col_at(self, col):
@@ -3493,17 +3750,8 @@ class MainWindow(QMainWindow):
         row = self.table.verticalHeader().logicalIndexAt(pos)
         if row < 0:
             return
-        # 视图行 -> 数据行；表头行（视图 0）上两个动作都落到数据行 0
-        data_row = max(0, row - 1)
-        below = data_row + (1 if row > 0 else 0)
         menu = QMenu(self)
-        menu.addAction(tr("向上插入一行"), lambda: self.insert_row(data_row))
-        menu.addAction(tr("向下插入一行"), lambda: self.insert_row(below))
-        menu.addAction(tr("删除选中行"), self.delete_selected_rows)
-        if row > 0:
-            menu.addSeparator()
-            menu.addAction(tr("将此行设为表头"),
-                           lambda: self.promote_row_to_header(row - 1))
+        self._add_row_actions(menu, row)
         menu.exec(self.table.verticalHeader().mapToGlobal(pos))
 
     @staticmethod
@@ -3600,14 +3848,25 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".xlsx", ".xls", ".csv", ".tsv")):
-                self.load_file(path)
+            if path.lower().endswith(_OPENABLE_EXTS):
+                event.acceptProposedAction()
+                # 加载带模态进度框（嵌套事件循环），不能在拖放事件处理中直接跑：
+                # 让拖放先结束，下一轮事件循环再加载
+                QTimer.singleShot(0, lambda p=path: self.load_file(p))
                 return
         QMessageBox.information(self, tr("拖拽打开"), tr("仅支持 Excel / CSV 文件"))
 
     # ================= 关闭 =================
 
     def closeEvent(self, event):
+        self._flush_preview()   # 400ms 内的最后一笔预览编辑不能丢
+        analysis_win = getattr(self, "_analysis_win", None)
+        if analysis_win is not None and analysis_win.isVisible():
+            # 分析窗口里代码还在跑时它会拒绝关闭：主窗口也不能关，
+            # 否则挂在它下面的工作线程随窗口销毁直接崩溃
+            if not analysis_win.close():
+                event.ignore()
+                return
         if self._check_save_before_discard():
             self._save_recent()
             self._save_file_config()   # 记住最后停留的 sheet / 图片列

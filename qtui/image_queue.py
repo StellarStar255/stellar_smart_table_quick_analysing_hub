@@ -12,14 +12,14 @@ import threading
 import time
 import traceback
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
     QPushButton, QVBoxLayout, QWidget,
 )
 
-from qtui.image_viewer import ImageViewer, copy_image_to_clipboard
+from qtui.image_viewer import ImageViewer, copy_image_to_clipboard_async
 from qtui.image_utils import load_image
 from qtui.i18n import tr
 
@@ -74,6 +74,23 @@ class _ThumbnailLabel(QLabel):
         super().mouseDoubleClickEvent(event)
 
 
+class _PreviewSignals(QObject):
+    loaded = pyqtSignal(str, QImage)
+
+
+class _PreviewLoader(QRunnable):
+    """后台解码预览图（与 image_panel 的加载器同一套路：QImage 可跨线程）。"""
+
+    def __init__(self, path, size, signals):
+        super().__init__()
+        self._path = path
+        self._size = size
+        self._signals = signals
+
+    def run(self):
+        self._signals.loaded.emit(self._path, load_image(self._path, self._size))
+
+
 class FloatingImageQueue(QWidget):
     """浮动图片队列窗口，逐一复制图片到剪贴板"""
 
@@ -99,6 +116,14 @@ class FloatingImageQueue(QWidget):
         self.setWindowFlags(Qt.WindowType.Window
                             | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle(tr("图片队列复制"))
+
+        # 预览图后台解码：大图在主线程解码会让每次「下一张」都卡一下
+        self._preview_pool = QThreadPool(self)
+        self._preview_pool.setMaxThreadCount(1)
+        self._preview_signals = _PreviewSignals(self)
+        self._preview_signals.loaded.connect(self._on_preview_loaded)
+        self._preview_path = None        # 正在显示/等待显示的那张，旧任务的结果直接丢掉
+        self._copy_seq = 0               # 复制请求序号：只把最新一次的结果写到状态栏
 
         self._build_ui()
 
@@ -355,8 +380,14 @@ class FloatingImageQueue(QWidget):
                 pass
 
     def _update_preview(self, path):
-        # 解码时直接缩到预览尺寸并应用 EXIF 方向（大图不再全量解码）
-        image = load_image(path, (_PREVIEW_MAX_W, _PREVIEW_MAX_H))
+        # 解码在后台线程，直接缩到预览尺寸并应用 EXIF 方向（大图不再全量解码）
+        self._preview_path = path
+        self._preview_pool.start(_PreviewLoader(
+            path, (_PREVIEW_MAX_W, _PREVIEW_MAX_H), self._preview_signals))
+
+    def _on_preview_loaded(self, path, image):
+        if path != self._preview_path:
+            return                       # 用户已经翻到别的图了
         if image.isNull():
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText(tr("(无法预览)"))
@@ -378,12 +409,21 @@ class FloatingImageQueue(QWidget):
             return
         path = self.image_paths[self.current_index]
         total = len(self.image_paths)
-        if copy_image_to_clipboard(path):
-            self.status_label.setText(
-                tr("已复制 {}/{}").format(self.current_index + 1, total))
-        else:
-            self.status_label.setText(tr("复制失败"))
-        QTimer.singleShot(1500, lambda: self.status_label.setText(""))
+        index = self.current_index
+        self._copy_seq += 1
+        seq = self._copy_seq
+
+        def _done(ok):
+            try:
+                if seq != self._copy_seq:
+                    return           # 之后又点了下一张，以最新那次为准
+                self.status_label.setText(
+                    tr("已复制 {}/{}").format(index + 1, total) if ok else tr("复制失败"))
+                QTimer.singleShot(1500, lambda: self.status_label.setText(""))
+            except RuntimeError:
+                pass                 # 窗口已关闭销毁
+
+        copy_image_to_clipboard_async(path, _done)
 
     def _jump_to_index(self):
         total = len(self.image_paths)

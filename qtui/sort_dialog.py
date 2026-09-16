@@ -2,7 +2,7 @@
 """多列排序对话框：若干行"列 + 升/降序"，从上到下为优先级。"""
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
+    QDialog, QVBoxLayout, QGridLayout, QLabel, QComboBox,
     QPushButton, QDialogButtonBox, QWidget,
 )
 

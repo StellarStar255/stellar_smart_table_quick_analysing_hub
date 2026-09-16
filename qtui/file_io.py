@@ -28,6 +28,26 @@ CSV_ENCODINGS = ("utf-8-sig", "gbk", "big5", "gb18030", "utf-16", "latin1")
 # 新建 CSV 的默认编码：带 BOM 的 utf-8，Windows 上的 Excel 才能正确识别中文
 DEFAULT_CSV_ENCODING = "utf-8-sig"
 
+# 编码探测只解码文件开头这么多字节（而不是用每种编码整文件 read_csv 一遍）
+_ENCODING_SAMPLE_BYTES = 4 << 20
+
+# 纯文本表格格式（分隔符文本）：.csv 逗号；.tsv/.txt 制表符
+_TEXT_EXTS = (".csv", ".tsv", ".txt")
+_TAB_EXTS = (".tsv", ".txt")
+
+# 字段原文是否带前导零（"007"、"-007"、"+007"）；"0"、"0.5"、"10.0" 都不算
+_LEADING_ZERO_RE = r"^\s*[-+]?0\d"
+
+
+def is_text_format(path) -> bool:
+    """路径是否为分隔符文本表格（.csv / .tsv / .txt），大小写不敏感。"""
+    return str(path).lower().endswith(_TEXT_EXTS)
+
+
+def _sep_for_ext(path) -> str:
+    """仅按扩展名推断分隔符：.tsv/.txt 制表符，其余逗号。"""
+    return "\t" if str(path).lower().endswith(_TAB_EXTS) else ","
+
 # Excel 对 sheet 名的限制
 SHEET_NAME_MAX_LEN = 31
 _SHEET_NAME_BAD_CHARS = set('\\/?*[]:')
@@ -91,11 +111,41 @@ def _sniff_bom(file_path):
             head = f.read(4)
     except OSError:
         return None
+    # 4 字节的 UTF-32 BOM 必须先判：FF FE 00 00 的前两字节与 UTF-16 LE 相同
+    if head.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-32"
     if head.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
     if head.startswith((b"\xff\xfe", b"\xfe\xff")):
         return "utf-16"
     return None
+
+
+def _detect_encodings(file_path):
+    """返回按可能性排序的候选编码元组。
+
+    有 BOM 直接定；否则只解码文件开头 _ENCODING_SAMPLE_BYTES 字节
+    （增量解码器容忍尾部被截断的多字节序列），淘汰解不开的编码——
+    比用每种编码把整个文件 read_csv 一遍便宜得多。顺序仍是 CSV_ENCODINGS。
+    """
+    bom_enc = _sniff_bom(file_path)
+    if bom_enc:
+        return (bom_enc,)
+    try:
+        with open(file_path, "rb") as f:
+            sample = f.read(_ENCODING_SAMPLE_BYTES)
+    except OSError:
+        return CSV_ENCODINGS
+    import codecs
+    final = len(sample) < _ENCODING_SAMPLE_BYTES
+    good = []
+    for enc in CSV_ENCODINGS:
+        try:
+            codecs.getincrementaldecoder(enc)().decode(sample, final)
+        except (UnicodeError, LookupError):
+            continue
+        good.append(enc)
+    return tuple(good) or CSV_ENCODINGS
 
 
 def _csv_may_have_leading_zeros(file_path, sep):
@@ -105,13 +155,13 @@ def _csv_may_have_leading_zeros(file_path, sep):
     只有命中时才对数值列做逐列核对。
     """
     sep_b = sep.encode("ascii", "replace") if sep else b","
-    pat = re.compile(rb'[' + re.escape(sep_b) + rb'"\n]-?0[0-9]')
+    pat = re.compile(rb'[' + re.escape(sep_b) + rb'"\r\n][-+]?0[0-9]')
     try:
         with open(file_path, "rb") as f:
             first = f.read(3)
             if first[:1] == b"0" and first[1:2].isdigit():
                 return True
-            if first[:1] == b"-" and first[1:2] == b"0" and first[2:3].isdigit():
+            if first[:1] in (b"-", b"+") and first[1:2] == b"0" and first[2:3].isdigit():
                 return True
             f.seek(0)
             tail = b""
@@ -131,13 +181,15 @@ def _preserve_leading_zeros(df, file_path, read_kwargs):
     """把被 pandas 推断成数字、但原文带前导零的列（邮编/工号/编码）还原为文本。
 
     做法：只对"整数值"列（int 列，或非空值全为整数的 float 列）用 dtype=str
-    重读，比较原文长度与数字位数——原文更长即存在前导零（或 + 号），整列
-    保持原文。不改动其它列，pandas 的快速推断路径保持不变。
+    重读，原文匹配 ^\\s*[-+]?0\\d（"007"/"-007"）才判定为前导零，整列保持
+    原文；"10.0"、"0"、"0.5" 都不算（旧的"原文比数字位数长"启发式会把
+    "10.0" 误判成前导零，把整个浮点列变成文本）。
+    不改动其它列，pandas 的快速推断路径保持不变。
     """
     if df is None or len(df) == 0 or len(df.columns) == 0:
         return df
     enc = read_kwargs.get("encoding") or ""
-    if not enc.lower().startswith("utf-16"):
+    if not enc.lower().startswith(("utf-16", "utf-32")):   # 宽字符编码无法字节预扫
         if not _csv_may_have_leading_zeros(file_path, read_kwargs.get("sep") or ","):
             return df
     cand = []
@@ -162,16 +214,7 @@ def _preserve_leading_zeros(df, file_path, read_kwargs):
         return df
     for pos, i in enumerate(cand):
         rs = raw.iloc[:, pos]
-        mask = rs.notna().to_numpy()
-        if not mask.any():
-            continue
-        texts = rs.to_numpy()[mask].astype(str)
-        lens = np.char.str_len(np.char.strip(texts))
-        v = df.iloc[:, i].to_numpy()[mask].astype(np.float64)
-        av = np.abs(v)
-        digits = np.where(av < 1, 1, np.floor(np.log10(np.maximum(av, 1)) + 1e-9) + 1)
-        digits = digits + (v < 0)
-        if (lens > digits).any():
+        if rs.str.match(_LEADING_ZERO_RE, na=False).any():
             df.isetitem(i, rs.to_numpy())
     return df
 
@@ -182,15 +225,14 @@ def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
     列数不一致（前言元数据行比数据行窄）导致解析失败时，改为整文件
     原样载入（首行也作为数据、列名用位置字母），由用户决定表头。
     空文件返回空 DataFrame。检测到的编码记录在 df.attrs["source_encoding"]，
-    保存时可按原编码写回。
+    分隔符记录在 df.attrs["source_sep"]，保存时可按原样写回。
+    编码先用文件开头样本探测（_detect_encodings），正常只解析一次。
     """
     last_err = None
     sep = delimiter
     if sep is None:
-        sep = "\t" if file_path.lower().endswith((".tsv", ".txt")) else ","
-    bom_enc = _sniff_bom(file_path)
-    encodings = (bom_enc,) if bom_enc else CSV_ENCODINGS
-    for enc in encodings:
+        sep = _sep_for_ext(file_path)
+    for enc in _detect_encodings(file_path):
         kwargs = dict(encoding=enc, sep=sep)
         try:
             df = pd.read_csv(file_path, **kwargs)
@@ -213,6 +255,7 @@ def read_csv_any_encoding(file_path, delimiter=None) -> pd.DataFrame:
             if df is None:
                 df = pd.DataFrame()
         df.attrs["source_encoding"] = _source_encoding_name(file_path, enc)
+        df.attrs["source_sep"] = sep
         return df
     raise last_err
 
@@ -251,11 +294,27 @@ def _xlsx_has_formulas(file_path):
     return False
 
 
+def _formula_text(v):
+    """单元格值 -> 公式文本（"=..."）；不是公式返回 None。
+
+    普通公式是以 "=" 开头的 str；数组公式（Ctrl+Shift+Enter / 动态数组）
+    openpyxl 读成 ArrayFormula 对象，文本在 .text 里。模拟运算表
+    （DataTableFormula）没有可显示的文本，返回 None。
+    """
+    if isinstance(v, str):
+        return v if len(v) > 1 and v.startswith("=") else None
+    text = getattr(v, "text", None)     # openpyxl.worksheet.formula.ArrayFormula
+    if isinstance(text, str) and text:
+        return text if text.startswith("=") else "=" + text
+    return None
+
+
+
 def read_sheet_formulas(file_path, sheet_name) -> dict:
     """用 openpyxl 扫描 sheet 中的公式，返回 {(row, col): "=..."}。
 
     pandas 读到的是公式的缓存计算值，公式文本必须用 data_only=False 另读。
-    仅支持 .xlsx；读取失败返回空 dict。
+    数组公式（ArrayFormula）取其 .text。仅支持 .xlsx；读取失败返回空 dict。
     """
     if not str(file_path).lower().endswith(".xlsx"):
         return {}
@@ -271,9 +330,9 @@ def read_sheet_formulas(file_path, sheet_name) -> dict:
         ws = wb[sheet_name]
         for row in ws.iter_rows(min_row=2):  # 第 1 行是表头
             for cell in row:
-                v = cell.value
-                if isinstance(v, str) and len(v) > 1 and v.startswith("="):
-                    formulas[(cell.row - 2, cell.column - 1)] = v
+                text = _formula_text(cell.value)
+                if text is not None:
+                    formulas[(cell.row - 2, cell.column - 1)] = text
         wb.close()
     except Exception as e:
         print(f"读取公式失败: {e}")
@@ -295,11 +354,99 @@ def _xlsx_has_custom_fills(file_path) -> bool:
         return False
 
 
+# 主题色索引 -> 主题 XML 里的颜色名（ECMA-376：0/1 是 lt1/dk1，2/3 是 lt2/dk2）
+_THEME_SLOTS = ("lt1", "dk1", "lt2", "dk2", "accent1", "accent2", "accent3",
+                "accent4", "accent5", "accent6", "hlink", "folHlink")
+_DRAWINGML_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _theme_palette(wb):
+    """从工作簿主题 XML 解析 12 个主题色 ['RRGGBB' | None, ...]；没有/解析失败返回 None。"""
+    raw = getattr(wb, "loaded_theme", None)
+    if not raw:
+        return None
+    try:
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(raw)
+        scheme = root.find(".//" + _DRAWINGML_NS + "clrScheme")
+        if scheme is None:
+            return None
+        named = {}
+        for child in scheme:
+            tag = child.tag.split("}")[-1]
+            clr = child.find(_DRAWINGML_NS + "srgbClr")
+            val = clr.get("val") if clr is not None else None
+            if val is None:
+                clr = child.find(_DRAWINGML_NS + "sysClr")
+                val = clr.get("lastClr") if clr is not None else None
+            if val and re.fullmatch(r"[0-9A-Fa-f]{6}", val[-6:]):
+                named[tag] = val[-6:].upper()
+        return [named.get(k) for k in _THEME_SLOTS]
+    except Exception:
+        return None
+
+
+def _apply_tint(hex6, tint):
+    """Excel 的主题色明暗调整（tint ∈ [-1, 1]，按 HLS 亮度缩放）。"""
+    if not tint:
+        return hex6
+    import colorsys
+    r, g, b = (int(hex6[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    if tint < 0:
+        l = l * (1.0 + tint)
+    else:
+        l = l * (1.0 - tint) + tint
+    r, g, b = colorsys.hls_to_rgb(h, min(1.0, max(0.0, l)), s)
+    return "%02X%02X%02X" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def _fill_rgb(fill, palette=None):
+    """solid 填充 -> '#rrggbb'；无填充或本应用无法解析的填充返回 None。
+
+    rgb 直接取；indexed 按 Excel 默认调色板（COLOR_INDEX，64/65 系统色除外）；
+    theme 用工作簿主题表 + tint 解析（没有主题表时返回 None）。
+    读取（read_sheet_colors）与就地保存清底色（_write_sheet_values）都用这
+    一个函数判断"应用认识的填充"，保证只清掉自己读到过的那些。
+    注意 openpyxl 对 theme/indexed 颜色的 .rgb 属性返回的是描述符错误文本，
+    不能只看 isinstance(rgb, str)。
+    """
+    if fill is None or fill.fill_type != "solid":
+        return None
+    color = fill.fgColor
+    if color is None:
+        return None
+    ctype = getattr(color, "type", None)
+    if ctype == "rgb":
+        rgb = color.rgb
+        if not isinstance(rgb, str) or rgb == "00000000":
+            return None
+        hex6 = rgb[-6:]
+    elif ctype == "indexed":
+        from openpyxl.styles.colors import COLOR_INDEX
+        idx = color.indexed
+        if not isinstance(idx, int) or not 0 <= idx < len(COLOR_INDEX):
+            return None
+        hex6 = COLOR_INDEX[idx][-6:]
+    elif ctype == "theme":
+        idx = color.theme
+        if (not palette or not isinstance(idx, int)
+                or not 0 <= idx < len(palette) or palette[idx] is None):
+            return None
+        tint = color.tint if isinstance(color.tint, (int, float)) else 0.0
+        hex6 = _apply_tint(palette[idx], tint)
+    else:
+        return None
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", hex6):
+        return None
+    return "#" + hex6.lower()
+
+
 def read_sheet_colors(file_path, sheet_name) -> dict:
     """读取 sheet 的单元格背景色，返回 {(数据行, 列): '#rrggbb'}。
 
-    行号 -1 表示表头行（Excel 第 1 行）。仅支持 .xlsx；
-    无自定义填充或读取失败返回空 dict。
+    行号 -1 表示表头行（Excel 第 1 行）。rgb / 默认调色板 indexed / 主题色
+    （含 tint）都解析为 rgb；仅支持 .xlsx；无自定义填充或读取失败返回空 dict。
     """
     if not str(file_path).lower().endswith(".xlsx"):
         return {}
@@ -312,15 +459,12 @@ def read_sheet_colors(file_path, sheet_name) -> dict:
         if sheet_name not in wb.sheetnames:
             wb.close()
             return {}
+        palette = _theme_palette(wb)
         for row in wb[sheet_name].iter_rows():
             for cell in row:
-                fill = cell.fill
-                if fill is None or fill.fill_type != "solid":
-                    continue
-                rgb = getattr(fill.fgColor, "rgb", None)
-                if not isinstance(rgb, str) or rgb == "00000000":
-                    continue
-                colors[(cell.row - 2, cell.column - 1)] = "#" + rgb[-6:].lower()
+                rgb = _fill_rgb(cell.fill, palette)
+                if rgb is not None:
+                    colors[(cell.row - 2, cell.column - 1)] = rgb
         wb.close()
     except Exception as e:
         print(f"读取背景色失败: {e}")
@@ -466,7 +610,7 @@ _LOSSY_PARTS = (
 
 
 def xlsx_lossy_parts(file_path):
-    """扫描 xlsx，返回就地保存时会丢失的功能名（去重、保持顺序）。"""
+    """扫描 xlsx，返回就地保存时会丢失的功能名（已翻译、去重、保持顺序）。"""
     import zipfile
     found = []
     try:
@@ -479,7 +623,7 @@ def xlsx_lossy_parts(file_path):
             continue
         if any(part in n for n in names):
             found.append(label)
-    return found
+    return [tr(label) for label in found]
 
 
 def _xl_value(v):
@@ -513,46 +657,128 @@ def _fill_for(color, cache):
     return fill
 
 
-def _write_sheet_values(ws, df, clear_stale_fills):
+def _sync_merged_ranges(ws, max_row, max_col):
+    """delete_rows / delete_cols 不会更新合并区域：把超出新范围的合并区裁掉或删掉。
+
+    局限：openpyxl 的 delete_rows/delete_cols 同样不会同步条件格式、数据验证
+    的作用区域和公式引用——它们只是引用了已不存在的区域（Excel 打开时忽略
+    越界部分，文件不会损坏），这里只处理会让 Excel 报"文件已损坏"的合并区。
+    """
+    from openpyxl.worksheet.cell_range import CellRange
+    for r in list(ws.merged_cells.ranges):
+        if r.max_row <= max_row and r.max_col <= max_col:
+            continue
+        ws.merged_cells.remove(r)
+        if r.min_row > max_row or r.min_col > max_col:
+            continue                                  # 整个区域都在删掉的范围里
+        new_max_row = min(r.max_row, max_row)
+        new_max_col = min(r.max_col, max_col)
+        if (new_max_row, new_max_col) != (r.min_row, r.min_col):   # 剩一格就不算合并
+            ws.merged_cells.add(CellRange(min_col=r.min_col, min_row=r.min_row,
+                                          max_col=new_max_col, max_row=new_max_row))
+
+
+def _write_sheet_values(ws, df, clear_stale_fills, colors=None, formulas=None,
+                        palette=None):
     """把 DataFrame 整块覆盖到 sheet（第 1 行表头），并删掉多余的行列。
 
-    表头行原本是公式的单元格不覆盖，否则用户的公式会被写死成静态文本；
-    返回这样保留下来的表头公式个数。
-    clear_stale_fills=True 时顺手清掉数据区里的旧底色（用户清除颜色才生效）。
+    - 表头行原本是公式的单元格不覆盖，否则用户的公式会被写死成静态文本；
+    - 数组公式（ArrayFormula）在应用的公式表 formulas 里仍存在时不用缓存值
+      覆盖（由 patch_workbook 的公式写入负责）；formulas 为 None（调用方没有
+      公式信息）时一律保留。模拟运算表（DataTableFormula）应用不解析，一律保留；
+    - 合并区域里非左上角的占位格（MergedCell）在 Excel 里本来就没有值，跳过；
+      若应用里该格有内容则计入 skipped_merged；
+    - clear_stale_fills=True 时清掉数据区里应用认识的旧底色（rgb/默认调色板/
+      主题色，见 _fill_rgb）；颜色没变的格子保留原填充对象（主题色不会被改写成
+      rgb），应用从没读到过的填充原样保留。
+    返回 {"kept_header_formulas": n, "skipped_merged": m}。
     """
+    from openpyxl.cell.cell import MergedCell
+    from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+    colors = colors or {}
     kept = 0
+    skipped_merged = 0
     ncols = len(df.columns)
     nrows = len(df.index)
-    for j, name in enumerate(df.columns):
-        cell = ws.cell(row=1, column=j + 1)
-        if isinstance(cell.value, str) and cell.value.startswith("="):
-            kept += 1
-            continue
-        cell.value = str(name)
-    for i, row in enumerate(df.itertuples(index=False, name=None)):
-        for j, v in enumerate(row):
-            # 不能用 ws.cell(..., value=...)：openpyxl 对 None 是跳过不写，
-            # 旧值会留在格子里，用户删掉的内容就删不掉
-            ws.cell(row=i + 2, column=j + 1).value = _xl_value(v)
-    if clear_stale_fills:
+    if ncols:
+        header_cells = next(ws.iter_rows(min_row=1, max_row=1, max_col=ncols))
+        for cell, name in zip(header_cells, df.columns):
+            if isinstance(cell, MergedCell):
+                if not str(name).startswith("Unnamed"):
+                    skipped_merged += 1
+                continue
+            if _formula_text(cell.value) is not None:
+                kept += 1
+                continue
+            cell.value = str(name)
+    if nrows and ncols:
+        rows = ws.iter_rows(min_row=2, max_row=nrows + 1, max_col=ncols)
+        for i, (cells, values) in enumerate(
+                zip(rows, df.itertuples(index=False, name=None))):
+            for j, (cell, v) in enumerate(zip(cells, values)):
+                if isinstance(cell, MergedCell):
+                    if _xl_value(v) is not None:
+                        skipped_merged += 1
+                    continue
+                cur = cell.value
+                if isinstance(cur, DataTableFormula):
+                    continue
+                if isinstance(cur, ArrayFormula) and (
+                        formulas is None or (i, j) in formulas):
+                    continue
+                # 不能用 ws.cell(..., value=...)：openpyxl 对 None 是跳过不写，
+                # 旧值会留在格子里，用户删掉的内容就删不掉
+                cell.value = _xl_value(v)
+    if clear_stale_fills and ncols:
         from openpyxl.styles import PatternFill
         none_fill = PatternFill()
         for row in ws.iter_rows(min_row=1, max_row=nrows + 1, max_col=ncols):
             for cell in row:
-                if cell.fill is not None and cell.fill.fill_type is not None:
-                    cell.fill = none_fill
+                fill = cell.fill
+                if fill is None or fill.fill_type is None:
+                    continue
+                known = _fill_rgb(fill, palette)
+                if known is None:
+                    continue          # 应用从没读到过的填充，原样保留
+                if colors.get((cell.row - 2, cell.column - 1)) == known:
+                    continue          # 颜色没变：保留原填充（主题色仍是主题色）
+                cell.fill = none_fill
     # 多余的行列真删掉（表变短/变窄时不留空壳）
     if ws.max_row > nrows + 1:
         ws.delete_rows(nrows + 2, ws.max_row - (nrows + 1))
     if ws.max_column > ncols:
         ws.delete_cols(ncols + 1, ws.max_column - ncols)
-    return kept
+    _sync_merged_ranges(ws, nrows + 1, ncols)
+    return {"kept_header_formulas": kept, "skipped_merged": skipped_merged}
 
 
-def _apply_fills(ws, colors, cache):
+def _apply_fills(ws, colors, cache, palette=None):
+    from openpyxl.cell.cell import MergedCell
     for (row, col), color in colors.items():
         excel_row = row + 2 if row >= 0 else 1   # -1 = 表头行
-        ws.cell(row=excel_row, column=col + 1).fill = _fill_for(color, cache)
+        cell = ws.cell(row=excel_row, column=col + 1)
+        if isinstance(cell, MergedCell):
+            continue
+        if _fill_rgb(cell.fill, palette) == color:
+            continue                              # 已是这个颜色：不改写原填充
+        cell.fill = _fill_for(color, cache)
+
+
+def _write_formulas(ws, formulas):
+    """把应用的公式写回 sheet；原本是数组公式的单元格仍写成数组公式。"""
+    from openpyxl.cell.cell import MergedCell
+    from openpyxl.worksheet.formula import ArrayFormula
+    for (row, col), formula in formulas.items():
+        # +2: 跳过表头行且 openpyxl 从 1 开始计数
+        cell = ws.cell(row=row + 2, column=col + 1)
+        if isinstance(cell, MergedCell):
+            continue
+        cur = cell.value
+        if isinstance(cur, ArrayFormula):
+            if cur.text != formula:
+                cell.value = ArrayFormula(cur.ref, formula)
+            continue
+        cell.value = formula
 
 
 def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
@@ -563,7 +789,8 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
     sheets: {sheet名: DataFrame}，只写这些 sheet；不在里面的 sheet 原样保留。
     sheet_order: 保存后完整的 sheet 顺序；不在其中的 sheet 视为用户删除。
     formulas / cell_colors: 与 save_workbook 同义，只对 sheets 里的 sheet 生效。
-    返回 {"kept_header_formulas": n}。
+    返回 {"kept_header_formulas": n, "skipped_merged_cells": m}：
+    m 是落在合并区域占位格上、Excel 里无法存放而没写入的非空值个数。
     先写临时文件再原子替换，写一半失败不会损坏任何一个文件。
     """
     from openpyxl import load_workbook
@@ -579,7 +806,9 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
     keep_vba = (str(src_path).lower().endswith((".xlsm", ".xltm"))
                 and str(dest_path).lower().endswith((".xlsm", ".xltm")))
     wb = load_workbook(src_path, data_only=False, keep_vba=keep_vba)
+    palette = _theme_palette(wb) if clear_stale_fills else None
     kept_header_formulas = 0
+    skipped_merged = 0
     fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(dest_path)[1] or ".xlsx",
                                     dir=os.path.dirname(dest_path) or ".")
     os.close(fd)
@@ -595,11 +824,15 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
             if df is None:
                 continue                          # 没改动过：整张原样保留
             ws = wb[name] if name in wb.sheetnames else wb.create_sheet(title=name)
-            kept_header_formulas += _write_sheet_values(ws, df, clear_stale_fills)
-            for (row, col), formula in formulas.get(name, {}).items():
-                # +2: 跳过表头行且 openpyxl 从 1 开始计数
-                ws.cell(row=row + 2, column=col + 1, value=formula)
-            _apply_fills(ws, cell_colors.get(name, {}), fill_cache)
+            sheet_colors = cell_colors.get(name, {})
+            stats = _write_sheet_values(ws, df, clear_stale_fills,
+                                        colors=sheet_colors,
+                                        formulas=formulas.get(name),
+                                        palette=palette)
+            kept_header_formulas += stats["kept_header_formulas"]
+            skipped_merged += stats["skipped_merged"]
+            _write_formulas(ws, formulas.get(name, {}))
+            _apply_fills(ws, sheet_colors, fill_cache, palette)
         wb._sheets = [wb[n] for n in order if n in wb.sheetnames]
         wb.properties.keywords = COORD_MARKER
         wb.save(tmp_path)
@@ -609,21 +842,42 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
-    return {"kept_header_formulas": kept_header_formulas}
+    return {"kept_header_formulas": kept_header_formulas,
+            "skipped_merged_cells": skipped_merged}
 
 
-def save_csv(file_path, df: pd.DataFrame, encoding=None):
-    """写 CSV：先写同目录临时文件再原子替换，写一半失败不会损坏原文件。
+def csv_separator(file_path, df: pd.DataFrame = None, sep=None) -> str:
+    """决定写分隔符文本时用的分隔符。
+
+    显式 sep 优先；否则 .tsv 一定是制表符；.csv 用读取时记录的
+    df.attrs["source_sep"]（如用户自定义的 ";"），但从 .tsv/.txt 导出成
+    .csv 时不把制表符带进 .csv；其余（.txt）按记录值，没有则按扩展名推断。
+    """
+    if sep:
+        return sep
+    ext = os.path.splitext(str(file_path))[1].lower()
+    src = (df.attrs.get("source_sep") if df is not None else None) or None
+    if ext == ".tsv":
+        return "\t"
+    if ext == ".csv" and src == "\t":
+        return ","
+    return src or _sep_for_ext(file_path)
+
+
+def save_csv(file_path, df: pd.DataFrame, encoding=None, sep=None):
+    """写 CSV/TSV/TXT：先写同目录临时文件再原子替换，写一半失败不会损坏原文件。
 
     encoding 未指定时依次取：df.attrs["source_encoding"]（读取时记录的
     原文件编码，按原样写回）→ utf-8-sig（新文件；带 BOM，Windows Excel
-    才能正确显示中文）。
+    才能正确显示中文）。sep 未指定时见 csv_separator（.tsv/.txt 用制表符）。
     """
     enc = encoding or df.attrs.get("source_encoding") or DEFAULT_CSV_ENCODING
-    fd, tmp_path = tempfile.mkstemp(suffix=".csv", dir=os.path.dirname(file_path) or ".")
+    sep = csv_separator(file_path, df, sep)
+    suffix = os.path.splitext(str(file_path))[1] or ".csv"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=os.path.dirname(file_path) or ".")
     os.close(fd)
     try:
-        df.to_csv(tmp_path, index=False, encoding=enc)
+        df.to_csv(tmp_path, index=False, encoding=enc, sep=sep)
         _replace_file(tmp_path, file_path)
     except Exception:
         if os.path.exists(tmp_path):

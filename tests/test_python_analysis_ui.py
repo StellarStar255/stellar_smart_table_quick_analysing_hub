@@ -255,10 +255,11 @@ class TestFlattenFrame:
         flat = flatten_frame(g)
         assert list(flat.columns) == ['ground_truth', '序号_sum', '序号_mean']
 
-    def test_plain_frame_untouched_but_copied(self):
+    def test_plain_frame_returned_as_is(self):
+        # 不需要整理时不再复制整表（调用方只读），直接返回原对象
         df = _df()
         flat = flatten_frame(df)
-        assert flat is not df and flat.equals(df)
+        assert flat is df
 
     def test_index_name_clashing_with_column(self):
         df = pd.DataFrame({'k': [1, 2], 'v': [3, 4]})
@@ -439,3 +440,165 @@ class TestHistoryAndPersistence:
                             staticmethod(lambda *a, **k: python_analysis.QMessageBox.StandardButton.Yes))
         win._load_history_entry(win._history[0])
         assert win.code_edit.toPlainText() == "z = 3"
+
+
+class TestQueuedSheetFlatten:
+    """代码里 save_as_sheet(...) 排队保存的表也要和按钮一样先整理（分组标签展开、多级列压平）。"""
+
+    def test_groupby_result_keeps_group_column(self, win):
+        win.code_edit.setPlainText(
+            "save_as_sheet(df.groupby('ground_truth')['序号'].sum().to_frame(), '汇总')")
+        run_sync(win)
+        saved_df, name = win.host.added[-1]
+        assert name == '汇总'
+        assert list(saved_df.columns) == ['ground_truth', '序号']
+        assert list(saved_df['ground_truth']) == ['a', 'b']
+
+    def test_multiindex_columns_flattened(self, win):
+        win.code_edit.setPlainText(
+            "save_as_sheet(df.groupby('ground_truth').agg({'序号': ['sum', 'mean']}), 'x')")
+        run_sync(win)
+        saved_df, _ = win.host.added[-1]
+        assert list(saved_df.columns) == ['ground_truth', '序号_sum', '序号_mean']
+
+
+class TestAppendAlignment:
+    def _yes(self, monkeypatch):
+        monkeypatch.setattr(python_analysis.QMessageBox, "question",
+                            staticmethod(lambda *a, **k: python_analysis.QMessageBox.StandardButton.Yes))
+
+    def test_sorted_result_realigned_to_current_rows(self, rich, monkeypatch):
+        rich.code_edit.setPlainText(
+            "result = df.sort_values('序号', ascending=False)[['序号']].rename(columns={'序号': 'r'})")
+        run_sync(rich)
+        self._yes(monkeypatch)
+        rich._append_result_columns()
+        appended = rich.host.appended[-1]
+        assert list(appended.columns) == ['r']            # 不会多出 index 列
+        assert list(appended['r']) == [1, 2, 3]           # 按当前表的行序，不是排序后的顺序
+
+    def test_mismatched_index_warns_instead_of_misaligning(self, rich, monkeypatch):
+        rich.code_edit.setPlainText("result = df.set_index('ground_truth')[['序号']]")  # 3 行但标签是 a/b/a
+        run_sync(rich)
+        self._yes(monkeypatch)
+        warned = []
+        monkeypatch.setattr(python_analysis.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a[2])))
+        rich._append_result_columns()
+        assert warned and rich.host.appended == []
+        assert "df.merge" in warned[0]
+
+    def test_align_result_rows_helper(self):
+        from qtui.python_analysis import align_result_rows
+        base = pd.DataFrame({'v': [10, 20, 30]})
+        perm = base.iloc[[2, 0, 1]]
+        out, why = align_result_rows(perm, base.index)
+        assert why is None and list(out['v']) == [10, 20, 30] and 'index' not in out.columns
+        assert align_result_rows(base.head(2), base.index) == (None, 'rows')
+        labelled = base.set_axis(['x', 'y', 'z'])
+        assert align_result_rows(labelled, base.index) == (None, 'index')
+
+
+class TestMemorySharing:
+    def test_df_full_is_same_copy_when_not_filtered(self, win):
+        win.code_edit.setPlainText("print(df_full is df)")
+        run_sync(win)
+        assert "True" in win.output_edit.toPlainText()
+
+    def test_df_full_separate_when_filtered(self, rich):
+        rich.host.original_df = pd.concat([_df(), _df()], ignore_index=True)
+        rich.code_edit.setPlainText("print(df_full is df, len(df_full))")
+        run_sync(rich)
+        assert "False 6" in rich.output_edit.toPlainText()
+
+    def test_preferred_result_skips_equals_on_large_frames(self, win, monkeypatch):
+        calls = []
+        real = pd.DataFrame.equals
+        monkeypatch.setattr(pd.DataFrame, "equals",
+                            lambda self, other: calls.append(1) or real(self, other))
+        host_df = win.host.model.df                      # 3 × 4 = 12 个单元格
+        monkeypatch.setattr(win, "_EQUALS_MAX_CELLS", 4)
+        assert win._preferred_result({"df": host_df.copy()}) is None and calls == []
+        # 列名不同：不用逐值比较就知道改过
+        assert win._preferred_result({"df": host_df.rename(columns={'序号': 'n'})}) == "df"
+        assert calls == []
+        # 小表才逐值比较
+        monkeypatch.setattr(win, "_EQUALS_MAX_CELLS", 1000)
+        changed = host_df.copy()
+        changed.iloc[0, 1] = 99
+        assert win._preferred_result({"df": changed}) == "df" and calls == [1]
+
+
+class TestSheetFetchThread:
+    def test_sheet_read_happens_on_main_thread(self, rich):
+        """sheets['x'] 在工作线程里被调用，但真正读宿主数据必须在主线程。"""
+        import threading
+        import time
+        seen = []
+        orig = rich.host.get_sheet_df
+
+        def get_sheet_df(name):
+            seen.append(threading.get_ident())
+            return orig(name)
+        rich.host.get_sheet_df = get_sheet_df
+        rich.code_edit.setPlainText("other = sheets['其他']\nprint('rows', len(other))")
+        rich.run_code()
+        worker = rich._worker
+        finished = []
+        worker.finished.connect(lambda: finished.append(1))
+        deadline = time.time() + 10
+        while not finished and time.time() < deadline:
+            _app.processEvents()
+            time.sleep(0.01)
+        _app.processEvents()
+        assert finished, "工作线程没有结束（主线程代办可能死锁）"
+        assert seen and all(t == threading.main_thread().ident for t in seen)
+        assert "rows 2" in rich.output_edit.toPlainText()
+
+
+class TestRunningState:
+    def test_run_while_running_shows_hint(self, win):
+        win.code_edit.setPlainText("import time\ntime.sleep(0.5)")
+        win.run_code()
+        assert win._worker.isRunning()
+        win.run_code()                                    # 再按 F5
+        assert tr("代码正在运行，请等待完成或点击「停止」") in win.host.status
+        win._worker.wait(5000)
+        _app.processEvents()
+
+    def test_stop_pending_hint_when_uninterruptible(self, win):
+        import time
+        win.code_edit.setPlainText("import time\ntime.sleep(0.8)")   # C 层调用，停不下来
+        win.run_code()
+        time.sleep(0.2)                                   # 等代码真的进到 sleep 里
+        win.stop_code()
+        assert win._stop_pending_timer.isActive()
+        win._on_stop_pending()                            # 模拟 3 秒到点
+        assert tr("当前操作无法中断，请等待完成") in win.host.status
+        win._worker.wait(5000)
+        _app.processEvents()
+        assert not win._stop_pending_timer.isActive()
+
+
+class TestCloseFromHost:
+    """主窗口退出时会调用 self._analysis_win.close()。"""
+
+    def test_close_saves_code_and_accepts(self, win):
+        win.code_edit.setPlainText("print('bye')")
+        assert win.close() is True
+        with open(python_analysis.LAST_CODE_FILE, encoding='utf-8') as f:
+            assert f.read() == "print('bye')"
+
+    def test_close_refused_while_uninterruptible_code_runs(self, win, monkeypatch):
+        warned = []
+        monkeypatch.setattr(python_analysis.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: warned.append(a)))
+        import time
+        win.code_edit.setPlainText("import time\ntime.sleep(4)")
+        win.run_code()
+        time.sleep(0.3)                                   # 等代码真的进到 sleep 里（之前 cancel 会当场生效）
+        assert win.close() is False                       # 等了 3 秒仍在跑：拒绝关闭，不销毁线程
+        assert warned
+        win._worker.wait(10000)
+        _app.processEvents()
+        assert win.close() is True                        # 跑完后就能关了

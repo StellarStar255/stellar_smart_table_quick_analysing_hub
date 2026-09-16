@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 _app = QApplication.instance() or QApplication([])
 
 from qtui import file_io
+from qtui.i18n import tr
 from qtui.main_window import MainWindow
 
 
@@ -33,7 +34,7 @@ def make_rich_xlsx(path, rows=5):
         ws.append([i, i * 2])
     ws.column_dimensions["A"].width = 33
     ws.freeze_panes = "A2"
-    ws.merge_cells("D1:E1")
+    ws.merge_cells("A{0}:B{0}".format(rows + 1))   # 数据区最后一行合并（表外的合并区会随删列一起删除）
     ws.conditional_formatting.add(
         "A2:A99", CellIsRule(operator="greaterThan", formula=["2"],
                              fill=PatternFill(bgColor="FFC7CE")))
@@ -149,9 +150,10 @@ class TestPatchWorkbook:
     def test_save_as_copy_keeps_source_intact(self, tmp_path):
         src = make_rich_xlsx(str(tmp_path / "src.xlsx"))
         dest = str(tmp_path / "copy.xlsx")
-        df = pd.DataFrame({"a": [7], "b": [8]})
+        df = pd.DataFrame({"a": [7, 2, 3, 4, 5], "b": [8, 4, 6, 8, 10]})
         file_io.patch_workbook(src, dest, {"数据": df}, ["数据", "原样"])
         assert features(dest) == features(src)          # 副本继承全部设置
+        assert load_workbook(dest)["数据"]["A2"].value == 7
         assert load_workbook(src)["数据"]["A2"].value == 1   # 原文件没被动
 
 
@@ -165,7 +167,7 @@ class TestLossyParts:
         src = make_rich_xlsx(str(tmp_path / "src.xlsx"))
         with zipfile.ZipFile(src, "a") as z:
             z.writestr("xl/vbaProject.bin", b"\x00")
-        assert "宏（VBA）" in file_io.xlsx_lossy_parts(src)
+        assert tr("宏（VBA）") in file_io.xlsx_lossy_parts(src)   # 已按界面语言翻译
 
 
 class TestSaveThroughWindow:
@@ -199,7 +201,148 @@ class TestSaveThroughWindow:
                             lambda *a, **k: (asked.append(a[2]),
                                              QMessageBox.StandardButton.Cancel)[1])
         assert win.save_file() is False
-        assert asked and "切片器" in asked[0]
+        assert asked and tr("切片器") in asked[0]
         assert load_workbook(src)["数据"]["B2"].value == 2   # 取消后原文件没动
         win.model.modified = False
         win.close()
+
+
+class TestFillsAppNeverReadArePreserved:
+    """就地保存只清应用认识的底色；主题色/调色板色不能被抹掉，也不能读成垃圾"""
+
+    def _make(self, path):
+        from openpyxl.styles.colors import Color
+        wb = Workbook(); ws = wb.active; ws.title = "S"
+        ws.append(["a", "b", "c", "d"]); ws.append([1, 2, 3, 4]); ws.append([5, 6, 7, 8])
+        ws["A2"].fill = PatternFill(fill_type="solid", fgColor=Color(theme=4, tint=0.4))
+        ws["B2"].fill = PatternFill(fill_type="solid", fgColor=Color(indexed=5))
+        ws["C2"].fill = PatternFill(fill_type="solid", fgColor="FF00FF00")
+        ws["D3"].fill = PatternFill(fill_type="solid", fgColor=Color(theme=7))
+        wb.save(path)
+        return path
+
+    def test_read_resolves_theme_and_indexed_to_rgb(self, tmp_path):
+        src = self._make(str(tmp_path / "t.xlsx"))
+        colors = file_io.read_sheet_colors(src, "S")
+        assert colors[(0, 2)] == "#00ff00"
+        assert colors[(0, 1)] == "#ffff00"                    # 默认调色板第 5 号是黄色
+        import re
+        for key in ((0, 0), (1, 3)):
+            assert re.fullmatch(r"#[0-9a-f]{6}", colors[key]), colors[key]   # 不再是 "#'str'>"
+        assert colors[(0, 0)] != colors[(1, 3)]
+
+    def test_inplace_save_keeps_theme_fill_objects_when_unchanged(self, tmp_path):
+        src = self._make(str(tmp_path / "t.xlsx"))
+        colors = file_io.read_sheet_colors(src, "S")
+        df = pd.DataFrame({"a": [1, 5], "b": [2, 6], "c": [3, 7], "d": [4, 8]})
+        file_io.patch_workbook(src, src, {"S": df}, ["S"], cell_colors={"S": colors})
+        ws = load_workbook(src)["S"]
+        assert ws["A2"].fill.fgColor.type == "theme"
+        assert ws["A2"].fill.fgColor.theme == 4 and abs(ws["A2"].fill.fgColor.tint - 0.4) < 1e-9
+        assert ws["B2"].fill.fgColor.type == "indexed" and ws["B2"].fill.fgColor.indexed == 5
+        assert ws["D3"].fill.fgColor.type == "theme" and ws["D3"].fill.fgColor.theme == 7
+        assert ws["C2"].fill.fgColor.rgb == "FF00FF00"
+        assert file_io.read_sheet_colors(src, "S") == colors   # 再读一遍完全一致
+
+    def test_user_cleared_known_fill_is_removed_but_unknown_kept(self, tmp_path, monkeypatch):
+        src = self._make(str(tmp_path / "t.xlsx"))
+        # 主题表解析不出来时（应用从没显示过这些主题色）：即使用户清空全部颜色也原样保留
+        monkeypatch.setattr(file_io, "_theme_palette", lambda wb: None)
+        assert (0, 0) not in file_io.read_sheet_colors(src, "S")
+        df = pd.DataFrame({"a": [1, 5], "b": [2, 6], "c": [3, 7], "d": [4, 8]})
+        file_io.patch_workbook(src, src, {"S": df}, ["S"], cell_colors={"S": {}})
+        ws = load_workbook(src)["S"]
+        assert ws["A2"].fill.fgColor.type == "theme" and ws["A2"].fill.fill_type == "solid"
+        assert ws["D3"].fill.fgColor.type == "theme"
+        assert ws["B2"].fill.fill_type is None        # 调色板色应用认识：用户清了就清掉
+        assert ws["C2"].fill.fill_type is None
+
+    def test_changed_color_overrides_theme_fill(self, tmp_path):
+        src = self._make(str(tmp_path / "t.xlsx"))
+        colors = file_io.read_sheet_colors(src, "S")
+        colors[(0, 0)] = "#123456"
+        df = pd.DataFrame({"a": [1, 5], "b": [2, 6], "c": [3, 7], "d": [4, 8]})
+        file_io.patch_workbook(src, src, {"S": df}, ["S"], cell_colors={"S": colors})
+        ws = load_workbook(src)["S"]
+        assert ws["A2"].fill.fgColor.rgb == "FF123456"
+
+
+class TestArrayFormulas:
+    def _make(self, path):
+        from openpyxl.worksheet.formula import ArrayFormula
+        wb = Workbook(); ws = wb.active; ws.title = "S"
+        ws.append(["a", "b", "c"]); ws.append([1, 2, None]); ws.append([3, 4, None])
+        ws["C2"] = ArrayFormula("C2", "=SUM(A2:A3*B2:B3)")
+        ws["C3"] = "=A3+B3"
+        wb.save(path)
+        return path
+
+    def test_read_sheet_formulas_sees_array_formula(self, tmp_path):
+        src = self._make(str(tmp_path / "af.xlsx"))
+        assert file_io.read_sheet_formulas(src, "S") == {(0, 2): "=SUM(A2:A3*B2:B3)",
+                                                         (1, 2): "=A3+B3"}
+
+    def test_inplace_save_keeps_array_formula(self, tmp_path):
+        from openpyxl.worksheet.formula import ArrayFormula
+        src = self._make(str(tmp_path / "af.xlsx"))
+        formulas = file_io.read_sheet_formulas(src, "S")
+        df = pd.DataFrame({"a": [1, 3], "b": [2, 4], "c": [14.0, 7.0]})   # c 列是缓存值
+        file_io.patch_workbook(src, src, {"S": df}, ["S"], formulas={"S": formulas})
+        ws = load_workbook(src)["S"]
+        assert isinstance(ws["C2"].value, ArrayFormula)
+        assert ws["C2"].value.text == "=SUM(A2:A3*B2:B3)" and ws["C2"].value.ref == "C2"
+        assert ws["C3"].value == "=A3+B3"
+        # 调用方没有公式信息时同样不能用缓存值把数组公式盖掉
+        file_io.patch_workbook(src, src, {"S": df}, ["S"])
+        assert isinstance(load_workbook(src)["S"]["C2"].value, ArrayFormula)
+
+    def test_edited_array_formula_written_back_as_array(self, tmp_path):
+        from openpyxl.worksheet.formula import ArrayFormula
+        src = self._make(str(tmp_path / "af.xlsx"))
+        df = pd.DataFrame({"a": [1, 3], "b": [2, 4], "c": [0.0, 7.0]})
+        file_io.patch_workbook(src, src, {"S": df}, ["S"],
+                               formulas={"S": {(0, 2): "=SUM(A2:A3+B2:B3)", (1, 2): "=A3+B3"}})
+        v = load_workbook(src)["S"]["C2"].value
+        assert isinstance(v, ArrayFormula) and v.text == "=SUM(A2:A3+B2:B3)" and v.ref == "C2"
+
+    def test_user_removed_array_formula_becomes_value(self, tmp_path):
+        src = self._make(str(tmp_path / "af.xlsx"))
+        df = pd.DataFrame({"a": [1, 3], "b": [2, 4], "c": [99.0, 7.0]})
+        file_io.patch_workbook(src, src, {"S": df}, ["S"], formulas={"S": {(1, 2): "=A3+B3"}})
+        assert load_workbook(src)["S"]["C2"].value == 99
+
+
+class TestMergedRangesOnShrink:
+    def _make(self, path):
+        wb = Workbook(); ws = wb.active; ws.title = "S"
+        ws.append(["a", "b", "c"])
+        for i in range(1, 9):
+            ws.append([i, i * 2, i * 3])
+        ws.merge_cells("A2:A3")     # 完全在新范围内：保留
+        ws.merge_cells("B3:B6")     # 跨出新范围：裁到 B3:B4
+        ws.merge_cells("A8:A9")     # 整体在删掉的行里：删除
+        ws.merge_cells("C5:C9")     # 整列被删：删除
+        ws.merge_cells("E1:F1")     # 表头右侧被删的列：删除
+        wb.save(path)
+        return path
+
+    def test_no_crash_and_ranges_synced(self, tmp_path):
+        src = self._make(str(tmp_path / "m.xlsx"))
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        result = file_io.patch_workbook(src, src, {"S": df}, ["S"])
+        ws = load_workbook(src)["S"]
+        assert ws.max_row == 4 and ws.max_column == 2
+        assert sorted(str(r) for r in ws.merged_cells.ranges) == ["A2:A3", "B3:B4"]
+        assert ws["A2"].value == 1 and ws["B3"].value == 5   # 合并区左上角照常写入
+        assert result["skipped_merged_cells"] == 2      # A3/B4 是占位格，df 里的 2/6 写不进去
+
+    def test_merged_placeholder_without_value_is_not_counted(self, tmp_path):
+        src = str(tmp_path / "m2.xlsx")
+        wb = Workbook(); ws = wb.active; ws.title = "S"
+        ws.append(["a", "b"]); ws.append([1, None]); ws.merge_cells("A2:B2")
+        wb.save(src)
+        df = pd.DataFrame({"a": [7], "b": [None]})
+        result = file_io.patch_workbook(src, src, {"S": df}, ["S"])
+        assert result["skipped_merged_cells"] == 0
+        ws = load_workbook(src)["S"]
+        assert ws["A2"].value == 7 and [str(r) for r in ws.merged_cells.ranges] == ["A2:B2"]

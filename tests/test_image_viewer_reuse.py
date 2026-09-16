@@ -81,3 +81,54 @@ def test_closed_viewer_is_dropped_and_new_one_opens(win, images):
     win.open_image_viewer(images[1], new_window=False)
     assert len(win._image_viewers) == 1
     assert win._image_viewers[0].image_path == images[1]
+
+
+# ---------------------------------------------------------------------------
+# 剪贴板复制 / 队列预览不再在 GUI 线程同步跑
+# ---------------------------------------------------------------------------
+
+def _wait_until(pred, timeout=5.0):
+    import time
+    end = time.time() + timeout
+    while not pred() and time.time() < end:
+        _app.processEvents()
+        time.sleep(0.01)
+    return pred()
+
+
+def test_async_copy_falls_back_to_qt_clipboard(images, monkeypatch):
+    from qtui import image_viewer
+    monkeypatch.setattr(image_viewer, "_copy_via_system_tool", lambda p: False)
+    got = []
+    image_viewer.copy_image_to_clipboard_async(images[0], got.append)
+    assert _wait_until(lambda: got) and got == [True]
+    assert not QApplication.clipboard().image().isNull()
+
+
+def test_async_copy_missing_file_reports_false_immediately(tmp_path):
+    from qtui.image_viewer import copy_image_to_clipboard_async
+    got = []
+    copy_image_to_clipboard_async(str(tmp_path / "nope.png"), got.append)
+    assert got == [False]
+
+
+def test_viewer_copy_updates_title_after_background_copy(images, monkeypatch):
+    from qtui import image_viewer
+    monkeypatch.setattr(image_viewer, "_copy_via_system_tool", lambda p: True)
+    viewer = ImageViewer(images[0])
+    viewer._copy_image()
+    base = os.path.basename(images[0])
+    assert _wait_until(lambda: viewer.windowTitle() != base)   # "(已复制)" 追加到标题
+    viewer.close()
+
+
+def test_queue_preview_decoded_off_main_thread_and_copy_async(images, monkeypatch):
+    from qtui import image_viewer
+    from qtui.image_queue import FloatingImageQueue
+    monkeypatch.setattr(image_viewer, "_copy_via_system_tool", lambda p: True)
+    q = FloatingImageQueue(images)
+    assert _wait_until(lambda: q.preview_label.pixmap().width() == 40)    # 第一张 40×30
+    q._go_next()
+    assert _wait_until(lambda: q.preview_label.pixmap().width() == 60)    # 第二张 60×20
+    assert _wait_until(lambda: q.status_label.text() != "")               # 复制结果回到状态栏
+    q.close()

@@ -6,6 +6,7 @@
 多条件之间为 AND 关系，依次应用。条件名与 Tkinter 版完全一致。
 """
 
+import numpy as np
 import pandas as pd
 
 from qtui.i18n import tr
@@ -22,28 +23,114 @@ CONDITIONS = [
 last_errors = []
 
 
-def _is_numeric_column(series: pd.Series) -> bool:
+def _numeric_values(series: pd.Series):
+    """列可按数值比较时返回其数值形式（Series），否则返回 None。
+
+    数值 dtype 直接返回；object 列里非空值全是数字（如公式结果混入后整列
+    退化为 object）也按数值比较。只做一次 to_numeric，结果供比较复用。
+    """
     if pd.api.types.is_bool_dtype(series.dtype):
-        return False
+        return None
     if pd.api.types.is_numeric_dtype(series.dtype):
-        return True
-    # object 列里全是数字（如公式结果混入后整列退化为 object）也按数值比较
-    non_null = series.dropna()
-    if non_null.empty:
-        return False
-    return pd.to_numeric(non_null, errors='coerce').notna().all()
+        return series
+    if pd.api.types.is_datetime64_any_dtype(series.dtype):
+        return None
+    numeric = pd.to_numeric(series, errors='coerce')
+    if numeric.notna().sum() == 0:
+        return None
+    if (numeric.isna() & series.notna()).any():
+        return None
+    return numeric
+
+
+def _is_numeric_column(series: pd.Series) -> bool:
+    return _numeric_values(series) is not None
+
+
+_scalar_formatter = None
+
+
+def _format_scalar_func():
+    """单值格式化函数：直接复用表格模型的 pandas_model._format_cell
+    （单一事实来源）；模型不可导入时（纯 pandas 环境）用等价的本地实现兜底。
+    只解析一次，避免 map 时逐元素 import。
+    """
+    global _scalar_formatter
+    if _scalar_formatter is None:
+        try:
+            from qtui.pandas_model import _format_cell
+        except Exception:   # 没装 Qt 时也能用
+            _format_cell = _format_cell_fallback
+        _scalar_formatter = _format_cell
+    return _scalar_formatter
+
+
+def _format_cell_fallback(value) -> str:
+    import datetime
+    if type(value) is str:
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value != value:
+            return ""
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return repr(float(value))
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return str(value)
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        return str(value)
+    if isinstance(value, np.floating):
+        return _format_cell_fallback(float(value))
+    if isinstance(value, datetime.datetime):
+        if (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+            return value.date().isoformat()
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+    return str(value)
 
 
 def display_text(series: pd.Series) -> pd.Series:
-    """与表格显示一致的文本：整数值的浮点不带 .0（10.0 显示为 10）；缺失值为空串。"""
-    def fmt(v):
-        if isinstance(v, float):
-            if v != v:
-                return ''
-            if v.is_integer() and abs(v) < 1e15:
-                return str(int(v))
-        return '' if v is None else str(v)
-    return series.map(fmt)
+    """与表格显示完全一致的文本（筛选/查找的唯一事实来源）。
+
+    整数值的浮点不带 .0（10.0 显示为 10）；日期列显示 2024-01-01，带时间
+    才显示 2024-01-01 08:30:00；缺失值为空串。数值/日期列走向量化路径，
+    其余逐元素套用表格模型的格式化函数。
+    """
+    dtype = series.dtype
+    index = series.index
+    if pd.api.types.is_bool_dtype(dtype) and not isinstance(dtype, pd.BooleanDtype):
+        return series.astype(str)
+    if pd.api.types.is_float_dtype(dtype) and isinstance(dtype, np.dtype):
+        arr = series.to_numpy(dtype=np.float64)
+        notna = ~np.isnan(arr)
+        with np.errstate(invalid='ignore'):
+            is_int = notna & (np.abs(arr) < 1e15) & (arr == np.floor(arr))
+        out = arr.astype(str).astype(object)
+        out[~notna] = ''
+        if is_int.any():
+            out[is_int] = arr[is_int].astype(np.int64).astype(str)
+        return pd.Series(out, index=index, dtype=object)
+    if pd.api.types.is_integer_dtype(dtype) and isinstance(dtype, np.dtype):
+        return series.astype(str)
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        notna = series.notna().to_numpy()
+        out = np.full(len(series), '', dtype=object)
+        if notna.any():
+            dt = series.dt
+            full = dt.strftime('%Y-%m-%d %H:%M:%S').to_numpy(dtype=object)
+            midnight = ((dt.hour == 0) & (dt.minute == 0) & (dt.second == 0)
+                        & (dt.microsecond == 0) & (dt.nanosecond == 0)).to_numpy()
+            short = dt.strftime('%Y-%m-%d').to_numpy(dtype=object)
+            out = np.where(midnight, short, full)
+            out[~notna] = ''
+        return pd.Series(out, index=index, dtype=object)
+    if isinstance(dtype, pd.StringDtype):
+        return series.astype(object).where(series.notna(), '').astype(str)
+    return series.map(_format_scalar_func())
 
 
 _display_text = display_text     # 旧名保留
@@ -72,13 +159,14 @@ def value_counts(series: pd.Series):
 
 def _equals_mask(series: pd.Series, value) -> pd.Series:
     """"等于"：数值列按数值比较（10 匹配 10.0），否则按显示文本比较。"""
-    if _is_numeric_column(series):
+    numeric = _numeric_values(series)
+    if numeric is not None:
         try:
             target = float(str(value).strip())
         except ValueError:
             target = None
         if target is not None:
-            return pd.to_numeric(series, errors='coerce') == target
+            return numeric == target
     return display_text(series) == str(value)
 
 
@@ -89,6 +177,36 @@ def _to_float(value, condition):
         raise ValueError('{}: "{}"'.format(tr('大于/小于 条件需要数值'), value))
 
 
+def _condition_mask(series: pd.Series, condition, value):
+    """单个条件在原始列上的布尔掩码；未知条件返回 None。"""
+    if condition == '等于':
+        return _equals_mask(series, value)
+    if condition == '不等于':
+        return ~_equals_mask(series, value)
+    if condition == '包含':
+        # 用户输入按字面匹配，不是正则（"a.b" 不该匹配 "axb"，"c(1" 不该报错）；
+        # 文本用显示文本（缺失值为空串），None/NaN 不会因 "nan"/"None" 被误匹配
+        return display_text(series).str.contains(str(value), case=False,
+                                                 regex=False, na=False)
+    if condition == '大于':
+        return pd.to_numeric(series, errors='coerce') > _to_float(value, condition)
+    if condition == '小于':
+        return pd.to_numeric(series, errors='coerce') < _to_float(value, condition)
+    if condition == '值在列表中':
+        # 按"显示文本"匹配，与列头筛选弹层里勾选的文本一致
+        # （10.0 显示为 10，空值显示为空串）
+        return display_text(series).isin(list(value))
+    if condition == '开头是':
+        return display_text(series).str.startswith(str(value), na=False)
+    if condition == '结尾是':
+        return display_text(series).str.endswith(str(value), na=False)
+    if condition == '为空':
+        return display_text(series).str.strip() == ''
+    if condition == '不为空':
+        return display_text(series).str.strip() != ''
+    return None
+
+
 def apply_filters(original_df: pd.DataFrame, active_filters: list):
     """从原始数据依次应用所有筛选条件。
 
@@ -96,48 +214,34 @@ def apply_filters(original_df: pd.DataFrame, active_filters: list):
     filtered_df 已 reset_index；idx 列表把筛选后行位置映射回原始索引，
     以便编辑时能同步更新 original_df。
 
-    无法应用的条件（如"大于 abc"）跳过并记入模块级 last_errors，
-    宿主可据此提示用户，而不是让筛选标签显示着却没生效。
+    所有条件先在原始列上算出掩码、按 AND 合并，最后只切片一次
+    （不再逐条件复制整表）。无法应用的条件（如"大于 abc"）跳过并记入
+    模块级 last_errors，宿主可据此提示用户，而不是让筛选标签显示着却没生效。
     """
-    filtered_df = original_df.copy()
     last_errors.clear()
+    mask = None
 
     for filter_info in active_filters:
         col = filter_info['col']
         condition = filter_info['condition']
         value = filter_info['value']
-        if col not in filtered_df.columns:
+        if col not in original_df.columns:
             continue
-        series = filtered_df[col]
+        series = original_df[col]
         try:
-            if condition == '等于':
-                filtered_df = filtered_df[_equals_mask(series, value)]
-            elif condition == '不等于':
-                filtered_df = filtered_df[~_equals_mask(series, value)]
-            elif condition == '包含':
-                # 用户输入按字面匹配，不是正则（"a.b" 不该匹配 "axb"，"c(1" 不该报错）
-                filtered_df = filtered_df[series.astype(str).str.contains(
-                    str(value), case=False, regex=False, na=False)]
-            elif condition == '大于':
-                filtered_df = filtered_df[pd.to_numeric(series, errors='coerce') > _to_float(value, condition)]
-            elif condition == '小于':
-                filtered_df = filtered_df[pd.to_numeric(series, errors='coerce') < _to_float(value, condition)]
-            elif condition == '值在列表中':
-                # 按"显示文本"匹配，与列头筛选弹层里勾选的文本一致
-                # （10.0 显示为 10，空值显示为空串）
-                filtered_df = filtered_df[display_text(series).isin(list(value))]
-            elif condition == '开头是':
-                filtered_df = filtered_df[series.astype(str).str.startswith(str(value), na=False)]
-            elif condition == '结尾是':
-                filtered_df = filtered_df[series.astype(str).str.endswith(str(value), na=False)]
-            elif condition == '为空':
-                filtered_df = filtered_df[series.isna() | (series.astype(str).str.strip() == '')]
-            elif condition == '不为空':
-                filtered_df = filtered_df[series.notna() & (series.astype(str).str.strip() != '')]
+            m = _condition_mask(series, condition, value)
         except Exception as e:
             last_errors.append((filter_info, str(e)))
             continue
+        if m is None:
+            continue
+        m = np.asarray(m, dtype=bool)
+        mask = m if mask is None else (mask & m)
 
+    if mask is None:
+        filtered_df = original_df.copy()
+    else:
+        filtered_df = original_df[mask]
     idx_map = list(filtered_df.index)
     return filtered_df.reset_index(drop=True), idx_map
 

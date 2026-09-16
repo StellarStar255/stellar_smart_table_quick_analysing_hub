@@ -26,15 +26,15 @@ Once installed, the app checks for new versions automatically. You can also upda
 
 ```bash
 # Pass a file path directly (positional argument)
-python smart_table_quick_analysing_hub_qt.py data.xlsx
-python smart_table_quick_analysing_hub_qt.py /path/to/file.csv
+python smart_table_quick_analysing_hub.py data.xlsx
+python smart_table_quick_analysing_hub.py /path/to/file.csv
 
 # Specify a file with -f or --file
-python smart_table_quick_analysing_hub_qt.py -f report.xlsx
-python smart_table_quick_analysing_hub_qt.py --file /path/to/data.xlsx
+python smart_table_quick_analysing_hub.py -f report.xlsx
+python smart_table_quick_analysing_hub.py --file /path/to/data.xlsx
 
 # Show help
-python smart_table_quick_analysing_hub_qt.py -h
+python smart_table_quick_analysing_hub.py -h
 
 ```
 
@@ -140,7 +140,7 @@ pip install -r requirements.txt
 ### 3. Run the app
 
 ```bash
-python smart_table_quick_analysing_hub_qt.py
+python smart_table_quick_analysing_hub.py
 ```
 
 ## System Requirements
@@ -319,15 +319,15 @@ Issues and Pull Requests are welcome!
 
 ```bash
 # 直接传入文件路径（位置参数）
-python smart_table_quick_analysing_hub_qt.py data.xlsx
-python smart_table_quick_analysing_hub_qt.py /path/to/file.csv
+python smart_table_quick_analysing_hub.py data.xlsx
+python smart_table_quick_analysing_hub.py /path/to/file.csv
 
 # 使用 -f 或 --file 参数指定文件
-python smart_table_quick_analysing_hub_qt.py -f report.xlsx
-python smart_table_quick_analysing_hub_qt.py --file /path/to/data.xlsx
+python smart_table_quick_analysing_hub.py -f report.xlsx
+python smart_table_quick_analysing_hub.py --file /path/to/data.xlsx
 
 # 查看帮助信息
-python smart_table_quick_analysing_hub_qt.py -h
+python smart_table_quick_analysing_hub.py -h
 
 ```
 
@@ -436,7 +436,7 @@ pip install -r requirements.txt
 ### 3. 运行程序
 
 ```bash
-python smart_table_quick_analysing_hub_qt.py
+python smart_table_quick_analysing_hub.py
 ```
 
 ## 系统要求

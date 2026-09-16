@@ -171,6 +171,7 @@ class _FakeThread:
 
     def wait(self, ms=None):
         self.waited = True
+        self.wait_ms = ms
         self.running = False
         return True
 
@@ -210,9 +211,19 @@ class TestDownloaderLifetime:
         mgr = self._manager()
         dl, chk = _FakeThread(), _FakeThread()
         mgr._downloader, mgr._checker = dl, chk
+        mgr._pending.append(dl)
         mgr.shutdown()
         assert dl.cancelled and dl.waited and chk.waited
         assert mgr._downloader is None and mgr._checker is None
+
+    def test_shutdown_waits_without_timeout(self):
+        """带超时的 wait 一超时，运行中的线程随窗口销毁就会 abort——必须等到底。"""
+        mgr = self._manager()
+        dl, chk = _FakeThread(), _FakeThread()
+        mgr._checker = chk
+        mgr._pending.append(dl)
+        mgr.shutdown()
+        assert dl.wait_ms is None and chk.wait_ms is None
 
 
 class TestCancelStopsRetries:
@@ -354,6 +365,7 @@ class TestCancelDetection:
 
         class FakeDownloader:
             def __init__(self, *a, **k):
+                self.dest = a[1] if len(a) > 1 else k.get("dest")
                 self.checksum_status = "ok"
                 self.cancelled = False
                 self._slots = {}
@@ -407,3 +419,70 @@ class TestCancelDetection:
         path, err, dl = mgr._download_once({}, self._asset(), 1)
         assert path is None and err is None
         assert mgr._user_cancelled is True and dl.cancelled
+
+
+    def test_download_dest_is_in_private_random_temp_dir(self, monkeypatch):
+        import tempfile
+        mgr = self._manager(monkeypatch, "done")
+        _, _, dl = mgr._download_once({}, self._asset(), 1)
+        tmp = tempfile.gettempdir()
+        assert os.path.basename(dl.dest) == "pkg.dmg"          # 包名保持原样
+        assert os.path.dirname(dl.dest) != tmp                 # 不再直接放在公共临时目录
+        assert os.path.dirname(dl.dest).startswith(tmp)
+        assert os.path.basename(os.path.dirname(dl.dest)).startswith(updater._TEMP_PREFIX)
+        os.rmdir(os.path.dirname(dl.dest))
+
+
+class TestCancelInterruptsRead:
+    def test_cancel_closes_in_flight_response(self, monkeypatch, tmp_path):
+        """取消时要关掉正在读的响应：卡在 read() 里的线程才能立刻醒来。"""
+        class Resp(_FakeResponse):
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        resp = Resp([b'x' * 50, b'y' * 50], 100)
+        monkeypatch.setattr(updater, "_urlopen", lambda req, timeout: resp)
+        d = updater.Downloader("http://x/pkg.dmg", str(tmp_path / "pkg.dmg"))
+        d.progress.connect(lambda got, total: d.cancel())
+        d.run()
+        assert resp.closed and d._resp is None
+
+
+class TestTempScriptPaths:
+    def test_linux_install_script_has_random_exclusive_name(self, monkeypatch):
+        import tempfile
+        popen = []
+        monkeypatch.setattr(updater.subprocess, "Popen", lambda args, **k: popen.append(args))
+        updater._install_linux("/tmp/pkgdir/pkg.deb")
+        script = popen[0][1]
+        try:
+            assert os.path.dirname(script) == tempfile.gettempdir()
+            name = os.path.basename(script)
+            assert name.startswith(updater._TEMP_PREFIX) and name.endswith(".sh")
+            assert name != "smart_table_hub_update.sh"
+            assert os.access(script, os.X_OK)
+            with open(script, encoding="utf-8") as fh:
+                assert "/tmp/pkgdir/pkg.deb" in fh.read()
+        finally:
+            os.unlink(script)
+
+    def test_two_scripts_get_different_names(self, monkeypatch):
+        popen = []
+        monkeypatch.setattr(updater.subprocess, "Popen", lambda args, **k: popen.append(args))
+        updater._install_linux("/tmp/a.deb")
+        updater._install_linux("/tmp/b.deb")
+        a, b = popen[0][1], popen[1][1]
+        try:
+            assert a != b
+        finally:
+            os.unlink(a)
+            os.unlink(b)
+
+
+class TestSharedConfigDir:
+    def test_updater_uses_shared_config_dir(self):
+        from qtui.paths import CONFIG_DIR
+        assert updater.CONFIG_DIR is CONFIG_DIR
+        assert CONFIG_DIR.endswith(".smart_table_hub")

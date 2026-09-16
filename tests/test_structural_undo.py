@@ -12,11 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import pytest
-from PyQt6.QtCore import QCoreApplication, Qt
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
 
 from qtui.pandas_model import PandasTableModel
 
-_app = QCoreApplication.instance() or QCoreApplication([])
+_app = QApplication.instance() or QApplication([])   # 须是 GUI 应用：同一进程里其他测试要建控件
 
 
 def make_model():
@@ -241,3 +242,33 @@ class TestReplaceAndAppendFromAnalysis:
         with pytest.raises(ValueError):
             m.append_columns([('Z', [1, 2])])
         assert list(m.df.columns) == ['X', 'Y', 'N']
+
+
+class TestAppendColumnsRecalc:
+    """追加列后要重建依赖并重算：被裁剪到表尾的区域 / 越界单格引用能读到新列。"""
+
+    def test_clipped_range_picks_up_new_column(self):
+        m = PandasTableModel(pd.DataFrame({'A': [0.0], 'B': [5.0]}))
+        m.setData(m.index(1, 0), '=SUM(B2:Z2)')
+        assert m.df.iat[0, 0] == 5.0
+        m.append_columns([('C', [10.0])])
+        assert m.df.iat[0, 0] == 15.0
+        assert m._dependents_of((0, 2)) == {(0, 0)}  # 新列已进入区域依赖
+        m.setData(m.index(1, 1), '20')               # 编辑区域内单元格触发重算
+        assert m.df.iat[0, 0] == 30.0
+        assert m.undo() and m.df.iat[0, 0] == 15.0
+        assert m.undo() and m.df.iat[0, 0] == 5.0    # 撤销追加列
+        assert list(m.df.columns) == ['A', 'B']
+
+    def test_out_of_range_cell_ref_resolves_after_append(self):
+        m = PandasTableModel(pd.DataFrame({'A': [0.0], 'B': [1.0]}))
+        m.setData(m.index(1, 0), '=C2*2')
+        stale = m.df.iat[0, 0]
+        m.append_columns([('C', [21.0])])
+        assert m.df.iat[0, 0] == 42.0 and m.df.iat[0, 0] != stale
+
+    def test_unrelated_formula_untouched(self):
+        m = PandasTableModel(pd.DataFrame({'A': [0.0], 'B': [1.0]}))
+        m.setData(m.index(1, 0), '=B2+1')
+        m.append_columns([('C', ['x'])])
+        assert m.df.iat[0, 0] == 2.0 and m.formulas == {(0, 0): '=B2+1'}

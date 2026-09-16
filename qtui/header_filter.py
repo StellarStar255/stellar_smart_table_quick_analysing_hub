@@ -9,7 +9,7 @@ ColumnFilterPopup  无边框弹层：升序/降序、搜索、带计数的值勾
 """
 
 from PyQt6.QtCore import Qt, QEvent, QEventLoop, QRect, QPoint
-from PyQt6.QtGui import QColor, QPainter, QPen, QPolygon
+from PyQt6.QtGui import QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
@@ -153,7 +153,7 @@ class ColumnFilterPopup(QDialog):
         self.value_list.setUniformItemSizes(True)
         layout.addWidget(self.value_list, 1)
         for text, count in self._values:
-            item = QListWidgetItem("{} ({})".format(text or BLANK_LABEL, count))
+            item = QListWidgetItem("{} ({})".format(text or tr(BLANK_LABEL), count))
             item.setData(Qt.ItemDataRole.UserRole, text)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked
@@ -201,7 +201,7 @@ class ColumnFilterPopup(QDialog):
         self.value_list.blockSignals(True)
         for i in range(self.value_list.count()):
             item = self.value_list.item(i)
-            value = item.data(Qt.ItemDataRole.UserRole) or BLANK_LABEL
+            value = item.data(Qt.ItemDataRole.UserRole) or tr(BLANK_LABEL)
             hit = needle in str(value).lower()
             item.setHidden(bool(needle) and not hit)
             if needle:

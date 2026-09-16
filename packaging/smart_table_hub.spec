@@ -35,6 +35,11 @@ a = Analysis(
     ] + (
         # 图片队列自动模式的全局 Cmd+V 监听（仅 macOS）
         ["Quartz"] if sys.platform == "darwin" else []
+    ) + (
+        # AI 生成代码的 API Key 存系统钥匙串；keyring 后端经 entry point 动态加载，静态分析扫不到
+        ["keyring.backends.macOS"] if sys.platform == "darwin"
+        else ["keyring.backends.Windows"] if sys.platform == "win32"
+        else ["keyring.backends.SecretService"]
     ),
     excludes=[
         # 只保留 PyQt6 一套 Qt 绑定（Anaconda 环境常同时装有 PyQt5）
