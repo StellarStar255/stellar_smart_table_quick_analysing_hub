@@ -119,36 +119,50 @@ class TestRangeIndexCorrectness:
 
 
 class TestPerformanceGuard:
-    """性能护栏：整列 2000 个区域公式，改一格 / 增删一行都应远低于 1 秒。"""
+    """性能护栏：整列 2000 个区域公式，改一格 / 增删一行 / 清整列。
+
+    以"建模型（含整表求值一次）"的耗时为基准做相对比较，而不是写死秒数：
+    CI runner 比本机慢一倍以上，绝对阈值在慢机器上会误报（v1.12.0 CI）。
+    旧实现改一格要 10 倍于求值本身的时间，相对倍数足以抓住这类回归。
+    """
 
     N = 2000
+    BUILD_CEILING = 5.0     # 整表求值本身若慢到这个地步，也是回归
+
+    def _build(self):
+        t = time.perf_counter()
+        m = range_model(self.N)
+        baseline = time.perf_counter() - t
+        assert baseline < self.BUILD_CEILING, f"build+evaluate took {baseline:.2f}s"
+        # 极快机器上基准可能小到被计时噪声淹没，给个下限
+        return m, max(baseline, 0.05)
 
     def test_edit_one_range_cell_is_fast(self):
-        m = range_model(self.N)
+        m, baseline = self._build()
         t = time.perf_counter()
         m.setData(m.index(6, 1), "5")
         elapsed = time.perf_counter() - t
         assert m.df.iat[0, 2] == 0 + self.N + 4
-        assert elapsed < 1.0, f"edit one B cell took {elapsed:.2f}s"
+        assert elapsed < 4 * baseline, f"edit one B cell took {elapsed:.2f}s (baseline {baseline:.2f}s)"
 
     def test_insert_and_remove_row_are_fast(self):
-        m = range_model(self.N)
+        m, baseline = self._build()
         t = time.perf_counter()
         m.insert_row(self.N // 2)
         m.remove_rows([self.N // 2])
         elapsed = time.perf_counter() - t
         assert m.formulas[(0, 2)] == f"=A2*2+SUM(B$2:B${self.N + 1})"
         assert m.df.iat[0, 2] == self.N
-        assert elapsed < 2.0, f"insert+remove row took {elapsed:.2f}s"
+        assert elapsed < 8 * baseline, f"insert+remove row took {elapsed:.2f}s (baseline {baseline:.2f}s)"
 
     def test_clear_column_is_fast(self):
-        m = range_model(self.N)
+        m, baseline = self._build()
         t = time.perf_counter()
         cleared = m.clear_cells([(r, 1) for r in range(self.N)])
         elapsed = time.perf_counter() - t
         assert cleared == self.N
         assert m.df.iat[3, 2] == 6.0                 # SUM 空列 = 0
-        assert elapsed < 1.0, f"clear column took {elapsed:.2f}s"
+        assert elapsed < 4 * baseline, f"clear column took {elapsed:.2f}s (baseline {baseline:.2f}s)"
 
 
 class TestStructuralRecalcOnlyChanged:

@@ -293,3 +293,72 @@ class TestEditingGuards:
         assert win.model.df["B"].tolist() == before
         win.table.select_whole_rows()
         assert sel_rect(win) == (1, 1, 3, 1)
+
+
+class TestSheetTabBar:
+    """底部 Excel 式 Sheet 标签栏。"""
+
+    def test_placeholder_tab_for_single_table(self, win):
+        assert win.sheet_names == []
+        assert [win.sheet_tabs.tabText(i) for i in range(win.sheet_tabs.count())] == ["Sheet1"]
+
+    def test_tabs_follow_sheet_names_and_click_switches(self, win):
+        win.add_sheet_from_df(pd.DataFrame({"k": [1]}), "S2")
+        win.add_sheet_from_df(pd.DataFrame({"k": [2]}), "S3")
+        assert [win.sheet_tabs.tabText(i) for i in range(win.sheet_tabs.count())] == ["Sheet1", "S2", "S3"]
+        assert win.sheet_tabs.currentIndex() == 0
+        win.sheet_tabs.setCurrentIndex(2)
+        assert win.current_sheet == "S3"
+        assert win.model.df["k"].tolist() == [2]
+        win.switch_sheet_relative(1)
+        assert win.current_sheet == "Sheet1" and win.sheet_tabs.currentIndex() == 0
+
+    def test_rename_current_sheet(self, win, monkeypatch):
+        from PyQt6.QtWidgets import QInputDialog
+        win.add_sheet_from_df(pd.DataFrame({"k": [1]}), "S2")
+        monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("主表", True)))
+        win.rename_sheet("Sheet1")
+        assert win.sheet_names == ["主表", "S2"]
+        assert win.current_sheet == "主表"
+        assert "主表" in win._pinned_sheets and "Sheet1" not in win._pinned_sheets
+        assert win.sheet_tabs.tabText(0) == "主表"
+        assert win.model.modified
+
+    def test_rename_other_sheet_moves_cached_state(self, win, monkeypatch):
+        from PyQt6.QtWidgets import QInputDialog
+        win.add_sheet_from_df(pd.DataFrame({"k": [7]}), "S2")
+        monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("S9", True)))
+        win.rename_sheet("S2")
+        assert win.sheet_names == ["Sheet1", "S9"]
+        assert "S2" not in win._sheet_cache and win._sheet_cache["S9"]["k"].tolist() == [7]
+        win.switch_sheet("S9")
+        assert win.model.df["k"].tolist() == [7]
+
+    def test_rename_rejects_duplicate_and_invalid(self, win, monkeypatch):
+        from PyQt6.QtWidgets import QInputDialog, QMessageBox
+        win.add_sheet_from_df(pd.DataFrame({"k": [1]}), "S2")
+        warned = []
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: warned.append(a)))
+        for bad in ("s2", "a/b", ""):
+            monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, _b=bad, **k: (_b, True)))
+            win.rename_sheet("Sheet1")
+        assert win.sheet_names == ["Sheet1", "S2"]
+        assert len(warned) == 2    # 空名直接忽略，不弹窗
+
+    def test_drag_reorder_updates_sheet_names(self, win):
+        win.add_sheet_from_df(pd.DataFrame({"k": [1]}), "S2")
+        win.add_sheet_from_df(pd.DataFrame({"k": [2]}), "S3")
+        win.model.modified = False
+        win.sheet_tabs.moveTab(2, 0)
+        assert win.sheet_names == ["S3", "Sheet1", "S2"]
+        assert win.current_sheet == "Sheet1"
+        assert win.model.modified
+
+    def test_delete_single_sheet_via_tab(self, win, monkeypatch):
+        from PyQt6.QtWidgets import QMessageBox
+        win.add_sheet_from_df(pd.DataFrame({"k": [1]}), "S2")
+        monkeypatch.setattr(QMessageBox, "question",
+                            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+        win.delete_sheet("S2")
+        assert win.sheet_names == ["Sheet1"]
+        assert [win.sheet_tabs.tabText(i) for i in range(win.sheet_tabs.count())] == ["Sheet1"]

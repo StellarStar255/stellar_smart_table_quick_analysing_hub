@@ -28,7 +28,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QTableView, QVBoxLayout, QHBoxLayout, QWidget, QLabel,
-    QComboBox, QToolBar, QPushButton, QMessageBox, QFileDialog,
+    QTabBar, QToolBar, QPushButton, QMessageBox, QFileDialog,
     QInputDialog, QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate,
     QStyle, QMenu, QCheckBox, QDialog,
     QDialogButtonBox, QListWidget, QListWidgetItem, QPlainTextEdit,
@@ -1334,17 +1334,6 @@ class MainWindow(QMainWindow):
             ("统计", self.show_statistics)))
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" Sheet: "))
-        self.sheet_combo = QComboBox()
-        self.sheet_combo.setMinimumWidth(150)
-        self.sheet_combo.currentTextChanged.connect(self._on_sheet_combo_changed)
-        tb.addWidget(self.sheet_combo)
-        add_sheet_btn = QPushButton("+")
-        add_sheet_btn.setFixedWidth(28)
-        add_sheet_btn.clicked.connect(self.create_new_sheet)
-        tb.addWidget(add_sheet_btn)
-        tb.addSeparator()
-
         self.copy_headers_cb = QCheckBox(tr("复制列名"))
         self.copy_headers_cb.setToolTip(tr(
             "复制时在第一行附带列名，方便粘贴到 Excel 等外部软件。\n"
@@ -1381,7 +1370,40 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self.filter_bar)
         layout.addWidget(self.table, 1)
+        layout.addWidget(self._build_sheet_bar())
         self.setCentralWidget(central)
+
+    def _build_sheet_bar(self):
+        """表格底部的 Excel 式 Sheet 标签栏：点击切换、双击重命名、拖拽排序、右键菜单。"""
+        bar = QWidget()
+        bar.setObjectName("sheet_bar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(2)
+        self.sheet_tabs = QTabBar()
+        self.sheet_tabs.setShape(QTabBar.Shape.RoundedSouth)
+        self.sheet_tabs.setDocumentMode(True)
+        self.sheet_tabs.setExpanding(False)
+        self.sheet_tabs.setMovable(True)
+        self.sheet_tabs.setUsesScrollButtons(True)
+        self.sheet_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.sheet_tabs.setDrawBase(False)
+        self.sheet_tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sheet_tabs.currentChanged.connect(self._on_sheet_tab_changed)
+        self.sheet_tabs.tabBarDoubleClicked.connect(self._on_sheet_tab_double_clicked)
+        self.sheet_tabs.tabMoved.connect(self._on_sheet_tab_moved)
+        self.sheet_tabs.customContextMenuRequested.connect(self._on_sheet_tab_menu)
+        lay.addWidget(self.sheet_tabs)
+        add_btn = QPushButton("+")
+        add_btn.setFlat(True)
+        add_btn.setFixedSize(24, 22)
+        add_btn.setToolTip(tr("新建Sheet"))
+        add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        add_btn.clicked.connect(self.create_new_sheet)
+        lay.addWidget(add_btn)
+        lay.addStretch(1)
+        return bar
 
     def _build_docks(self):
         # 单元格内容预览（可编辑，方便查看/修改长文本）
@@ -1509,7 +1531,7 @@ class MainWindow(QMainWindow):
             i += 1
         self.sheet_names.append(name)
         self._cache_sheet(name, df.reset_index(drop=True), pin=True)
-        self._refresh_sheet_combo()
+        self._refresh_sheet_tabs()
         self._mark_modified()
         self.update_statusbar(tr("已添加 Sheet: {}（保存文件后写入文件）").format(name))
 
@@ -1595,7 +1617,7 @@ class MainWindow(QMainWindow):
         self.model.set_dataframe(df)
         self.model.modified = False
         self.image_dock.hide()
-        self._refresh_sheet_combo()
+        self._refresh_sheet_tabs()
         self._update_title()
         self.update_statusbar(tr("新建空白表格"))
 
@@ -1688,7 +1710,7 @@ class MainWindow(QMainWindow):
             self.model.set_dataframe(df, formulas=formulas, from_file=not marker)
             self.model.modified = False
             self._refresh_image_dock()
-            self._refresh_sheet_combo()
+            self._refresh_sheet_tabs()
             self._update_title()
             self.recent_files = file_io.add_recent_file(self.recent_files, path)
             self._save_recent()
@@ -1914,7 +1936,7 @@ class MainWindow(QMainWindow):
                     self._coord_marker_cache.pop(path, None)
                     if self.current_sheet not in self.sheet_names:
                         self.current_sheet = self.sheet_names[0]
-                    self._refresh_sheet_combo()
+                    self._refresh_sheet_tabs()
                     # 全部 sheet 已落盘，可以重新参与缓存淘汰
                     self._pinned_sheets.clear()
                 self.model.modified = False
@@ -2060,14 +2082,121 @@ class MainWindow(QMainWindow):
 
     # ================= Sheet 管理 =================
 
-    def _refresh_sheet_combo(self):
-        self.sheet_combo.blockSignals(True)
-        self.sheet_combo.clear()
-        self.sheet_combo.addItems(self.sheet_names)
-        if self.current_sheet:
-            self.sheet_combo.setCurrentText(self.current_sheet)
-        self.sheet_combo.setEnabled(bool(self.sheet_names))
-        self.sheet_combo.blockSignals(False)
+    def _refresh_sheet_tabs(self):
+        """让底部标签栏与 sheet_names / current_sheet 保持一致。
+        单表（CSV/空白）时也显示一个 Sheet1 标签，和 Excel 的观感一致。"""
+        tabs = self.sheet_tabs
+        names = self.sheet_names or ["Sheet1"]
+        tabs.blockSignals(True)
+        while tabs.count() > len(names):
+            tabs.removeTab(tabs.count() - 1)
+        for i, name in enumerate(names):
+            if i < tabs.count():
+                if tabs.tabText(i) != name:
+                    tabs.setTabText(i, name)
+            else:
+                tabs.addTab(name)
+            tabs.setTabToolTip(i, name)
+        current = self.current_sheet if self.sheet_names else names[0]
+        if current in names:
+            tabs.setCurrentIndex(names.index(current))
+        tabs.blockSignals(False)
+
+    def _sheet_name_at_tab(self, index):
+        if index < 0 or index >= self.sheet_tabs.count():
+            return None
+        return self.sheet_tabs.tabText(index)
+
+    def _ensure_named_sheets(self):
+        """单表模式（CSV/空白）没有 sheet_names；需要按名操作时把当前表登记为 Sheet1。"""
+        if not self.sheet_names:
+            self.sheet_names = ["Sheet1"]
+            self.current_sheet = "Sheet1"
+            self._cache_sheet("Sheet1", self.model.df, pin=True)
+
+    def _on_sheet_tab_changed(self, index):
+        name = self._sheet_name_at_tab(index)
+        if not name or not self.sheet_names or name == self.current_sheet:
+            return
+        self.switch_sheet(name)
+
+    def _on_sheet_tab_double_clicked(self, index):
+        name = self._sheet_name_at_tab(index)
+        if name:
+            self.rename_sheet(name)
+
+    def _on_sheet_tab_moved(self, _from, _to):
+        """拖拽标签排序：以标签栏的顺序为准重排 sheet_names（保存时按此顺序写入）。"""
+        if not self.sheet_names:
+            return
+        new_order = [self.sheet_tabs.tabText(i) for i in range(self.sheet_tabs.count())]
+        if sorted(new_order) != sorted(self.sheet_names) or new_order == self.sheet_names:
+            return
+        self.sheet_names = new_order
+        self._mark_modified()
+        self.update_statusbar(tr("已调整 Sheet 顺序（保存文件后生效）"))
+
+    def _on_sheet_tab_menu(self, pos):
+        index = self.sheet_tabs.tabAt(pos)
+        name = self._sheet_name_at_tab(index)
+        menu = QMenu(self)
+        menu.addAction(tr("新建Sheet..."), self.create_new_sheet)
+        if name:
+            menu.addAction(tr("重命名..."), lambda: self.rename_sheet(name))
+            act = menu.addAction(tr("删除"), lambda: self.delete_sheet(name))
+            act.setEnabled(len(self.sheet_names) > 1)
+        menu.exec(self.sheet_tabs.mapToGlobal(pos))
+
+    def rename_sheet(self, old):
+        """重命名 sheet：内存里所有按名索引的状态一起改名；
+        原文件里的 sheet 先读进内存钉住，保存时才能按新名写出。"""
+        if self.sheet_names and old not in self.sheet_names:
+            return
+        new, ok = QInputDialog.getText(self, tr("重命名Sheet"), tr("新名称:"), text=old)
+        if not ok:
+            return
+        new = new.strip()
+        if not new or new == old:
+            return
+        others = [n for n in self.sheet_names if n != old]
+        err = file_io.check_sheet_name(new, others)
+        if err:
+            QMessageBox.warning(self, tr("重命名Sheet"), err)
+            return
+        self._ensure_named_sheets()
+        if old != self.current_sheet and old not in self._sheet_cache:
+            excel_file = self._excel_file
+            if excel_file is None:
+                return
+            ok, loaded = self._run_blocking(
+                tr("重命名Sheet"), tr("正在读取 {} ...").format(old),
+                lambda: file_io.read_sheet(excel_file, old))
+            if not ok:
+                self._show_error(tr("重命名Sheet"), tr("读取 sheet 失败: {}").format(old), loaded)
+                return
+            self._sheet_cache[old] = loaded
+        if old != self.current_sheet:
+            # 公式/背景色底账也要一起带走，否则按新名保存时只剩静态值
+            if old not in self._sheet_formulas or old not in self._sheet_colors:
+                bundle = self._load_sheet_bundle(
+                    old, self._sheet_formulas.get(old), self._sheet_colors.get(old))
+                if bundle is None:
+                    return
+                _df, formulas, colors = bundle
+                self._sheet_formulas.setdefault(old, dict(formulas or {}))
+                self._sheet_colors.setdefault(old, dict(colors or {}))
+        self.sheet_names = [new if n == old else n for n in self.sheet_names]
+        if self.current_sheet == old:
+            self.current_sheet = new
+        for store in (self._sheet_cache, self.sheet_filters,
+                      self._sheet_formulas, self._sheet_colors):
+            if old in store:
+                store[new] = store.pop(old)
+        self._pinned_sheets.discard(old)
+        self._pinned_sheets.add(new)   # 新名不在原文件里，必须整体写出
+        self._refresh_sheet_tabs()
+        self._mark_modified()
+        self.update_statusbar(tr("已重命名 Sheet: {} → {}（保存文件后生效）").format(old, new))
 
     def _cache_sheet(self, name, df, pin=False):
         """缓存 sheet 数据。pin=True 表示该 sheet 只存在于内存（新建/已修改），
@@ -2085,11 +2214,6 @@ class MainWindow(QMainWindow):
             if old in self._pinned_sheets or old not in on_disk:
                 continue   # 只能淘汰"未修改且可从文件重读"的 sheet
             del self._sheet_cache[old]
-
-    def _on_sheet_combo_changed(self, name):
-        if not name or name == self.current_sheet:
-            return
-        self.switch_sheet(name)
 
     def _run_blocking(self, title, message, func):
         """后台线程跑 func，模态进度框等待；返回 (ok, 结果或 traceback 文本)。"""
@@ -2173,7 +2297,7 @@ class MainWindow(QMainWindow):
         bundle = self._load_sheet_bundle(
             name, self._sheet_formulas.get(name), self._sheet_colors.get(name))
         if bundle is None:
-            self._refresh_sheet_combo()   # 下拉框回到实际停留的 sheet
+            self._refresh_sheet_tabs()   # 标签栏回到实际停留的 sheet
             return
         df, formulas, colors = bundle
         formulas = formulas or None
@@ -2202,7 +2326,7 @@ class MainWindow(QMainWindow):
                 from_file=bool(self.current_file)
                 and not self._file_has_coord_marker(self.current_file))
             self.model.cell_colors = dict(colors)
-        self._refresh_sheet_combo()
+        self._refresh_sheet_tabs()
         self._rebuild_filter_bar()
         self._refresh_image_dock()
         self._save_file_config()   # 记住最后停留的 sheet
@@ -2254,7 +2378,7 @@ class MainWindow(QMainWindow):
         self.sheet_names.append(name)
         self._cache_sheet(name, self.model.df.copy(), pin=True)
         self._mark_modified()
-        self._refresh_sheet_combo()
+        self._refresh_sheet_tabs()
         self.update_statusbar(tr("已添加 Sheet: {}（保存文件后生效）").format(name))
 
     def delete_sheets(self):
@@ -2283,6 +2407,24 @@ class MainWindow(QMainWindow):
                      if lst.item(i).checkState() == Qt.CheckState.Checked]
         if not to_delete:
             return
+        self._delete_sheet_names(to_delete)
+
+    def delete_sheet(self, name):
+        """标签右键「删除」：删除单个 sheet，先确认。"""
+        if name not in self.sheet_names:
+            return
+        if len(self.sheet_names) <= 1:
+            QMessageBox.warning(self, tr("删除Sheet"), tr("至少需要保留一个 Sheet"))
+            return
+        ret = QMessageBox.question(
+            self, tr("删除Sheet"), tr("确定删除 Sheet「{}」？此操作可在保存前通过关闭文件放弃。").format(name),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self._delete_sheet_names([name])
+
+    def _delete_sheet_names(self, to_delete):
         if len(to_delete) >= len(self.sheet_names):
             QMessageBox.warning(self, tr("删除Sheet"), tr("不能删除所有 Sheet"))
             return
@@ -2311,7 +2453,7 @@ class MainWindow(QMainWindow):
         if self.current_sheet in to_delete:
             self.switch_sheet(self.sheet_names[0])
         else:
-            self._refresh_sheet_combo()
+            self._refresh_sheet_tabs()
         self._mark_modified()
         self.update_statusbar(tr("已删除 {} 个 Sheet（保存文件后生效）").format(len(to_delete)))
 
@@ -2484,7 +2626,7 @@ class MainWindow(QMainWindow):
         if len(names) < 2 or self.current_sheet not in names:
             return
         target = names[(names.index(self.current_sheet) + delta) % len(names)]
-        self.sheet_combo.setCurrentText(target)
+        self.switch_sheet(target)
 
     def insert_by_selection(self):
         """Ctrl+Shift+=：整列选区插入同样多的列，否则插入同样多的行（Excel 语义）。"""
