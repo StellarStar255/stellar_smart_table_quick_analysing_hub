@@ -1771,6 +1771,10 @@ class MainWindow(QMainWindow):
             self._save_recent()
             self._rebuild_recent_menu()
             self.update_statusbar(tr("已打开 {}：{} 行 × {} 列").format(os.path.basename(path), len(df), len(df.columns)))
+            # 恢复上次的筛选（视图状态，不算修改文档）
+            self._restore_saved_filters()
+            self.model.modified = False
+            self._update_title()
             # 整文件原样载入（无表头）的文件：提示是否提升表头，由用户决定
             self._offer_header_promotion()
 
@@ -2363,9 +2367,11 @@ class MainWindow(QMainWindow):
 
         # 恢复该 sheet 的筛选
         saved = self.sheet_filters.get(name)
-        if saved and saved["filters"]:
+        saved_filters = (self._prune_missing_filter_columns(saved["filters"], df)[0]
+                         if saved and saved.get("filters") else [])
+        if saved_filters:
             self.original_df = df
-            self.active_filters = list(saved["filters"])
+            self.active_filters = list(saved_filters)
             # 公式保持挂起（original_df 坐标），清除筛选时恢复
             self._suspended_formulas = dict(formulas) if formulas else None
             filtered, idx_map = filter_engine.apply_filters(df, self.active_filters)
@@ -2920,6 +2926,7 @@ class MainWindow(QMainWindow):
                 if f["col"] == old:
                     f["col"] = new
             self._rebuild_filter_bar()
+            self._save_file_config()   # 记忆的筛选条件跟着改列名
         if old in self.image_columns:
             self.image_columns.discard(old)
             self.image_columns.add(new)
@@ -3134,6 +3141,7 @@ class MainWindow(QMainWindow):
         if frozen_view:
             message += tr("；筛选中输入的 {} 个公式已转为静态值").format(frozen_view)
         self.update_statusbar(message)
+        self._save_file_config()   # 筛选条件随文件记忆，下次打开自动恢复
 
     def remove_filter(self, index):
         if 0 <= index < len(self.active_filters):
@@ -3156,6 +3164,7 @@ class MainWindow(QMainWindow):
         restored = len(self._suspended_formulas) if self._suspended_formulas else 0
         self._reset_filter_state()
         self._refresh_image_dock()
+        self._save_file_config()   # 清掉记忆的筛选，下次打开不再恢复
         parts = []
         if restored:
             parts.append(tr("已恢复 {} 个公式").format(restored))
@@ -3751,6 +3760,65 @@ class MainWindow(QMainWindow):
         entry = _file_config_entry(self.current_file)
         self.image_columns = set(entry.get("image_columns", []))
 
+    # 筛选条件随文件记忆：按 sheet 存（CSV 等单表文件用空串作键）。
+    # 只是视图状态，写在侧车配置里，不改动文件内容
+    _SINGLE_SHEET_KEY = ""
+
+    def _filters_snapshot(self):
+        """各 sheet 当前的筛选条件 {sheet 名: [条件, ...]}，没有筛选的 sheet 不写。"""
+        snap = {}
+        for name, saved in self.sheet_filters.items():
+            if name != self.current_sheet and saved.get("filters"):
+                snap[name] = [dict(f) for f in saved["filters"]]
+        if self.active_filters:
+            key = self.current_sheet or self._SINGLE_SHEET_KEY
+            snap[key] = [dict(f) for f in self.active_filters]
+        return snap
+
+    @staticmethod
+    def _valid_saved_filters(filters):
+        """配置文件里读出的条件做一遍结构校验，坏条目直接丢掉（配置可能被手改或来自旧版）。"""
+        allowed = set(filter_engine.CONDITIONS) | {"值在列表中"}
+        out = []
+        for f in filters if isinstance(filters, list) else []:
+            if (isinstance(f, dict) and isinstance(f.get("col"), str)
+                    and f.get("condition") in allowed and "value" in f):
+                out.append(dict(f))
+        return out
+
+    def _prune_missing_filter_columns(self, filters, df):
+        """去掉引用了已不存在列的条件（文件被外部改过列名/删过列），返回 (保留, 丢弃数)。"""
+        cols = {str(c) for c in df.columns}
+        kept = [f for f in filters if f["col"] in cols]
+        return kept, len(filters) - len(kept)
+
+    def _restore_saved_filters(self):
+        """打开文件后恢复上次的筛选：当前 sheet 立即应用，其余 sheet 切过去时应用。"""
+        saved = _file_config_entry(self.current_file).get("filters")
+        if not isinstance(saved, dict):
+            return
+        current_key = self.current_sheet or self._SINGLE_SHEET_KEY
+        for name, filters in saved.items():
+            filters = self._valid_saved_filters(filters)
+            if not filters or name == current_key:
+                continue
+            if name in self.sheet_names:
+                self.sheet_filters[name] = {"filters": filters, "original_df": None}
+        filters = self._valid_saved_filters(saved.get(current_key))
+        if not filters:
+            return
+        filters, dropped = self._prune_missing_filter_columns(filters, self.model.df)
+        if not filters:
+            self._save_file_config()   # 条件全部失效：顺手把配置里的旧条件清掉
+            return
+        self.active_filters = filters
+        self._reapply_filters()
+        message = tr("已恢复上次的 {} 个筛选条件，筛选后 {} 行").format(
+            len(filters), len(self.model.df))
+        if dropped:
+            message += tr("；{} 个条件引用的列已不存在，已忽略").format(dropped)
+        self.update_statusbar(message)
+
     def _save_file_config(self):
         import json
         if not self.current_file:
@@ -3762,7 +3830,8 @@ class MainWindow(QMainWindow):
                     cfg = json.load(f)
             cfg[os.path.abspath(self.current_file)] = {
                 "image_columns": sorted(self.image_columns),
-                "last_sheet": self.current_sheet}
+                "last_sheet": self.current_sheet,
+                "filters": self._filters_snapshot()}
             os.makedirs(os.path.dirname(FILE_CONFIG_PATH), exist_ok=True)
             with open(FILE_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)

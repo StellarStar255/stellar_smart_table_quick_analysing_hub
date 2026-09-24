@@ -40,3 +40,12 @@ def isolated_analysis_files(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(python_analysis, "PRESETS_FILE", str(d / "presets.json"))
     monkeypatch.setattr(python_analysis, "LAST_CODE_FILE", str(d / "last_code.py"))
     monkeypatch.setattr(python_analysis, "HISTORY_FILE", str(d / "history.json"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_file_config(tmp_path_factory, monkeypatch):
+    """每个文件的侧车配置（图片列、最后的 sheet、筛选条件）指到临时文件，
+    测试打开/筛选临时文件时不写进用户真实的 ~/.smart_table_hub。"""
+    from qtui import main_window
+    cfg = tmp_path_factory.mktemp("filecfg") / "qt_file_config.json"
+    monkeypatch.setattr(main_window, "FILE_CONFIG_PATH", str(cfg))

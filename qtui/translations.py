@@ -599,4 +599,7 @@ TRANSLATIONS = {
     '上一步': 'Back',
     '第 {} / {} 步': 'Step {} of {}',
     '退出教程': 'Exit tutorial',
+    # 筛选记忆
+    '已恢复上次的 {} 个筛选条件，筛选后 {} 行': 'Restored {} filter(s) from last time; {} row(s) shown',
+    '；{} 个条件引用的列已不存在，已忽略': '; {} condition(s) referenced columns that no longer exist and were ignored',
 }
