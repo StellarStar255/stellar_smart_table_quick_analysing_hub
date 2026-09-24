@@ -135,7 +135,8 @@ def _isna_scalar(v):
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
 from .header_filter import (ColumnFilterPopup, FilterHeaderView, arrow_rect_in,
-                            paint_arrow, MIN_SECTION_FOR_ARROW)
+                            paint_arrow, MIN_SECTION_FOR_ARROW,
+                            ACCENT as FILTER_ACCENT)
 from .find_dialog import FindReplaceDialog
 from .sort_dialog import SortDialog
 from .image_panel import ImagePreviewPanel
@@ -773,6 +774,15 @@ class _ExcelTableView(QTableView):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        header = self.horizontalHeader()
+        gap = getattr(header, "drop_gap", None)
+        if gap is not None:
+            # 拖动列头移动列：目标位置画一条贯穿表格的竖线
+            painter = QPainter(self.viewport())
+            painter.fillRect(QRect(header.gap_x(gap) - 1, 0, 3,
+                                   self.viewport().height()),
+                             QColor(FILTER_ACCENT))
+            painter.end()
         handle = self._fill_handle_rect()
         if handle is None:
             return
@@ -1057,6 +1067,7 @@ class MainWindow(QMainWindow):
         self.filter_header = FilterHeaderView(self.table)
         self.table.setHorizontalHeader(self.filter_header)
         self.table.filterArrowClicked.connect(self.open_column_filter)
+        self.filter_header.columnsMoveRequested.connect(self.move_columns)
         self.table.horizontalHeader().setDefaultSectionSize(140)
         # 列头单击仅选中整列，不触发排序——大表排序开销大且易误触，
         # 排序走工具栏/菜单/右键三个显式入口
@@ -3888,6 +3899,36 @@ class MainWindow(QMainWindow):
         self._sync_original_columns(insert_pos=pos,
                                     name=self.model.df.columns[pos])
         self._after_structure_change()
+
+    def move_columns(self, cols, gap):
+        """拖动列头：把 cols 整体移到间隙 gap（原第 gap 列之前）。
+
+        列宽跟着列走；筛选中同步 original_df 与原坐标底账（筛选条件按列名记，不受影响）。
+        """
+        header = self.table.horizontalHeader()
+        widths = [header.sectionSize(i) for i in range(header.count())]
+        order = self.model.move_columns(cols, gap)
+        if order is None:
+            return
+        new_pos = {old: new for new, old in enumerate(order)}
+        if self.original_df is not None:
+            self.original_df = self.original_df.iloc[:, order]
+            self._remap_original_ledgers(col_map=lambda c: new_pos.get(c, c))
+        for new, old in enumerate(order):
+            if old < len(widths):
+                header.resizeSection(new, widths[old])
+        self._rebuild_filter_bar()     # 漏斗标记跟着列位置变
+        self._after_structure_change()
+        # 选中移动后的列，方便连续拖动
+        first, last = new_pos[min(cols)], new_pos[max(cols)]
+        m = self.model
+        self.table.selectionModel().select(
+            QItemSelection(m.index(0, first), m.index(m.rowCount() - 1, last)),
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Columns)
+        self.table.selectionModel().setCurrentIndex(
+            m.index(0, first), QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.update_statusbar(tr("已移动 {} 列").format(len(cols)))
 
     def _show_col_menu(self, pos):
         col = self.table.horizontalHeader().logicalIndexAt(pos)

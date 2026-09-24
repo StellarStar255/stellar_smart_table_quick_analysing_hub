@@ -4,12 +4,15 @@ Excel 式列筛选：列头下拉箭头 + 值勾选弹层。
 
 FilterHeaderView   字母表头，记录哪些列已筛选；箭头画在第 1 行（列名行）
                    单元格右侧（已筛选画成实心漏斗），由表格视图绘制/响应点击。
+                   选中整列后按住字母列头拖动可移动列（Excel 式）。
 ColumnFilterPopup  无边框弹层：升序/降序、搜索、带计数的值勾选列表、
                    全选/反选、清除筛选。结果放在 result / sort_ascending。
 """
 
-from PyQt6.QtCore import Qt, QEvent, QEventLoop, QRect, QPoint
-from PyQt6.QtGui import QPainter, QPen, QPolygon
+from PyQt6.QtCore import (
+    Qt, QEvent, QEventLoop, QModelIndex, QPoint, QRect, QTimer, pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QPainter, QPen, QPolygon
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
@@ -22,6 +25,8 @@ MIN_SECTION_FOR_ARROW = 28
 ACCENT = "#4a9edb"
 MAX_VALUES = 2000       # 弹层里最多列出的去重值个数
 BLANK_LABEL = "(空白)"   # 空值在列表里的显示名，内部值是空串
+RESIZE_MARGIN = 4       # 离列边界这么近算拖列宽，不算拖列
+AUTOSCROLL_MARGIN = 24  # 拖列时鼠标离表头左右边缘这么近就自动滚动
 
 
 def arrow_rect_in(rect):
@@ -70,10 +75,23 @@ class FilterHeaderView(QHeaderView):
     由表格视图绘制与响应点击——箭头挨着列名比挂在字母行上更自然。
     """
 
+    # 拖动列头移动列：(被移动的列号列表, 目标间隙)。间隙 g 指原第 g 列之前，
+    # g == 列数表示移到最后
+    columnsMoveRequested = pyqtSignal(list, int)
+
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._filtered_cols = set()
         self.setSectionsClickable(True)
+        # 拖列状态：按下已选中列时记录，移动超过阈值才算开始拖
+        self._drag_cols = None
+        self._press_pos = None
+        self._dragging = False
+        self._drop_gap = None
+        self._last_x = 0
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(40)
+        self._scroll_timer.timeout.connect(self._auto_scroll)
 
     @property
     def filtered_columns(self):
@@ -87,6 +105,156 @@ class FilterHeaderView(QHeaderView):
             view = self.parentWidget()
             if view is not None and hasattr(view, "viewport"):
                 view.viewport().update()
+
+    # ---------- 拖动列头移动列 ----------
+
+    @property
+    def drop_gap(self):
+        """拖列中的目标间隙（供表格视图画插入线）；未在拖动时为 None。"""
+        return self._drop_gap if self._dragging else None
+
+    def gap_x(self, gap):
+        """间隙 gap 的视口 x 坐标。"""
+        count = self.count()
+        if count == 0:
+            return 0
+        if gap < count:
+            return self.sectionViewportPosition(gap)
+        last = count - 1
+        return self.sectionViewportPosition(last) + self.sectionSize(last)
+
+    def _selection_model(self):
+        view = self.parentWidget()
+        sm = view.selectionModel() if hasattr(view, "selectionModel") else None
+        return sm if sm is not None and self.model() is not None else None
+
+    def _selected_block(self, col):
+        """col 若是整列选中，返回它所在的连续整列选中块；否则 None。"""
+        sm = self._selection_model()
+        if sm is None or not sm.isColumnSelected(col, QModelIndex()):
+            return None
+        lo = hi = col
+        while lo > 0 and sm.isColumnSelected(lo - 1, QModelIndex()):
+            lo -= 1
+        while hi < self.count() - 1 and sm.isColumnSelected(hi + 1, QModelIndex()):
+            hi += 1
+        return list(range(lo, hi + 1))
+
+    def _near_resize_handle(self, x, col):
+        left = self.sectionViewportPosition(col)
+        right = left + self.sectionSize(col)
+        return x - left < RESIZE_MARGIN or right - x < RESIZE_MARGIN
+
+    def _draggable_block_at(self, pos):
+        col = self.logicalIndexAt(pos)
+        if col < 0 or self._near_resize_handle(pos.x(), col):
+            return None
+        return self._selected_block(col)
+
+    def _gap_at(self, x):
+        count = self.count()
+        col = self.logicalIndexAt(QPoint(x, 0))
+        if col < 0:
+            return 0 if x < 0 else count
+        mid = self.sectionViewportPosition(col) + self.sectionSize(col) / 2
+        return col if x < mid else col + 1
+
+    def _update_drop(self, x):
+        self._last_x = x
+        gap = self._gap_at(x)
+        if gap != self._drop_gap:
+            self._drop_gap = gap
+            self._repaint_all()
+
+    def _repaint_all(self):
+        self.viewport().update()
+        view = self.parentWidget()
+        if view is not None and hasattr(view, "viewport"):
+            view.viewport().update()
+
+    def _auto_scroll(self):
+        """拖到表头左右边缘时持续横向滚动，好把列拖到屏幕外的位置。"""
+        view = self.parentWidget()
+        bar = view.horizontalScrollBar() if hasattr(view, "horizontalScrollBar") else None
+        if not self._dragging or bar is None:
+            self._scroll_timer.stop()
+            return
+        width = self.viewport().width()
+        if self._last_x < AUTOSCROLL_MARGIN:
+            step = -max(8, AUTOSCROLL_MARGIN - self._last_x)
+        elif self._last_x > width - AUTOSCROLL_MARGIN:
+            step = max(8, self._last_x - (width - AUTOSCROLL_MARGIN))
+        else:
+            return
+        bar.setValue(bar.value() + step * 2)
+        self._update_drop(self._last_x)
+
+    def _end_drag(self):
+        self._drag_cols = None
+        self._press_pos = None
+        self._dragging = False
+        self._drop_gap = None
+        self._scroll_timer.stop()
+        self.unsetCursor()
+        self._repaint_all()
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier):
+            block = self._draggable_block_at(event.position().toPoint())
+            if block is not None:
+                # 先不交给基类：若没拖动，松开时再补一次普通单击
+                self._drag_cols = block
+                self._press_pos = event.position().toPoint()
+                self._dragging = False
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self._drag_cols is not None:
+            if not self._dragging:
+                if ((pos - self._press_pos).manhattanLength()
+                        < QApplication.startDragDistance()):
+                    return
+                self._dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._scroll_timer.start()
+            self._update_drop(pos.x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+        # 悬停在已选中的整列上提示可拖动（基类已处理列宽边界的光标）
+        if (event.buttons() == Qt.MouseButton.NoButton
+                and self._draggable_block_at(pos) is not None):
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self.cursor().shape() == Qt.CursorShape.OpenHandCursor:
+            self.unsetCursor()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_cols is None:
+            super().mouseReleaseEvent(event)
+            return
+        cols, gap, dragged = self._drag_cols, self._drop_gap, self._dragging
+        self._end_drag()
+        if dragged:
+            if gap is not None and not (cols[0] <= gap <= cols[-1] + 1):
+                self.columnsMoveRequested.emit(cols, gap)
+        else:
+            # 没拖动 = 普通单击：照常选中这一列（收起多列选区）
+            super().mousePressEvent(event)
+            super().mouseReleaseEvent(event)
+        event.accept()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        gap = self.drop_gap
+        if gap is None:
+            return
+        painter = QPainter(self.viewport())
+        x = self.gap_x(gap)
+        painter.fillRect(QRect(x - 1, 0, 3, self.viewport().height()), QColor(ACCENT))
 
 
 class ColumnFilterPopup(QDialog):

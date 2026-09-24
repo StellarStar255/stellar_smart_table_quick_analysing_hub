@@ -1014,6 +1014,9 @@ class PandasTableModel(QAbstractTableModel):
     def _do_reorder(self, positions):
         self._df = self._df.iloc[list(positions)].reset_index(drop=True)
 
+    def _do_reorder_columns(self, order):
+        self._df = self._df.iloc[:, list(order)]
+
     def insert_row(self, position: int):
         before = self._snapshot()
         self._invalidate_values()
@@ -1069,6 +1072,47 @@ class PandasTableModel(QAbstractTableModel):
         self._push_undo(("__struct__", "remove_columns", positions, removed,
                          before, self._snapshot()))
 
+    @staticmethod
+    def column_move_order(ncols, cols, target):
+        """把 cols 整体挪到"间隙" target（0..ncols，指原第 target 列之前）后的新列序。
+
+        返回 order：新第 i 列 = 原第 order[i] 列；无变化时返回 None。
+        """
+        cols = sorted({c for c in cols if 0 <= c < ncols})
+        if not cols:
+            return None
+        moving = set(cols)
+        rest = [c for c in range(ncols) if c not in moving]
+        k = max(0, min(target, ncols)) - sum(1 for c in cols if c < target)
+        order = rest[:k] + cols + rest[k:]
+        return None if order == list(range(ncols)) else order
+
+    def _apply_column_order(self, order):
+        """按列序重排 df，并把公式/背景色的键与公式内的列引用跟着搬走。"""
+        new_pos = {old: new for new, old in enumerate(order)}
+        self._do_reorder_columns(order)
+        self.formulas = {(r, new_pos[c]): v for (r, c), v in self.formulas.items()}
+        self.cell_colors = {(r, new_pos[c]): v for (r, c), v in self.cell_colors.items()}
+        self._rewrite_formulas(None, lambda c: new_pos.get(c, c))
+
+    def move_columns(self, cols, target):
+        """把 cols（列号集合）整体移到间隙 target 处（拖拽列头重排）。
+
+        公式引用随列移动（与 Excel 剪切插入列一致），可撤销。
+        返回新列序 order（新第 i 列 = 原第 order[i] 列）；未移动返回 None。
+        """
+        order = self.column_move_order(len(self._df.columns), cols, target)
+        if order is None:
+            return None
+        before = self._snapshot()
+        self._invalidate_values()
+        self.beginResetModel()
+        self._apply_column_order(order)
+        self.endResetModel()
+        self._finish_structure()
+        self._push_undo(("__struct__", "move_columns", order, before, self._snapshot()))
+        return order
+
     def _replay_struct(self, record, forward):
         """撤销（forward=False）/重做（forward=True）一条结构记录。"""
         kind, args = record[1], record[2:]
@@ -1107,6 +1151,14 @@ class PandasTableModel(QAbstractTableModel):
                 inverse = np.empty(len(positions), dtype=int)
                 inverse[np.asarray(positions, dtype=int)] = np.arange(len(positions))
                 self._do_reorder(inverse)
+        elif kind == "move_columns":
+            (order,) = args[:-2]
+            if not forward:
+                inverse = np.empty(len(order), dtype=int)
+                inverse[np.asarray(order, dtype=int)] = np.arange(len(order))
+                order = inverse.tolist()
+            # 键与公式文本由快照整体恢复，这里只挪数据
+            self._do_reorder_columns(order)
         elif kind == "promote":
             old_df, new_df = args[:-2]
             self._df = (new_df if forward else old_df).copy()
@@ -1123,9 +1175,10 @@ class PandasTableModel(QAbstractTableModel):
                 self._do_append_rows(n)
             else:
                 self._do_remove_rows(list(range(start, start + n)))
-        # 纯行重排不改变任何公式的值（引用随行一起移动），不必重算——
+        # 纯行/列重排不改变任何公式的值（引用随行列一起移动），不必重算——
         # 整列填充了公式的表重算一遍要好几秒；其余结构操作照常重算
-        self._restore_snapshot(after if forward else before, evaluate=(kind != "reorder"))
+        self._restore_snapshot(after if forward else before,
+                               evaluate=(kind not in ("reorder", "move_columns")))
         self.endResetModel()
         self._finish_structure()
 
