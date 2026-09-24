@@ -19,7 +19,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
+from http.client import HTTPException
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
@@ -49,6 +51,54 @@ except ImportError:
 
 def _urlopen(request, timeout):
     return urllib.request.urlopen(request, timeout=timeout, context=_SSL_CTX)
+
+
+def _proxy_hint():
+    """系统/环境里配了 HTTP(S) 代理时返回其地址，用于错误提示。"""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:                        # noqa: BLE001
+        return ""
+    return proxies.get("https") or proxies.get("http") or ""
+
+
+def describe_network_error(exc):
+    """把网络异常翻成用户看得懂的一句话 + 建议，原始报错附在最后便于排查。
+
+    urlopen 把底层错误包在 URLError.reason 里，先拆出来再分类。
+    """
+    raw = str(exc)
+    reason = exc.reason if (isinstance(exc, urllib.error.URLError)
+                            and not isinstance(exc, urllib.error.HTTPError)) else exc
+    proxy = _proxy_hint()
+    check_proxy = (tr("你的系统设置了代理（{}），请确认代理/VPN 软件正在运行。").format(proxy)
+                   if proxy else tr("如果需要代理/VPN 才能访问 GitHub，请确认它已开启。"))
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        if code in (403, 429):
+            msg = tr("GitHub 暂时限制了访问频率，请过几分钟再试。")
+        elif code == 404:
+            msg = tr("没有在 GitHub 上找到发布信息，请稍后再试。")
+        elif code >= 500:
+            msg = tr("GitHub 服务暂时不可用（HTTP {}），请稍后再试。").format(code)
+        else:
+            msg = tr("GitHub 返回了错误（HTTP {}），请稍后再试。").format(code)
+    elif isinstance(reason, socket.gaierror):
+        msg = tr("无法连接到 GitHub：找不到服务器地址（域名解析失败）。\n"
+                 "请检查网络是否已连接。") + check_proxy
+    elif isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in raw:
+        msg = tr("连接 GitHub 超时，网络较慢或不稳定，请稍后重试。") + check_proxy
+    elif isinstance(reason, ConnectionRefusedError):
+        msg = tr("连接被拒绝。") + check_proxy
+    elif isinstance(reason, ssl.SSLError):
+        msg = tr("与 GitHub 建立安全连接失败，可能是代理或网络拦截了 HTTPS，请稍后重试。")
+    elif isinstance(reason, (ConnectionError, HTTPException)):
+        msg = tr("与 GitHub 的连接中途断开，请稍后重试。")
+    elif isinstance(reason, OSError):
+        msg = tr("网络连接失败，请检查网络后重试。")
+    else:
+        msg = tr("出现意外错误，请稍后重试。")
+    return msg + "\n\n" + tr("详细信息：{}").format(raw)
 
 
 def _abort_response(resp):
@@ -108,7 +158,7 @@ class UpdateChecker(QThread):
             with _urlopen(req, timeout=15) as resp:
                 release = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # 网络失败不打扰用户
-            self.failed.emit(str(exc))
+            self.failed.emit(describe_network_error(exc))
             return
         latest = _parse_version(release.get("tag_name", ""))
         current = _parse_version(__version__)
@@ -191,7 +241,7 @@ class Downloader(QThread):
             self._remove_partial()
             if not self._cancelled:
                 # 取消导致的报错不算失败，否则上层还会"好心"重试
-                self.failed.emit(str(exc))
+                self.failed.emit(describe_network_error(exc))
 
     def _verify(self):
         status, expected = _fetch_checksum(self._release, self._asset_name)
@@ -226,7 +276,7 @@ def _fetch_checksum(release, asset_name):
                 with _urlopen(req, timeout=15) as resp:
                     text = resp.read().decode("utf-8")
             except Exception as exc:
-                return "unavailable", str(exc)
+                return "unavailable", describe_network_error(exc)
             for line in text.splitlines():
                 parts = line.split()
                 if len(parts) >= 2 and parts[-1].lstrip("*") == asset_name:
@@ -384,7 +434,7 @@ class UpdateManager:
             self._checker.failed.connect(
                 lambda msg: QMessageBox.warning(
                     self.window, tr("检查更新"),
-                    tr("检查更新失败：\n{}").format(msg)))
+                    tr("检查更新失败。\n\n{}").format(msg)))
         self._checker.start()
 
     def _on_update_found(self, release):
@@ -446,7 +496,7 @@ class UpdateManager:
                         continue
                     QMessageBox.warning(
                         self.window, tr("下载失败"),
-                        tr("升级包下载失败（已自动重试 {} 次）：\n{}").format(
+                        tr("升级包下载失败（已自动重试 {} 次）。\n\n{}").format(
                             self._MAX_DOWNLOAD_ATTEMPTS - 1, error))
                     return
                 action = self._check_package(path, downloader, attempt)
@@ -594,7 +644,7 @@ class UpdateManager:
                 return "retry"
             QMessageBox.critical(
                 self.window, tr("无法校验"),
-                tr("无法获取升级包的校验文件（网络错误），已取消安装：\n{}").format(
+                tr("无法获取升级包的校验文件，为安全起见已取消安装。\n\n{}").format(
                     downloader.checksum_error if downloader else ""))
             return "abort"
         if status != "ok":

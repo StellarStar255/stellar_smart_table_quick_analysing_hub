@@ -486,3 +486,49 @@ class TestSharedConfigDir:
         from qtui.paths import CONFIG_DIR
         assert updater.CONFIG_DIR is CONFIG_DIR
         assert CONFIG_DIR.endswith(".smart_table_hub")
+
+
+class TestDescribeNetworkError:
+    """网络报错翻成人话，原始信息保留在"详细信息"里。"""
+
+    def _describe(self, exc, monkeypatch, proxy=None):
+        import urllib.request as ur
+        from qtui import i18n, updater
+        monkeypatch.setattr(i18n, "_ACTIVE", i18n.LANG_ZH)   # 断言按中文原文写
+        monkeypatch.setattr(ur, "getproxies",
+                            lambda: {"https": proxy} if proxy else {})
+        return updater.describe_network_error(exc)
+
+    def test_dns_failure_mentions_proxy(self, monkeypatch):
+        import socket
+        import urllib.error
+        exc = urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided, or not known"))
+        msg = self._describe(exc, monkeypatch, proxy="http://127.0.0.1:10808/")
+        assert "域名解析失败" in msg
+        assert "127.0.0.1:10808" in msg
+        assert "详细信息" in msg and "Errno 8" in msg
+
+    def test_dns_failure_without_proxy(self, monkeypatch):
+        import socket
+        import urllib.error
+        msg = self._describe(urllib.error.URLError(socket.gaierror(8, "x")), monkeypatch)
+        assert "域名解析失败" in msg and "代理/VPN" in msg
+
+    def test_timeout(self, monkeypatch):
+        import urllib.error
+        msg = self._describe(urllib.error.URLError(TimeoutError("timed out")), monkeypatch)
+        assert "超时" in msg
+
+    def test_rate_limited(self, monkeypatch):
+        import urllib.error
+        exc = urllib.error.HTTPError("u", 403, "rate limit exceeded", {}, None)
+        assert "访问频率" in self._describe(exc, monkeypatch)
+
+    def test_refused(self, monkeypatch):
+        import urllib.error
+        exc = urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+        assert "连接被拒绝" in self._describe(exc, monkeypatch, proxy="http://127.0.0.1:1/")
+
+    def test_unknown_keeps_raw(self, monkeypatch):
+        msg = self._describe(IOError("下载不完整（50/100 字节）"), monkeypatch)
+        assert "50/100" in msg
