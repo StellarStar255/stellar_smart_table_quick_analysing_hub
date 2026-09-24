@@ -1259,9 +1259,26 @@ class MainWindow(QMainWindow):
 
         # 帮助
         help_menu = menubar.addMenu(tr("帮助"))
+        self._add_action(help_menu, tr("新手教程"), self.start_onboarding_tour)
         self._add_action(help_menu, tr("检查更新..."),
                          lambda: self._update_manager.check(silent=False))
         self._add_action(help_menu, tr("关于"), self._show_about)
+
+    # ---------- 新手教程 ----------
+
+    def start_onboarding_tour(self):
+        """开始（或重新开始）互动式新手教程。"""
+        from qtui.onboarding_tour import OnboardingTour
+        tour = getattr(self, "_onboarding_tour", None)
+        if tour is not None and tour.is_active():
+            tour.skip()
+        self._onboarding_tour = OnboardingTour(self, self._settings)
+        self._onboarding_tour.start()
+        return self._onboarding_tour
+
+    def schedule_onboarding_tour(self, delay_ms=800):
+        """首次启动：等窗口排好版（以及上次会话的文件载入）后再开始教程。"""
+        QTimer.singleShot(delay_ms, lambda: self.isVisible() and self.start_onboarding_tour())
 
     def _switch_language(self, lang):
         from qtui import i18n
@@ -1359,13 +1376,17 @@ class MainWindow(QMainWindow):
         self.auto_save_cb.toggled.connect(self._on_auto_save_toggled)
         tb.addWidget(self.auto_save_cb)
 
-    @staticmethod
-    def _add_toolbar_buttons(tb, pairs):
-        """按 (中文文案, 槽) 批量加按钮；丢弃 clicked(bool) 参数（见 _add_action）。"""
+    def _add_toolbar_buttons(self, tb, pairs):
+        """按 (中文文案, 槽) 批量加按钮；丢弃 clicked(bool) 参数（见 _add_action）。
+
+        按钮按中文文案登记到 _toolbar_buttons，新手教程据此定位高亮目标。
+        """
+        registry = self.__dict__.setdefault("_toolbar_buttons", {})
         for text, slot in pairs:
             btn = QPushButton(tr(text))
             btn.clicked.connect(lambda *_a, _s=slot: _s())
             tb.addWidget(btn)
+            registry[text] = btn
 
     def _build_filter_bar(self):
         self.filter_bar = QWidget()
@@ -1429,6 +1450,7 @@ class MainWindow(QMainWindow):
         self.sheet_tabs.customContextMenuRequested.connect(self._on_sheet_tab_menu)
         lay.addWidget(self.sheet_tabs)
         add_btn = QPushButton("+")
+        self.sheet_add_btn = add_btn
         add_btn.setFlat(True)
         add_btn.setFixedSize(24, 22)
         add_btn.setToolTip(tr("新建Sheet"))

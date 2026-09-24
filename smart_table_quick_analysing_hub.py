@@ -99,6 +99,9 @@ def main():
         app.setWindowIcon(QIcon(ICON_PATH))
     window = MainWindow(initial_file=initial_file)
     window.show()
+    from qtui.onboarding_tour import should_show_onboarding
+    if should_show_onboarding(window._settings):
+        window.schedule_onboarding_tour(800)
     sys.exit(app.exec())
 
 
