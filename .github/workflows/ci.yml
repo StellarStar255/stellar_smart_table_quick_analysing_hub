@@ -12,9 +12,9 @@ jobs:
       # 无显示环境下跑 Qt（测试只用 QtCore/QtGui，不需要真实窗口）
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
