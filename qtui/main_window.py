@@ -1029,6 +1029,11 @@ class MainWindow(QMainWindow):
         self.original_df = None          # 筛选前的完整数据
         self._filtered_idx_map = None    # 筛选行 -> original_df 索引标签
         self._suspended_formulas = None  # 筛选期间挂起的公式（original_df 坐标）
+        # 筛选切换的撤销/重做记录（见 _record_filter_change）
+        self._filter_undo = []
+        self._filter_redo = []
+        self._replaying_filters = False
+        self._view_snapshot = {"filters": [], "idx_map": None}
         self.image_columns = set()       # 标记为图片列的列名
         self._image_queue_win = None
         self._image_viewers = []
@@ -1045,6 +1050,8 @@ class MainWindow(QMainWindow):
         # ---------- 模型与视图 ----------
         self.model = PandasTableModel()
         self.model.dataChanged.connect(self._on_cell_edited)
+        # 撤销筛选后又做了新编辑：筛选的重做记录作废（与普通撤销栈语义一致）
+        self.model.historyPushed.connect(self._filter_redo.clear)
 
         self.table = _ExcelTableView()
         self.table.setModel(self.model)
@@ -1670,6 +1677,7 @@ class MainWindow(QMainWindow):
         self.model.cell_colors.clear()
         self.image_columns = set()   # 先清图片列，modelReset 触发的面板同步才不会沿用旧列
         self.model.set_dataframe(df)
+        self._reset_history()
         self.model.modified = False
         self.image_dock.hide()
         self._refresh_sheet_tabs()
@@ -1771,8 +1779,9 @@ class MainWindow(QMainWindow):
             self._save_recent()
             self._rebuild_recent_menu()
             self.update_statusbar(tr("已打开 {}：{} 行 × {} 列").format(os.path.basename(path), len(df), len(df.columns)))
-            # 恢复上次的筛选（视图状态，不算修改文档）
+            # 恢复上次的筛选（视图状态，不算修改文档，也不进撤销历史）
             self._restore_saved_filters()
+            self._reset_history()
             self.model.modified = False
             self._update_title()
             # 整文件原样载入（无表头）的文件：提示是否提升表头，由用户决定
@@ -2387,6 +2396,7 @@ class MainWindow(QMainWindow):
                 from_file=bool(self.current_file)
                 and not self._file_has_coord_marker(self.current_file))
             self.model.cell_colors = dict(colors)
+        self._reset_history()      # 撤销历史属于上一个 sheet
         self._refresh_sheet_tabs()
         self._rebuild_filter_bar()
         self._refresh_image_dock()
@@ -2530,6 +2540,9 @@ class MainWindow(QMainWindow):
             if self.model.structure_version != version:
                 self._refresh_image_dock()
             self.update_statusbar(tr("已撤销"))
+        elif self._filter_undo:
+            # 当前视图上的编辑都撤完了，再往前是一次筛选切换
+            self._undo_filter_change()
 
     def redo(self):
         if self._text_editor_focused():
@@ -2541,6 +2554,8 @@ class MainWindow(QMainWindow):
             if self.model.structure_version != version:
                 self._refresh_image_dock()
             self.update_statusbar(tr("已重做"))
+        elif self._filter_redo:
+            self._redo_filter_change()
 
     def _text_editor_focused(self):
         from PyQt6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit
@@ -2726,7 +2741,7 @@ class MainWindow(QMainWindow):
         模型的撤销记录回退不了这些，只能作废历史；非筛选时结构操作可撤销。
         """
         if self.active_filters:
-            self.model.clear_history()
+            self._reset_history()
         self._mark_modified()
 
     def _require_no_filter(self):
@@ -2877,6 +2892,7 @@ class MainWindow(QMainWindow):
 
     def _remove_columns(self, cols):
         """删除列并同步 original_df；该列上的筛选条件一并撤掉。"""
+        was_filtered = bool(self.active_filters)
         names = {str(self.model.df.columns[c]) for c in cols}
         self.model.remove_columns(cols)
         self._sync_original_columns(removed=cols)
@@ -2890,6 +2906,9 @@ class MainWindow(QMainWindow):
                 self.clear_all_filters()
         else:
             self._rebuild_filter_bar()   # 漏斗标记跟着列位置变
+        if was_filtered:
+            # 删的是筛选视图里的列（original_df 已手工同步），撤销记录回退不了这些
+            self._reset_history()
         self._after_structure_change()
 
     def delete_selected_columns(self):
@@ -2980,7 +2999,79 @@ class MainWindow(QMainWindow):
         self._filtered_idx_map = None
         self._orig_cell_colors = None   # 筛选期间颜色的原始行坐标底账
         self._suspended_formulas = None
+        self._view_snapshot = self._view_state()
         self._rebuild_filter_bar()
+
+    # ---------- 筛选的撤销 / 重做 ----------
+    #
+    # 筛选切换会整表替换视图（set_dataframe 清空模型的撤销栈），而模型的撤销
+    # 记录是按"当时那个视图"的行号记的。所以把历史按视图分段：每次筛选切换
+    # 记一条 {before, after, undo}，undo 是切换前那段视图上的撤销栈。
+    # 撤销时先撤完当前视图上的编辑，再恢复切换前的视图、把那段撤销栈放回去。
+    # 视图按记下的行映射（idx_map）原样重建而不是重新筛选：视图里改过的行可能
+    # 已不满足条件，重新筛选会少行，放回的撤销记录就会对错行。
+
+    _FILTER_HISTORY_LIMIT = 100
+
+    def _view_state(self):
+        """当前视图 = 筛选条件 + 显示行到原表行的映射（未筛选时为 None）。"""
+        filtered = bool(self.active_filters) and self._filtered_idx_map is not None
+        return {"filters": [dict(f) for f in self.active_filters] if filtered else [],
+                "idx_map": list(self._filtered_idx_map) if filtered else None}
+
+    def _record_filter_change(self, before, history):
+        """一次筛选切换完成后记账。history 为切换前模型的 (undo, redo) 栈。"""
+        after = self._view_state()
+        self._view_snapshot = after
+        if self._replaying_filters:
+            return
+        if before == after:
+            # 视图没变（比如重新套用同样的条件）：切换前的历史照样有效，放回去
+            self.model.set_history(*history)
+            return
+        self._filter_undo.append({"before": before, "after": after,
+                                  "undo": history[0], "redo": []})
+        del self._filter_undo[:-self._FILTER_HISTORY_LIMIT]
+        self._filter_redo.clear()
+
+    def _apply_view_state(self, state):
+        self._replaying_filters = True
+        try:
+            if state["filters"]:
+                self.active_filters = [dict(f) for f in state["filters"]]
+                self._reapply_filters(idx_map=state["idx_map"])
+            elif self.original_df is not None:
+                self.clear_all_filters()
+        finally:
+            self._replaying_filters = False
+
+    def _undo_filter_change(self):
+        record = self._filter_undo.pop()
+        record["redo"] = self.model.take_history()[1]   # 这段视图上撤掉的编辑，重做时放回
+        self._apply_view_state(record["before"])
+        self.model.set_history(record["undo"], [])
+        self._filter_redo.append(record)
+        self.update_statusbar(tr("已撤销筛选：{}").format(self._describe_filters()))
+
+    def _redo_filter_change(self):
+        record = self._filter_redo.pop()
+        record["undo"] = self.model.take_history()[0]
+        self._apply_view_state(record["after"])
+        self.model.set_history([], record["redo"])
+        self._filter_undo.append(record)
+        self.update_statusbar(tr("已重做筛选：{}").format(self._describe_filters()))
+
+    def _describe_filters(self):
+        if not self.active_filters:
+            return tr("无筛选，显示全部 {} 行").format(len(self.model.df))
+        return tr("{} 个条件，{} 行").format(len(self.active_filters), len(self.model.df))
+
+    def _reset_history(self):
+        """作废全部撤销/重做（模型的和筛选的）：换文件/换 sheet/筛选中的结构操作之后。"""
+        self.model.clear_history()
+        self._filter_undo.clear()
+        self._filter_redo.clear()
+        self._view_snapshot = self._view_state()
 
     def _current_colors(self):
         """当前 sheet 的权威背景色表：筛选中为原始行坐标底账。"""
@@ -3105,8 +3196,13 @@ class MainWindow(QMainWindow):
         mapped.update({(r, c): v for (r, c), v in orig_colors.items() if r < 0})
         return mapped
 
-    def _reapply_filters(self):
+    def _reapply_filters(self, idx_map=None):
+        """按 active_filters 重建筛选视图。
+
+        idx_map 不为 None 时不重新筛选，直接按这份行映射重建视图（撤销/重做筛选用）。
+        """
         self._flush_preview()   # 视图即将整表替换，预览框里的编辑先写回原格
+        before, history = self._view_snapshot, self.model.take_history()
         frozen_view = 0
         if self.original_df is None:
             # 首次进入筛选：挂起公式（original_df 坐标），清除筛选后恢复。
@@ -3124,13 +3220,19 @@ class MainWindow(QMainWindow):
         if not self.active_filters:
             self.clear_all_filters()
             return
-        filtered, idx_map = filter_engine.apply_filters(self.original_df, self.active_filters)
-        self._report_filter_errors()
+        if idx_map is None:
+            filtered, idx_map = filter_engine.apply_filters(
+                self.original_df, self.active_filters)
+            self._report_filter_errors()
+        else:
+            idx_map = list(idx_map)
+            filtered = self.original_df.loc[idx_map].reset_index(drop=True)
         self._filtered_idx_map = idx_map
         # 背景色从原始行坐标映射到筛选后的显示行
         self.model.cell_colors = self._map_colors_to_view(
             self._orig_cell_colors or {}, idx_map)
         self.model.set_dataframe(filtered)
+        self._record_filter_change(before, history)
         self._rebuild_filter_bar()
         self._refresh_image_dock()
         message = tr("筛选结果: {} 行（共 {} 个筛选条件）").format(
@@ -3153,6 +3255,7 @@ class MainWindow(QMainWindow):
 
     def clear_all_filters(self):
         self._flush_preview()   # 筛选视图里的编辑先经 dataChanged 同步回 original_df
+        before, history = self._view_snapshot, self.model.take_history()
         # 筛选中输入的公式是视图坐标，恢复原表时转为静态值（值已同步）
         frozen_view = len(self.model.formulas) if self.original_df is not None else 0
         if self.original_df is not None:
@@ -3163,6 +3266,7 @@ class MainWindow(QMainWindow):
                                      formulas=self._suspended_formulas)
         restored = len(self._suspended_formulas) if self._suspended_formulas else 0
         self._reset_filter_state()
+        self._record_filter_change(before, history)
         self._refresh_image_dock()
         self._save_file_config()   # 清掉记忆的筛选，下次打开不再恢复
         parts = []
@@ -3472,6 +3576,7 @@ class MainWindow(QMainWindow):
             df = pd.DataFrame(norm, columns=[_col_letter(i) for i in range(width)])
         df = df.apply(to_numeric_or_keep)
         self.model.set_dataframe(df, mark_modified=True)
+        self._reset_history()
         self._mark_modified()
         self.update_statusbar(tr("已从剪贴板载入 {} 行 × {} 列").format(len(df), len(df.columns)))
 

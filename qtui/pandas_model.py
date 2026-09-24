@@ -99,6 +99,8 @@ class PandasTableModel(QAbstractTableModel):
     # 背景色变化 [(数据行, 列, 生效颜色或 None), ...]——含撤销/重做，
     # 宿主据此维护筛选期间的原始行坐标颜色底账
     cellColorsChanged = pyqtSignal(list)
+    # 记入了一条新的可撤销操作（不含撤销/重做回放）——宿主据此作废自己的重做记录
+    historyPushed = pyqtSignal()
 
     def __init__(self, df: pd.DataFrame = None, parent=None):
         super().__init__(parent)
@@ -775,6 +777,19 @@ class PandasTableModel(QAbstractTableModel):
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
+        self.historyPushed.emit()
+
+    def take_history(self):
+        """当前撤销/重做栈的副本 (undo, redo)。
+
+        筛选切换会整表替换视图（set_dataframe 清空历史），宿主先把这一段
+        视图上的历史取走保存，撤销筛选、回到同一视图时再用 set_history 放回。
+        """
+        return list(self._undo_stack), list(self._redo_stack)
+
+    def set_history(self, undo, redo):
+        self._undo_stack = list(undo)
+        self._redo_stack = list(redo)
 
     # 撤销记录按首元素分派：带标记的批量/结构记录 -> 对应回放函数，
     # 否则是单格编辑记录 (row, col, old, new, old_formula, new_formula, old_dtype)

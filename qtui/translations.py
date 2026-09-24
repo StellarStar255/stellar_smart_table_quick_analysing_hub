@@ -602,4 +602,9 @@ TRANSLATIONS = {
     # 筛选记忆
     '已恢复上次的 {} 个筛选条件，筛选后 {} 行': 'Restored {} filter(s) from last time; {} row(s) shown',
     '；{} 个条件引用的列已不存在，已忽略': '; {} condition(s) referenced columns that no longer exist and were ignored',
+    # 筛选撤销
+    '已撤销筛选：{}': 'Undid filter: {}',
+    '已重做筛选：{}': 'Redid filter: {}',
+    '无筛选，显示全部 {} 行': 'no filter, showing all {} rows',
+    '{} 个条件，{} 行': '{} condition(s), {} row(s)',
 }
