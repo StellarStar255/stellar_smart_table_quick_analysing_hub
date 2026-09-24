@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.formula_engine import FormulaEngine
-from . import file_io, filter_engine
+from . import file_io, filter_engine, xlsx_filters
 from .pandas_model import PandasTableModel, to_numeric_or_keep
 
 # 视图第 0 行是虚拟表头行；所有视图行 <-> 数据行换算共用此常量
@@ -1034,6 +1034,9 @@ class MainWindow(QMainWindow):
         self._filter_redo = []
         self._replaying_filters = False
         self._view_snapshot = {"filters": [], "idx_map": None}
+        # 本次筛选有变化的 sheet（保存 xlsx 时只改写这些 sheet 的 AutoFilter）
+        self._filters_touched = set()
+        self._filter_scan_pending = set()   # 还没读过文件里筛选的 sheet
         self.image_columns = set()       # 标记为图片列的列名
         self._image_queue_win = None
         self._image_viewers = []
@@ -1678,6 +1681,8 @@ class MainWindow(QMainWindow):
         self.image_columns = set()   # 先清图片列，modelReset 触发的面板同步才不会沿用旧列
         self.model.set_dataframe(df)
         self._reset_history()
+        self._filters_touched = set()
+        self._filter_scan_pending = set()
         self.model.modified = False
         self.image_dock.hide()
         self._refresh_sheet_tabs()
@@ -1741,16 +1746,19 @@ class MainWindow(QMainWindow):
                 active = target if target in sheets else sheets[0]
                 df, formulas, colors = self._read_sheet_bundle(active, excel_file, path)
                 marker = file_io.xlsx_has_coord_marker(path)
-                return ("excel", excel_file, sheets, active, df, formulas, colors, marker)
+                file_filters = xlsx_filters.read_saved_filters(path, sheets=[active])
+                return ("excel", excel_file, sheets, active, df, formulas, colors, marker,
+                        file_filters)
             df = file_io.read_csv_any_encoding(path)
-            return ("csv", None, [], None, df, {}, {}, False)
+            return ("csv", None, [], None, df, {}, {}, False, None)
 
         def done(result):
             if result is None:
                 self._show_error(tr("打开文件"), tr("加载失败:\n{}").format(path),
                                  dialog.last_error)
                 return
-            kind, excel_file, sheets, active_sheet, df, formulas, colors, marker = result
+            (kind, excel_file, sheets, active_sheet, df, formulas, colors, marker,
+             file_filters) = result
             self.current_file = path
             self._release_excel_file()
             self._excel_file = excel_file
@@ -1779,8 +1787,12 @@ class MainWindow(QMainWindow):
             self._save_recent()
             self._rebuild_recent_menu()
             self.update_statusbar(tr("已打开 {}：{} 行 × {} 列").format(os.path.basename(path), len(df), len(df.columns)))
-            # 恢复上次的筛选（视图状态，不算修改文档，也不进撤销历史）
-            self._restore_saved_filters()
+            # 恢复筛选（不算修改文档，也不进撤销历史）
+            self._filters_touched = set()
+            # 其余 sheet 文件里的筛选切过去时再扫（见 _scan_file_filters）
+            self._filter_scan_pending = ({n for n in sheets if n != active_sheet}
+                                         if kind == "excel" else set())
+            self._restore_saved_filters(file_filters)
             self._reset_history()
             self.model.modified = False
             self._update_title()
@@ -1948,6 +1960,11 @@ class MainWindow(QMainWindow):
                          if n != self.current_sheet and n in on_disk and source_file
                          and (n not in formulas_map or n not in colors_map)]
 
+            # 筛选写进文件（AutoFilter + 精确副本）；键是保存后的 sheet 名
+            filter_state = self._filters_for_save(order)
+            touched = {("Sheet1" if not self.sheet_names else n)
+                       for n in self._filters_touched}
+
             # 能在原工作簿上打补丁时就打补丁：透视表/条件格式/数据验证/列宽/
             # 数字格式/图表等 pandas 重建会全丢，只有就地更新才能保住
             dirty = self._dirty_sheets()
@@ -1960,10 +1977,19 @@ class MainWindow(QMainWindow):
                 if not self._confirm_lossy_save(patch_src):
                     return False
                 dirty_sheets = {n: sheets[n] for n in dirty}
+                # 只改写本次筛选变过的 sheet，其余 sheet 的 AutoFilter 原样保留
+                patch_filters = {n: filter_state.get(n, {"filters": [], "visible": None})
+                                 for n in touched if n in order}
 
                 def work():
+                    frames = {n: sheets[n] for n in patch_filters if n in sheets}
+                    for name in patch_filters:
+                        if name not in frames and excel_file is not None \
+                                and name in excel_file.sheet_names:
+                            frames[name] = file_io.read_sheet(excel_file, name)
                     kept_header[0] = file_io.patch_workbook(
                         patch_src, path, dirty_sheets, order, formulas_map,
+                        filters=patch_filters, filter_frames=frames,
                         cell_colors=colors_map,
                         progress_cb=lambda name, i, total: dialog.report(
                             tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
@@ -1985,7 +2011,7 @@ class MainWindow(QMainWindow):
                         path, sheets, order, formulas_map,
                         progress_cb=lambda name, i, total: dialog.report(
                             tr("正在写入 {} ({}/{}) ...").format(name, i, total)),
-                        cell_colors=colors_map)
+                        cell_colors=colors_map, filters=filter_state)
 
         def done(result):
             # run_in_background 失败时回调 None；成功且 work 返回 None 无法区分，
@@ -1998,6 +2024,7 @@ class MainWindow(QMainWindow):
             if not export_only and (switch_to or path == self.current_file):
                 self.current_file = path
                 if not text_format:
+                    self._filters_touched = set()   # 筛选已写进文件
                     self._release_excel_file()
                     self._excel_file, self.sheet_names = file_io.load_workbook_lazy(path)
                     # 刚由本应用写出，坐标标记以磁盘为准，下次切 sheet 时重新读取
@@ -2260,6 +2287,13 @@ class MainWindow(QMainWindow):
                       self._sheet_formulas, self._sheet_colors):
             if old in store:
                 store[new] = store.pop(old)
+        # 新名字在磁盘文件里还不存在：先把旧名下文件里的筛选读进来，并标记为要写——
+        # 改名后的 sheet 保存时是整张新建的，原来的 AutoFilter 不会自己跟过去
+        self._scan_file_filters(old)
+        if old in self.sheet_filters and new not in self.sheet_filters:
+            self.sheet_filters[new] = self.sheet_filters.pop(old)
+        self._filters_touched.discard(old)
+        self._filters_touched.add(new)
         self._pinned_sheets.discard(old)
         self._pinned_sheets.add(new)   # 新名不在原文件里，必须整体写出
         self._refresh_sheet_tabs()
@@ -2375,6 +2409,7 @@ class MainWindow(QMainWindow):
         self._reset_filter_state()
 
         # 恢复该 sheet 的筛选
+        self._scan_file_filters(name)
         saved = self.sheet_filters.get(name)
         saved_filters = (self._prune_missing_filter_columns(saved["filters"], df)[0]
                          if saved and saved.get("filters") else [])
@@ -3023,6 +3058,8 @@ class MainWindow(QMainWindow):
         """一次筛选切换完成后记账。history 为切换前模型的 (undo, redo) 栈。"""
         after = self._view_state()
         self._view_snapshot = after
+        if before != after:
+            self._on_filters_changed()
         if self._replaying_filters:
             return
         if before == after:
@@ -3033,6 +3070,12 @@ class MainWindow(QMainWindow):
                                   "undo": history[0], "redo": []})
         del self._filter_undo[:-self._FILTER_HISTORY_LIMIT]
         self._filter_redo.clear()
+
+    def _on_filters_changed(self):
+        """筛选变了：xlsx 的筛选要随文件保存，所以算修改文档；CSV 存不了筛选，不算。"""
+        self._filters_touched.add(self.current_sheet or self._SINGLE_SHEET_KEY)
+        if self.current_file and not _is_text_format(self.current_file):
+            self._mark_modified()
 
     def _apply_view_state(self, state):
         self._replaying_filters = True
@@ -3886,20 +3929,65 @@ class MainWindow(QMainWindow):
         allowed = set(filter_engine.CONDITIONS) | {"值在列表中"}
         out = []
         for f in filters if isinstance(filters, list) else []:
-            if (isinstance(f, dict) and isinstance(f.get("col"), str)
+            if (isinstance(f, dict)
+                    and (isinstance(f.get("col"), str) or isinstance(f.get("col_index"), int))
                     and f.get("condition") in allowed and "value" in f):
                 out.append(dict(f))
         return out
 
     def _prune_missing_filter_columns(self, filters, df):
-        """去掉引用了已不存在列的条件（文件被外部改过列名/删过列），返回 (保留, 丢弃数)。"""
+        """去掉引用了已不存在列的条件（文件被外部改过列名/删过列），返回 (保留, 丢弃数)。
+
+        来自 Excel AutoFilter 的条件只有列号，这里先按表头换成列名。
+        """
+        from qtui import xlsx_filters
+        total = len(filters)
+        filters = xlsx_filters.resolve_columns(filters, df.columns)
         cols = {str(c) for c in df.columns}
         kept = [f for f in filters if f["col"] in cols]
-        return kept, len(filters) - len(kept)
+        return kept, total - len(kept)
 
-    def _restore_saved_filters(self):
-        """打开文件后恢复上次的筛选：当前 sheet 立即应用，其余 sheet 切过去时应用。"""
-        saved = _file_config_entry(self.current_file).get("filters")
+    def _scan_file_filters(self, name):
+        """第一次切到某个 sheet 时读文件里它的筛选；文件里有就以文件为准。"""
+        if name not in self._filter_scan_pending:
+            return
+        self._filter_scan_pending.discard(name)
+        if not self.current_file or name in self._filters_touched:
+            return
+        found = xlsx_filters.read_saved_filters(self.current_file, sheets=[name])
+        if found is None or name not in found:
+            return
+        filters = self._valid_saved_filters(found[name])
+        if filters:
+            self.sheet_filters[name] = {"filters": filters, "original_df": None}
+        else:
+            self.sheet_filters.pop(name, None)
+
+    def _filters_for_save(self, order):
+        """保存 xlsx 用：{保存后的 sheet 名: {"filters": [...], "visible": 行位置或 None}}。
+
+        当前 sheet 用视图的实际行映射（筛选中改过、已不满足条件的行也还在视图里，
+        文件里同样不隐藏）；其余 sheet 的可见行在保存线程里按条件现算。
+        """
+        state = {}
+        for key, filters in self._filters_snapshot().items():
+            name = key if self.sheet_names else "Sheet1"
+            if name in order:
+                state[name] = {"filters": filters, "visible": None}
+        current = self.current_sheet if self.sheet_names else "Sheet1"
+        if current in state and self.original_df is not None and self._filtered_idx_map is not None:
+            state[current]["visible"] = self._orig_positions()
+        return state
+
+    def _restore_saved_filters(self, file_filters=None):
+        """打开文件后恢复筛选：当前 sheet 立即应用，其余 sheet 切过去时应用。
+
+        file_filters 是 xlsx 文件里自带的筛选（AutoFilter / 精确副本，见 xlsx_filters），
+        有就以文件为准——它随文件走、也反映别人在 Excel 里改过的筛选；
+        文件里没有任何筛选信息时才用本机侧车配置（CSV，或旧版只记在本机的 xlsx）。
+        """
+        from_file = file_filters is not None
+        saved = file_filters if from_file else _file_config_entry(self.current_file).get("filters")
         if not isinstance(saved, dict):
             return
         current_key = self.current_sheet or self._SINGLE_SHEET_KEY
@@ -3918,6 +4006,14 @@ class MainWindow(QMainWindow):
             return
         self.active_filters = filters
         self._reapply_filters()
+        key = self.current_sheet or self._SINGLE_SHEET_KEY
+        if from_file:
+            # 文件里本来就是这个筛选：保存时不改写它（Excel 里设的颜色筛选等应用表达不了，
+            # 改写会丢）
+            self._filters_touched.discard(key)
+        elif not _is_text_format(self.current_file):
+            # 旧版只记在本机的 xlsx 筛选：下次保存时写进文件（不算修改文档）
+            self._filters_touched.add(key)
         message = tr("已恢复上次的 {} 个筛选条件，筛选后 {} 行").format(
             len(filters), len(self.model.df))
         if dropped:

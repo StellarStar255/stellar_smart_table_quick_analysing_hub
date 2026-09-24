@@ -541,7 +541,7 @@ def _replace_file(tmp_path, file_path):
 
 
 def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
-                  progress_cb=None, cell_colors=None):
+                  progress_cb=None, cell_colors=None, filters=None):
     """把 {sheet名: DataFrame} 全量写入 xlsx。
 
     formulas: 可选 {sheet名: {(row, col): "=..."}}，公式覆盖写入对应单元格，
@@ -549,6 +549,8 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
     cell_colors: 可选 {sheet名: {(数据行, 列): '#rrggbb'}}，行 -1 为表头行，
     写成真实的单元格填充（Excel 中同样可见）。
     progress_cb: 可选 (sheet名, 序号从1起, 总数) -> None，逐 sheet 汇报进度。
+    filters: 可选 {sheet名: {"filters": [...], "visible": [数据行位置] 或 None}}，
+    写成 Excel AutoFilter + 隐藏行，并在自定义属性里存精确副本（见 xlsx_filters）。
     先写临时文件再原子替换，避免写一半损坏原文件（与旧版后台保存策略一致）。
     sheet 名不合法（过长/非法字符/重名）时抛 ValueError，而不是静默截断
     导致两个 sheet 互相覆盖。
@@ -562,6 +564,7 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
             raise ValueError(tr("Sheet 名 \"{}\" 不合法：{}").format(name, err))
     formulas = formulas or {}
     cell_colors = cell_colors or {}
+    filters = filters or {}
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=os.path.dirname(file_path) or ".")
     os.close(fd)
     try:
@@ -585,6 +588,10 @@ def save_workbook(file_path, sheets: dict, sheet_order=None, formulas=None,
                     excel_row = row + 2 if row >= 0 else 1   # -1 = 表头行
                     writer.sheets[name].cell(
                         row=excel_row, column=col + 1).fill = fill
+                if name in filters:
+                    _write_sheet_filters(writer.sheets[name], sheets[name],
+                                         filters[name])
+            _write_filter_properties(writer.book, sheets, filters, order, {})
             # 坐标版本标记：本应用保存的文件加载时公式结果可放心写入
             writer.book.properties.keywords = COORD_MARKER
         _replace_file(tmp_path, file_path)
@@ -782,13 +789,17 @@ def _write_formulas(ws, formulas):
 
 
 def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
-                   formulas=None, cell_colors=None, progress_cb=None):
+                   formulas=None, cell_colors=None, progress_cb=None,
+                   filters=None, filter_frames=None):
     """在原工作簿基础上就地更新数据后另存，保留 pandas 重建会丢掉的一切
     （透视表、条件格式、数据验证、数字格式、列宽、合并单元格、图表、图片…）。
 
     sheets: {sheet名: DataFrame}，只写这些 sheet；不在里面的 sheet 原样保留。
     sheet_order: 保存后完整的 sheet 顺序；不在其中的 sheet 视为用户删除。
     formulas / cell_colors: 与 save_workbook 同义，只对 sheets 里的 sheet 生效。
+    filters: 与 save_workbook 同义，但只放本次筛选有变化的 sheet（空条件 = 去掉筛选）；
+    其余 sheet 的 AutoFilter / 隐藏行原样保留。filter_frames 为这些 sheet 的完整数据
+    （算行数与表头用，可以包含 sheets 以外的 sheet）。
     返回 {"kept_header_formulas": n, "skipped_merged_cells": m}：
     m 是落在合并区域占位格上、Excel 里无法存放而没写入的非空值个数。
     先写临时文件再原子替换，写一半失败不会损坏任何一个文件。
@@ -801,6 +812,8 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
             raise ValueError(tr("Sheet 名 \"{}\" 不合法：{}").format(name, err))
     formulas = formulas or {}
     cell_colors = cell_colors or {}
+    filters = filters or {}
+    filter_frames = filter_frames or {}
     # 原文件本来就没有自定义底色时，不必为"清除底色"去扫整个数据区
     clear_stale_fills = _xlsx_has_custom_fills(src_path)
     keep_vba = (str(src_path).lower().endswith((".xlsm", ".xltm"))
@@ -833,6 +846,18 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
             skipped_merged += stats["skipped_merged"]
             _write_formulas(ws, formulas.get(name, {}))
             _apply_fills(ws, sheet_colors, fill_cache, palette)
+        for name, state in filters.items():
+            df = sheets.get(name, filter_frames.get(name))
+            if df is None or name not in wb.sheetnames:
+                continue
+            ws = wb[name]
+            _write_sheet_filters(ws, df, state,
+                                 unhide_when_cleared=bool(ws.auto_filter.ref))
+        from qtui import xlsx_filters
+        existing = xlsx_filters.read_properties_from_workbook(wb)
+        _write_filter_properties(
+            wb, {**filter_frames, **sheets}, filters, order,
+            {n: s for n, s in existing.items() if n in order and n not in filters})
         wb._sheets = [wb[n] for n in order if n in wb.sheetnames]
         wb.properties.keywords = COORD_MARKER
         wb.save(tmp_path)
@@ -844,6 +869,37 @@ def patch_workbook(src_path, dest_path, sheets: dict, sheet_order,
         raise
     return {"kept_header_formulas": kept_header_formulas,
             "skipped_merged_cells": skipped_merged}
+
+
+def _write_sheet_filters(ws, df, state, unhide_when_cleared=False):
+    """把一个 sheet 的筛选写成 AutoFilter + 隐藏行（visible 为 None 时按条件现算）。"""
+    from qtui import filter_engine, xlsx_filters
+    conditions = xlsx_filters.resolve_columns(state.get("filters") or [], df.columns)
+    spec = xlsx_filters.autofilter_spec(conditions, df.columns)
+    visible = state.get("visible")
+    if spec and visible is None:
+        _filtered, idx_map = filter_engine.apply_filters(df, conditions)
+        index = df.index
+        visible = [index.get_loc(label) for label in idx_map]
+    xlsx_filters.apply_to_worksheet(ws, spec, len(df.columns), len(df.index),
+                                    visible or [], unhide_when_cleared)
+
+
+def _write_filter_properties(wb, frames, filters, order, keep):
+    """自定义属性里的精确副本：本次写的 sheet 用新条件，keep 里的原样保留。"""
+    from qtui import xlsx_filters
+    state = dict(keep)
+    for name, st in filters.items():
+        df = frames.get(name)
+        if name not in order or df is None:
+            continue
+        conditions = xlsx_filters.resolve_columns(st.get("filters") or [], df.columns)
+        if conditions:
+            state[name] = {"filters": conditions, "sig": xlsx_filters.spec_signature(
+                xlsx_filters.autofilter_spec(conditions, df.columns))}
+        else:
+            state.pop(name, None)
+    xlsx_filters.write_properties(wb, state)
 
 
 def csv_separator(file_path, df: pd.DataFrame = None, sep=None) -> str:

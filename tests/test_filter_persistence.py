@@ -116,6 +116,8 @@ def test_per_sheet_filters(windows, xlsx_path):
     w.switch_sheet("乙")
     _apply(w, BIG)
     w.switch_sheet("甲")          # 最后停在「甲」
+    assert w.model.modified       # xlsx 的筛选要随文件保存，算修改
+    w.model.modified = False      # 不保存直接关：仍由本机配置记住
     w.close()
 
     w2 = _open(windows, xlsx_path)
