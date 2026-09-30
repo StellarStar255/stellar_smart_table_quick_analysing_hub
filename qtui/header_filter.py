@@ -26,6 +26,7 @@ ACCENT = "#4a9edb"
 MAX_VALUES = 2000       # 弹层里最多列出的去重值个数
 BLANK_LABEL = "(空白)"   # 空值在列表里的显示名，内部值是空串
 RESIZE_MARGIN = 4       # 离列边界这么近算拖列宽，不算拖列
+LAST_RESIZE_MARGIN = 8  # 最后一列贴着视口边缘，给内侧留出足够的拖宽点击区
 AUTOSCROLL_MARGIN = 24  # 拖列时鼠标离表头左右边缘这么近就自动滚动
 
 
@@ -89,6 +90,7 @@ class FilterHeaderView(QHeaderView):
         self._dragging = False
         self._drop_gap = None
         self._last_x = 0
+        self._last_resize = None  # (列号, 按下时 x, 原宽度)，字母/列名行共用
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setInterval(40)
         self._scroll_timer.timeout.connect(self._auto_scroll)
@@ -144,6 +146,39 @@ class FilterHeaderView(QHeaderView):
         left = self.sectionViewportPosition(col)
         right = left + self.sectionSize(col)
         return x - left < RESIZE_MARGIN or right - x < RESIZE_MARGIN
+
+    def last_resize_handle_at(self, x):
+        """最后一列右边缘的内侧点击区（与表格视口使用相同的横向坐标）。"""
+        col = self.count() - 1
+        if (col < 0 or self.isSectionHidden(col)
+                or self.sectionResizeMode(col) != QHeaderView.ResizeMode.Interactive
+                or self.stretchLastSection()):
+            return False
+        right = self.sectionViewportPosition(col) + self.sectionSize(col)
+        return (0 < right <= self.viewport().width()
+                and 0 <= x < self.viewport().width()
+                and 0 <= right - x <= LAST_RESIZE_MARGIN)
+
+    def begin_last_resize(self, x):
+        if not self.last_resize_handle_at(x):
+            return False
+        self._end_drag()
+        col = self.count() - 1
+        self._last_resize = (col, x, self.sectionSize(col))
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        return True
+
+    def update_last_resize(self, x):
+        if self._last_resize is None:
+            return False
+        col, start_x, width = self._last_resize
+        self.resizeSection(col, max(self.minimumSectionSize(),
+                                   min(self.maximumSectionSize(), width + x - start_x)))
+        return True
+
+    def end_last_resize(self):
+        self._last_resize = None
+        self.unsetCursor()
 
     def _draggable_block_at(self, pos):
         col = self.logicalIndexAt(pos)
@@ -201,6 +236,9 @@ class FilterHeaderView(QHeaderView):
     def mousePressEvent(self, event):
         if (event.button() == Qt.MouseButton.LeftButton
                 and event.modifiers() == Qt.KeyboardModifier.NoModifier):
+            if self.begin_last_resize(event.position().toPoint().x()):
+                event.accept()
+                return
             block = self._draggable_block_at(event.position().toPoint())
             if block is not None:
                 # 先不交给基类：若没拖动，松开时再补一次普通单击
@@ -213,6 +251,16 @@ class FilterHeaderView(QHeaderView):
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
+        if self.update_last_resize(pos.x()):
+            event.accept()
+            return
+        if (event.buttons() == Qt.MouseButton.NoButton
+                and self.last_resize_handle_at(pos.x())):
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+            event.accept()
+            return
+        if self.cursor().shape() == Qt.CursorShape.SplitHCursor:
+            self.unsetCursor()
         if self._drag_cols is not None:
             if not self._dragging:
                 if ((pos - self._press_pos).manhattanLength()
@@ -233,6 +281,11 @@ class FilterHeaderView(QHeaderView):
             self.unsetCursor()
 
     def mouseReleaseEvent(self, event):
+        if self._last_resize is not None and event.button() == Qt.MouseButton.LeftButton:
+            self.update_last_resize(event.position().toPoint().x())
+            self.end_last_resize()
+            event.accept()
+            return
         if self._drag_cols is None:
             super().mouseReleaseEvent(event)
             return

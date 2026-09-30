@@ -423,6 +423,14 @@ class _ExcelTableView(QTableView):
         super().__init__(parent)
         # 悬停填充柄要变十字光标，需要无按键的 move 事件
         self.viewport().setMouseTracking(True)
+        self._resizing_last_column = False
+
+    def _last_column_resize_hit(self, pos):
+        header = self.horizontalHeader()
+        if not isinstance(header, FilterHeaderView) or not header.last_resize_handle_at(pos.x()):
+            return False
+        cell = self.visualRect(self.model().index(0, header.count() - 1))
+        return cell.top() <= pos.y() <= cell.bottom()
 
     # ---------- 列名行的筛选箭头 ----------
 
@@ -898,6 +906,14 @@ class _ExcelTableView(QTableView):
         self._tab_origin_col = None
         editor = self._formula_editor()
         if editor is None and event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            if (event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    and self._last_column_resize_hit(pos)
+                    and self.horizontalHeader().begin_last_resize(pos.x())):
+                self._resizing_last_column = True
+                self.viewport().setCursor(Qt.CursorShape.SplitHCursor)
+                event.accept()
+                return
             col = self._arrow_hit(event.position().toPoint())
             if col >= 0:
                 self.filterArrowClicked.emit(col)
@@ -921,6 +937,10 @@ class _ExcelTableView(QTableView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._resizing_last_column:
+            self.horizontalHeader().update_last_resize(event.position().toPoint().x())
+            event.accept()
+            return
         if self._point_anchor is not None:
             editor = self._formula_editor()
             idx = self.indexAt(event.position().toPoint())
@@ -934,7 +954,9 @@ class _ExcelTableView(QTableView):
             return
         # 悬停填充柄时提示可拖拽；悬停筛选箭头时显示手形
         handle = self._fill_handle_rect()
-        if (handle is not None and handle.adjusted(-2, -2, 2, 2)
+        if self._last_column_resize_hit(event.position().toPoint()):
+            self.viewport().setCursor(Qt.CursorShape.SplitHCursor)
+        elif (handle is not None and handle.adjusted(-2, -2, 2, 2)
                 .contains(event.position().toPoint())):
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         elif self._arrow_hit(event.position().toPoint()) >= 0:
@@ -944,6 +966,14 @@ class _ExcelTableView(QTableView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._resizing_last_column and event.button() == Qt.MouseButton.LeftButton:
+            header = self.horizontalHeader()
+            header.update_last_resize(event.position().toPoint().x())
+            header.end_last_resize()
+            self._resizing_last_column = False
+            self.viewport().unsetCursor()
+            event.accept()
+            return
         if self._point_anchor is not None:
             self._point_anchor = None
             event.accept()
