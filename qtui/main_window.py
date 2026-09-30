@@ -1288,7 +1288,23 @@ class MainWindow(QMainWindow):
 
     def schedule_onboarding_tour(self, delay_ms=800):
         """首次启动：等窗口排好版（以及上次会话的文件载入）后再开始教程。"""
-        QTimer.singleShot(delay_ms, lambda: self.isVisible() and self.start_onboarding_tour())
+        def show_when_ready():
+            from qtui.onboarding_tour import should_show_onboarding
+            if not self.isVisible() or not should_show_onboarding(self._settings):
+                return
+            tour = getattr(self, "_onboarding_tour", None)
+            if tour is not None and tour.is_active():
+                return
+            if QApplication.activeModalWidget() is not None:
+                QTimer.singleShot(200, show_when_ready)
+                return
+            self.start_onboarding_tour()
+        QTimer.singleShot(delay_ms, show_when_ready)
+
+    def _end_onboarding_for_document_change(self):
+        tour = getattr(self, "_onboarding_tour", None)
+        if tour is not None and tour.is_active():
+            tour.document_replaced()
 
     def _switch_language(self, lang):
         from qtui import i18n
@@ -1665,6 +1681,7 @@ class MainWindow(QMainWindow):
         self._flush_preview()   # 预览框里未落盘的编辑先写回当前表，再决定是否保存
         if confirm and not self._check_save_before_discard():
             return
+        self._end_onboarding_for_document_change()
         cols = [_col_letter(i) for i in range(10)]
         df = pd.DataFrame(np.full((DEFAULT_ROWS, len(cols)), np.nan), columns=cols)
         self.current_file = None
@@ -1759,6 +1776,7 @@ class MainWindow(QMainWindow):
                 return
             (kind, excel_file, sheets, active_sheet, df, formulas, colors, marker,
              file_filters) = result
+            self._end_onboarding_for_document_change()
             self.current_file = path
             self._release_excel_file()
             self._excel_file = excel_file

@@ -574,6 +574,7 @@ TRANSLATIONS = {
     '先点字母列头选中整列（按住 Shift 可连选多列），再按住选中的列头左右拖，蓝线处就是落点。公式引用、背景色、列宽都会跟着走，⌘Z 可撤销。': 'Click a column letter to select the whole column (Shift-click to select several), then press and drag the selected header left or right; the blue line shows where it will land. Formula references, background colors and widths move along, and ⌘Z undoes it.',
     '点字母 B 选中「城市」列，再按住它拖到别处': 'Click letter B to select the “城市” column, then drag it somewhere else',
     '写公式': 'Write formulas',
+    '在「金额」列第一格输入 {} 并回车': 'In the first cell of the “金额” column, type {} and press Enter',
     '以 = 开头就是公式，支持 SUM、AVERAGE、IF、VLOOKUP 等常用函数。输入时直接点别的单元格可插入引用；拖选区右下角的小方块能把公式填充下去，⌘D 向下填充、⌥= 自动求和。': 'Anything starting with = is a formula, with common functions like SUM, AVERAGE, IF and VLOOKUP. While typing, click another cell to insert a reference; drag the small square at the bottom-right of the selection to fill the formula down. ⌘D fills down, ⌥= inserts AutoSum.',
     '在「金额」列第一格输入 =D2*E2 并回车（列被拖动过就按新位置写）': 'In the first cell of the “金额” column, type =D2*E2 and press Enter (adjust the letters if you moved columns)',
     '右键菜单里功能最全': 'The right-click menu has the most',

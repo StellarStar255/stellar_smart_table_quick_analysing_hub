@@ -60,6 +60,30 @@ def _tick_until_done(tour):
 
 
 class TestFlag:
+    def test_scheduled_start_waits_for_modal_and_does_not_restart(self, win):
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QDialog
+        dialog = QDialog(win)
+        dialog.setModal(True)
+        dialog.show()
+        win.schedule_onboarding_tour(0)
+        _pump()
+        assert getattr(win, "_onboarding_tour", None) is None
+        dialog.close()
+        QTest.qWait(250)
+        tour = win._onboarding_tour
+        assert tour.is_active()
+        _goto_key(tour, "formula")
+        win.schedule_onboarding_tour(0)
+        _pump()
+        assert win._onboarding_tour is tour
+        assert tour.current_step.key == "formula"
+        tour.skip()
+        win.schedule_onboarding_tour(0)
+        _pump()
+        assert win._onboarding_tour is tour
+        assert not tour.is_active()
+
     def test_first_launch_then_marked(self, win):
         assert ot.should_show_onboarding(win._settings)
         tour = win.start_onboarding_tour()
@@ -73,6 +97,23 @@ class TestFlag:
 
 
 class TestSampleData:
+    def test_new_document_ends_practice_without_clearing_later_edits(self, win):
+        tour = win.start_onboarding_tour()
+        win.new_file(confirm=False)
+        assert not tour.is_active()
+        win.model.setData(win.model.index(1, 0), "keep this")
+        tour.skip()
+        assert win.model.df.iat[0, 0] == "keep this"
+
+    def test_open_file_ends_practice(self, win, tmp_path):
+        path = tmp_path / "own.csv"
+        path.write_text("x,y\n1,2\n", encoding="utf-8")
+        tour = win.start_onboarding_tour()
+        win.load_file(str(path))
+        assert not tour.is_active()
+        assert win.current_file == str(path)
+        assert list(win.model.df.columns) == ["x", "y"]
+
     def test_blank_document_gets_sample_and_restored_after(self, win):
         tour = win.start_onboarding_tour()
         assert tour.sample_loaded
@@ -148,6 +189,66 @@ class TestSteps:
         win.model.setData(win.model.index(1, col), "=D2*E2")
         _tick_until_done(tour)
         assert win.model.df.iat[0, col] == pytest.approx(420)
+
+    def test_formula_hint_tracks_reordered_columns(self, win):
+        tour = win.start_onboarding_tour()
+        win.move_columns([1], 4)
+        _goto_key(tour, "formula")
+        columns = list(win.model.df.columns)
+        expected = "={}2*{}2".format(
+            mw_mod._col_letter(columns.index("销量")),
+            mw_mod._col_letter(columns.index("单价")))
+        assert expected in tour.overlay.hint_label.text()
+        cell = win.table.currentIndex()
+        assert cell.column() == columns.index("金额")
+        win.model.setData(cell, expected)
+        _tick_until_done(tour)
+        assert win.model.df.iat[0, cell.column()] == pytest.approx(420)
+
+    def test_formula_can_be_typed_in_real_table(self, win):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtTest import QTest
+        tour = win.start_onboarding_tour()
+        _goto_key(tour, "formula")
+        cell = win.table.currentIndex()
+        win.table.setFocus()
+        QTest.keyClicks(win.table, "=")
+        QTest.keyClicks(QApplication.focusWidget(), "D2*E2")
+        QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Return)
+        _pump()
+        _tick_until_done(tour)
+        assert win.model.df.iat[0, cell.column()] == pytest.approx(420)
+
+    def test_filter_popup_is_finished_before_advancing(self, win):
+        from qtui.header_filter import ColumnFilterPopup
+        tour = win.start_onboarding_tour()
+        _goto_key(tour, "filter")
+        popup = ColumnFilterPopup(win, "城市", [("上海", 3)])
+        popup.show()
+        try:
+            _tick_until_done(tour)
+            tour._advance_after_done()
+            assert tour.current_step.key == "filter"
+            popup.close()
+            tour._advance_after_done()
+            assert tour.current_step.key == "move_column"
+        finally:
+            popup.close()
+
+    def test_other_windows_popup_does_not_complete_step(self, win):
+        from qtui.header_filter import ColumnFilterPopup
+        from PyQt6.QtWidgets import QWidget
+        other = QWidget()
+        tour = win.start_onboarding_tour()
+        _goto_key(tour, "filter")
+        popup = ColumnFilterPopup(other, "城市", [("上海", 3)])
+        popup.show()
+        try:
+            tour._tick()
+            assert not tour._done_flag
+        finally:
+            popup.close()
+            other.close()
 
     def test_filter_step_completes_when_popup_opens(self, win):
         from qtui.header_filter import ColumnFilterPopup

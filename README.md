@@ -157,6 +157,20 @@ python smart_table_quick_analysing_hub.py
 
 ## User Guide
 
+### Interactive Tutorial
+
+The first launch shows a spotlight tour, following the tutorial style of
+[Stellar Smart Terminal](https://github.com/StellarStar255/stellar_smart_terminal).
+Reopen it any time from **Help → Tutorial**. Try filtering, dragging columns,
+entering a formula, and opening the right-click menu in the real interface;
+completed actions advance automatically. **Back**, **Skip this step**, and
+**Exit tutorial** are always available.
+
+A blank document gets temporary sample data for practice, cleared when you exit.
+On an existing document, the column-moving and formula steps provide explanations.
+Opening or creating another document ends the tour. The tutorial supports Chinese
+and English.
+
 ### Basic Operations
 
 1. **Create a new spreadsheet**
@@ -452,6 +466,17 @@ python smart_table_quick_analysing_hub.py
 - `PyQt6`: GUI界面
 
 ## 使用指南
+
+### 互动新手教程
+
+首次启动会显示聚光灯式引导，参考
+[Stellar Smart Terminal](https://github.com/StellarStar255/stellar_smart_terminal)
+的教程方式。也可随时从 **帮助 → 新手教程** 重看。在真实界面中试着点筛选箭头、
+拖动列头、输入公式、打开右键菜单，完成后会自动进入下一步；随时可点
+**上一步**、**跳过此步** 或 **退出教程**。
+
+空白表会载入临时示例数据供练习，退出时清除；已有文档中的拖列和公式步骤
+只作讲解。打开或新建其他文档时教程会结束。教程支持中英文。
 
 ### 基本操作
 

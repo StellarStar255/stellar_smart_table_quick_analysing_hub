@@ -88,7 +88,9 @@ def _visible_filter_popup(win) -> bool:
     from qtui.header_filter import ColumnFilterPopup
     for w in QApplication.topLevelWidgets():
         try:
-            if isinstance(w, ColumnFilterPopup) and w.isVisible():
+            if (isinstance(w, ColumnFilterPopup) and w.isVisible()
+                    and w.parentWidget() is not None
+                    and w.parentWidget().window() is win):
                 return True
         except RuntimeError:
             continue
@@ -495,6 +497,11 @@ class OnboardingTour(QObject):
     def skip(self):
         self._finish()
 
+    def document_replaced(self):
+        """换文件后结束教程，不能把刚新建/载入的文档当作练习表清掉。"""
+        self.sample_loaded = False
+        self._finish()
+
     def is_active(self) -> bool:
         return self.index >= 0 and not self._finished
 
@@ -560,6 +567,12 @@ class OnboardingTour(QObject):
         self.index = max(index, 0)
         self._baseline.columns = _columns(self.window)
         self._baseline.formulas = len(self.window.model.formulas)
+        if self.sample_loaded and self.current_step.key == "formula":
+            columns = list(self.window.model.df.columns)
+            if "金额" in columns and len(self.window.model.df):
+                cell = self.window.model.index(1, columns.index("金额"))
+                self.window.table.setCurrentIndex(cell)
+                self.window.table.scrollTo(cell)
         self._render()
         self.overlay.raise_()
         self.overlay.setFocus()
@@ -573,6 +586,14 @@ class OnboardingTour(QObject):
         hint = ""
         if interactive:
             hint = tr("✓ 做得好，马上进入下一步") if self._done_flag else step.hint
+            if step.key == "formula" and not self._done_flag:
+                from qtui.main_window import _col_letter
+                columns = list(self.window.model.df.columns)
+                if all(name in columns for name in ("销量", "单价", "金额")):
+                    formula = "={}2*{}2".format(
+                        _col_letter(columns.index("销量")),
+                        _col_letter(columns.index("单价")))
+                    hint = tr("在「金额」列第一格输入 {} 并回车").format(formula)
         if self.index == total - 1:
             next_text = tr("完成")
         elif interactive and not self._done_flag:
@@ -648,6 +669,11 @@ class OnboardingTour(QObject):
 
     def _advance_after_done(self):
         if self.is_active() and self._done_flag:
+            # 筛选使用自己的嵌套事件循环；先让用户操作/关闭弹层，再继续讲解。
+            if (_visible_filter_popup(self.window) or _context_menu_open(self.window)
+                    or QApplication.activeModalWidget() is not None):
+                self._advance_timer.start(self.POLL_MS)
+                return
             self.next()
 
     # ----- 收尾 -----
