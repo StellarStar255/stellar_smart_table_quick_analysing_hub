@@ -106,7 +106,7 @@ def test_cell_viewer_and_copy_queue_use_same_prefix(win, media, monkeypatch):
     folder, image, video = media
     win._set_image_column("media", str(folder))
     opened, queued = [], []
-    monkeypatch.setattr(win, "open_image_viewer", opened.append)
+    monkeypatch.setattr(win, "open_image_viewer", lambda path, **kw: opened.append(path))
     win._view_cell_image(win.model.index(1, 0))
     win._view_cell_image(win.model.index(2, 0))
     assert opened == [str(image), str(video)]

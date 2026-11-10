@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate,
     QStyle, QMenu, QCheckBox, QDialog,
     QDialogButtonBox, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QApplication, QDockWidget, QLineEdit,
+    QApplication, QDockWidget, QLineEdit, QSplitter,
 )
 
 from core.formula_engine import FormulaEngine
@@ -1536,13 +1536,26 @@ class MainWindow(QMainWindow):
         # 图片预览
         self.image_dock = QDockWidget(tr("图片预览"), self)
         self.image_dock.setObjectName("image_dock")
-        self.image_panel = ImagePreviewPanel()
-        self.image_panel.rowActivated.connect(self._on_image_row_activated)
-        self.image_panel.openImageRequested.connect(self.open_image_viewer)
-        self.image_panel.copyImageRequested.connect(self.copy_image_to_clipboard)
-        self.image_dock.setWidget(self.image_panel)
+        self.image_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.image_splitter.setChildrenCollapsible(False)
+        self.image_splitter.setHandleWidth(7)
+        self.image_splitter.setStyleSheet(
+            "QSplitter::handle:vertical { background: palette(mid); "
+            "margin: 1px 24px; border-radius: 2px; }")
+        self._image_panels = {}
+        self.image_panel = self._make_image_panel()
+        self.image_splitter.addWidget(self.image_panel)
+        self.image_dock.setWidget(self.image_splitter)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.image_dock)
         self.image_dock.hide()
+
+    def _make_image_panel(self):
+        panel = ImagePreviewPanel()
+        panel.rowActivated.connect(self._on_image_row_activated)
+        panel.openImageRequested.connect(
+            lambda path, p=panel: self.open_image_viewer(path, colname=p._image_col))
+        panel.copyImageRequested.connect(self.copy_image_to_clipboard)
+        return panel
 
     def _build_python_toolbar(self):
         self.python_toolbar = QToolBar(tr("Python分析"))
@@ -3037,6 +3050,9 @@ class MainWindow(QMainWindow):
         if old in self.image_columns:
             self.image_columns.discard(old)
             self.image_columns.add(new)
+            for viewer in self._image_viewers:
+                if _widget_alive(viewer) and getattr(viewer, "_preview_col", None) == old:
+                    viewer._preview_col = new
             self._update_image_context()
             self._save_file_config()   # 图片列名持久化在配置里，改名同步落盘
         self._mark_modified()
@@ -3788,10 +3804,13 @@ class MainWindow(QMainWindow):
             self._preview_cell = (current.row(), current.column())
             self.model.set_highlight_row(current.row())
             # 图片面板按数据行工作（视图行 0 是表头行）
-            self.image_panel.set_current_row(current.row() - HEADER_ROWS)
+            for panel in self._image_panels.values():
+                panel.set_current_row(current.row() - HEADER_ROWS)
         else:
             self._preview_cell = None
             self.model.set_highlight_row(-1)
+            for panel in self._image_panels.values():
+                panel.set_current_row(-1)
 
     def _on_preview_text_changed(self):
         if not self._preview_loading and getattr(self, "_preview_cell", None):
@@ -3814,21 +3833,53 @@ class MainWindow(QMainWindow):
     def _sync_image_panel(self, *_):
         """把当前 model.df 同步给图片面板（排序/筛选/插删行列都会换 df 对象，
         面板持有旧引用会导致行号和图片对不上）。"""
-        active_col = None
-        for col in self.model.df.columns:
-            if str(col) in self.image_columns:
-                active_col = str(col)
-                break
-        self.image_panel.set_context(self.model.df, active_col, self._base_image_dir(),
-                                     self.image_prefixes.get(active_col, ""))
+        active_cols = [str(col) for col in self.model.df.columns
+                       if str(col) in self.image_columns]
+        previous = self._image_panels
+        current = self.table.currentIndex()
+        row = current.row() - HEADER_ROWS if current.isValid() else self.image_panel._current_row
+        panels = {}
+        for index, col in enumerate(active_cols):
+            panel = previous.get(col)
+            if panel is None:
+                panel = self.image_panel if not previous and index == 0 else self._make_image_panel()
+                panel.set_current_row(row)
+            if self.image_splitter.indexOf(panel) != index:
+                self.image_splitter.insertWidget(index, panel)
+            panel.set_context(self.model.df, col, self._base_image_dir(),
+                              self.image_prefixes.get(col, ""))
+            panel.set_compact(len(active_cols) > 1)
+            panel.show()
+            panels[col] = panel
+        # Preserve an empty panel for the existing single-panel entry points.
+        keep = next(iter(panels.values()), self.image_panel)
+        for panel in previous.values():
+            if panel not in panels.values():
+                panel.set_context(None, None, "")
+                if panel is not keep:
+                    panel.setParent(None)
+                    panel.deleteLater()
+        self.image_panel = keep
+        self._image_panels = panels
+        if not panels:
+            keep.set_context(self.model.df, None, self._base_image_dir())
+        elif list(previous) != active_cols:
+            self.image_splitter.setSizes([1] * len(panels))
+        active_col = active_cols[0] if active_cols else None
         self._active_image_col = active_col
         self._image_synced_df = self.model.df
         return active_col
 
     def _update_image_context(self):
         """图片列设置变化后强制刷新图片面板并按需显示。"""
+        was_multiple = len(self._image_panels) > 1
         if self._sync_image_panel():
             self.image_dock.show()
+            if not was_multiple and len(self._image_panels) > 1:
+                self.resizeDocks([self.cell_preview_dock, self.image_dock],
+                                 [100, max(400, self.height() - 180)], Qt.Orientation.Vertical)
+        else:
+            self.image_dock.hide()
 
     def _refresh_image_dock(self):
         """整表替换后只决定面板是否显示：内容已由 modelReset 等信号同步过，
@@ -3849,7 +3900,7 @@ class MainWindow(QMainWindow):
     def _set_image_column(self, colname, prefix=None):
         if prefix is not None:
             self.image_prefixes[colname] = prefix.strip()
-        self.image_columns = {colname}  # 与旧版一致：同时只有一个图片列
+        self.image_columns.add(colname)
         self._update_image_context()
         self._save_file_config()
         self.update_statusbar(tr("已把 '{}' 设为图片列").format(colname))
@@ -3866,10 +3917,13 @@ class MainWindow(QMainWindow):
             col = self.table.currentIndex().column()
             self.jump_to_cell(row, max(0, col))
 
-    def open_image_viewer(self, path, new_window=None):
+    def open_image_viewer(self, path, new_window=None, colname=None):
         """默认复用同一个查看器窗口（换图 + 置顶），Cmd/Ctrl+双击才另开一个用于对比。"""
-        if path == self.image_panel.video_view.path:
-            self.image_panel.video_view.player.pause()
+        for panel in self._image_panels.values():
+            if path == panel.video_view.path:
+                panel.video_view.player.pause()
+            if colname is None and path == panel._current_path():
+                colname = panel._image_col
         try:
             from .image_viewer import ImageViewer
         except Exception as e:
@@ -3896,19 +3950,25 @@ class MainWindow(QMainWindow):
             viewer.navigateRequested.connect(
                 lambda step, v=viewer: self._viewer_navigate(v, step))
             self._image_viewers.append(viewer)
+        viewer._preview_col = colname if colname is not None else self._active_image_col
         viewer.show()
         viewer.raise_()
         viewer.activateWindow()
 
     def _viewer_navigate(self, viewer, step):
         """查看器里按 ←/→：按图片列顺序换到上一张/下一张，表格当前行跟着走。"""
-        found = self.image_panel.neighbor_with_image(step)
+        colname = getattr(viewer, "_preview_col", None)
+        panel = self._image_panels.get(colname) if colname is not None else self.image_panel
+        if panel is None:
+            return
+        found = panel.neighbor_with_image(step)
         if not found:
             return                        # 到头了：什么都不做
         row, path = found
         col = self.table.currentIndex().column()
         self.jump_to_cell(row, max(0, col))
-        self.image_panel.set_current_row(row)
+        for preview in self._image_panels.values():
+            preview.set_current_row(row)
         viewer.set_image(path)
 
     def copy_image_to_clipboard(self, path):
@@ -3934,7 +3994,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, tr("图片队列"), tr("图片队列加载失败: {}").format(e))
             return
         if colname is None:
-            colname = next(iter(self.image_columns), None)
+            colname = self._active_image_col
         if colname is None or colname not in self.model.df.columns:
             QMessageBox.information(self, tr("图片队列"), tr("请先把某一列设为图片列"))
             return
@@ -4228,7 +4288,7 @@ class MainWindow(QMainWindow):
         prefix = self.image_prefixes.get(colname, "")
         path = resolve_media_path(raw, self._base_image_dir(), prefix)
         if path:
-            self.open_image_viewer(path)
+            self.open_image_viewer(path, colname=colname)
         else:
             path = resolve_media_path(raw, self._base_image_dir(), prefix, must_exist=False)
             QMessageBox.warning(self, tr("查看图片"), tr("图片不存在:\n{}").format(path))
@@ -4445,6 +4505,8 @@ class MainWindow(QMainWindow):
             manager = getattr(self, "_update_manager", None)
             if manager is not None:
                 manager.shutdown()
+            for panel in self._image_panels.values():
+                panel.shutdown()
             event.accept()
         else:
             event.ignore()

@@ -18,12 +18,13 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QScrollArea, QFrame,
-    QGraphicsOpacityEffect, QSizePolicy, QMenu,
+    QGraphicsOpacityEffect, QSizePolicy, QMenu, QToolButton,
 )
 
 from qtui.i18n import tr
 from qtui.image_utils import load_image, is_video, resolve_media_path
 from qtui.video_player import VideoPlayer
+from qtui.video_frames import VideoFrameLoader
 
 STRIP_BEFORE, STRIP_AFTER = 10, 12      # 胶片条向前/向后渲染的行数
 THUMB_CACHE_LIMIT = 300
@@ -132,7 +133,7 @@ class _StripCell(QFrame):
         self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_label.setFixedSize(thumb_size)
         layout.addWidget(self.img_label)
-        self.caption = QLabel(str(row + 2))  # 网格第 1 行是表头，数据行号从 2 起
+        self.caption = QLabel(("▶ " if is_video(path) else "") + str(row + 2))
         self.caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.caption.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.caption)
@@ -178,6 +179,7 @@ class ImagePreviewPanel(QWidget):
         self._path_prefix = ""
         self._current_row = -1
         self._zoom = 1.0
+        self._compact = None
         self._entries = []   # 胶片条单元（按行号有序）
 
         self._thumb_cache = OrderedDict()   # 路径 -> 胶片条 QPixmap
@@ -212,13 +214,27 @@ class ImagePreviewPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
+        self.column_title = QLabel()
+        self.column_title.setStyleSheet("font-weight: bold;")
+        self.column_title.hide()
+        title_row = QHBoxLayout()
+        title_row.addWidget(self.column_title, 1)
+        self._strip_toggle = QToolButton()
+        self._strip_toggle.setCheckable(True)
+        self._strip_toggle.setChecked(True)
+        self._strip_toggle.hide()
+        self._strip_toggle.toggled.connect(self._set_strip_visible)
+        title_row.addWidget(self._strip_toggle)
+        layout.addLayout(title_row)
 
         # ---- 主图 ----
         self.main_view = _MainImageView()
         self.main_view.doubleClicked.connect(self.openImageRequested.emit)
         self.main_view.menuRequested.connect(self._show_image_menu)
         layout.addWidget(self.main_view, 1)
-        self.video_view = VideoPlayer(self)
+        self._video_frames = VideoFrameLoader(self)
+        self.video_view = VideoPlayer(self, frame_loader=self._video_frames)
+        self._video_frames.loaded.connect(self._on_thumb_loaded)
         self.video_view.openRequested.connect(self.openImageRequested.emit)
         self.video_view.hide()
         layout.addWidget(self.video_view, 1)
@@ -242,7 +258,9 @@ class ImagePreviewPanel(QWidget):
         self._update_strip_height()
 
         # ---- 缩放（控制胶片条缩略图大小） ----
-        zoom_row = QHBoxLayout()
+        self._zoom_controls = QWidget()
+        zoom_row = QHBoxLayout(self._zoom_controls)
+        zoom_row.setContentsMargins(0, 0, 0, 0)
         zoom_row.addWidget(QLabel(tr("缩放:")))
         self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_slider.setRange(50, 200)
@@ -252,7 +270,8 @@ class ImagePreviewPanel(QWidget):
         zoom_row.addWidget(self._zoom_slider, 1)
         self._zoom_label = QLabel("100%")
         zoom_row.addWidget(self._zoom_label)
-        layout.addLayout(zoom_row)
+        layout.addWidget(self._zoom_controls)
+        self._set_strip_visible(True)
 
         self._hint = QLabel(tr("右键列头选择「设为图片列」"))
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -261,11 +280,17 @@ class ImagePreviewPanel(QWidget):
     # ---------- 外部接口 ----------
 
     def set_context(self, df, image_col, base_dir, prefix=""):
+        if (image_col, base_dir or "", prefix) != (self._image_col, self._base_dir, self._path_prefix):
+            self._video_frames.clear()
+            self._thumb_inflight = {p for p in self._thumb_inflight if not is_video(p)}
         self._df = df
         self._image_col = image_col
         self._base_dir = base_dir or ""
         self._path_prefix = prefix
         self._hint.setVisible(image_col is None)
+        self.column_title.setText(str(image_col) if image_col is not None else "")
+        self.column_title.setVisible(image_col is not None)
+        self._strip_toggle.setVisible(image_col is not None)
         if image_col is None:
             self.video_view.set_path(None)
             self.video_view.hide()
@@ -277,6 +302,23 @@ class ImagePreviewPanel(QWidget):
         else:
             self._rebuild_strip()
             self._update_main_image(fade=False)
+
+    def set_compact(self, compact):
+        """Give the current row more room when comparing multiple columns."""
+        if self._compact != compact:
+            self._compact = compact
+            self._strip_toggle.setChecked(not compact)
+
+    def _set_strip_visible(self, visible):
+        self._strip_scroll.setVisible(visible)
+        self._zoom_controls.setVisible(visible)
+        self._strip_toggle.setText(tr("隐藏缩略图") if visible else tr("显示缩略图"))
+        if visible:
+            for cell in self._entries:
+                if cell.path and cell.path not in self._thumb_cache:
+                    self._request_thumb(cell.path)
+        else:
+            self._retain_video_requests()
 
     def set_current_row(self, row):
         if row == self._current_row:
@@ -442,7 +484,7 @@ class ImagePreviewPanel(QWidget):
         cell.menuRequested.connect(self._show_image_menu)
         cell.set_focused(row == self._current_row)
         self._set_cell_pixmap(cell)
-        if path and not is_video(path) and path not in self._thumb_cache:
+        if path and path not in self._thumb_cache:
             self._request_thumb(path)
         return cell
 
@@ -461,6 +503,7 @@ class ImagePreviewPanel(QWidget):
                 focused_cell = cell
         if focused_cell:
             QTimer.singleShot(0, lambda c=focused_cell: self._center_cell(c, animated=False))
+        self._retain_video_requests()
 
     def _incremental_strip_update(self):
         if self._df is None or self._image_col not in self._df.columns:
@@ -489,6 +532,13 @@ class ImagePreviewPanel(QWidget):
                 focused_cell = e
         if focused_cell:
             QTimer.singleShot(0, lambda c=focused_cell: self._center_cell(c, animated=True))
+        self._retain_video_requests()
+
+    def _retain_video_requests(self):
+        paths = ([self._current_path()] if self._strip_scroll.isHidden() else
+                 [e.path for e in self._entries if e.path])
+        removed = self._video_frames.retain([path for path in paths if path])
+        self._thumb_inflight.difference_update(removed)
 
     def _center_cell(self, cell, animated):
         if cell not in self._entries:
@@ -518,10 +568,7 @@ class ImagePreviewPanel(QWidget):
         if cell.path is None:
             cell.img_label.setText(tr("无图"))
             return
-        if is_video(cell.path):
-            cell.img_label.setText(tr("▶ 视频"))
-            cell.img_label.setToolTip(os.path.basename(cell.path))
-            return
+        cell.img_label.setToolTip(os.path.basename(cell.path))
         pix = self._thumb_cache.get(cell.path)
         if pix is not None:
             self._thumb_cache.move_to_end(cell.path)
@@ -532,12 +579,17 @@ class ImagePreviewPanel(QWidget):
         elif cell.path in self._thumb_cache:
             cell.img_label.setText(tr("加载失败"))
         else:
-            cell.img_label.setText("…")
+            cell.img_label.setText(tr("▶ 视频") if is_video(cell.path) else "…")
 
     def _request_thumb(self, path):
         if path in self._thumb_inflight:
             return
+        if is_video(path) and self._strip_scroll.isHidden() and path != self._current_path():
+            return
         self._thumb_inflight.add(path)
+        if is_video(path):
+            self._video_frames.request(path)
+            return
         # 按 2 倍请求，缩放滑块放大时不至于糊
         size = QSize(BASE_STRIP_THUMB.width() * 2, BASE_STRIP_THUMB.height() * 2)
         self._pool.start(_ImageLoader(path, size, self._thumb_signals))
@@ -550,6 +602,9 @@ class ImagePreviewPanel(QWidget):
                 if cell.path == path:
                     cell.img_label.setText(tr("加载失败"))
             return
+        if is_video(path):
+            img = img.scaled(BASE_STRIP_THUMB * 2, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
         pix = QPixmap.fromImage(img)
         self._thumb_cache[path] = pix
         while len(self._thumb_cache) > THUMB_CACHE_LIMIT:
@@ -558,5 +613,16 @@ class ImagePreviewPanel(QWidget):
             if cell.path == path:
                 self._set_cell_pixmap(cell)
         # 大图还没就绪时，用刚到的缩略图先occupy主图区
-        if path == self._current_path() and path not in self._main_cache:
+        if not is_video(path) and path == self._current_path() and path not in self._main_cache:
             self.main_view.set_image(pix, path, fade=False)
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self):
+        self._refresh_timer.stop()
+        self._zoom_settle_timer.stop()
+        self._zoom_throttle.stop()
+        self._video_frames.clear()
+        self.video_view.player.stop()

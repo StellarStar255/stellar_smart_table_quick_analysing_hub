@@ -9,6 +9,10 @@
 """
 
 TRANSLATIONS = {
+    '正在生成视频预览…': 'Generating video preview…',
+    '无法生成视频预览，可尝试播放': 'Video preview unavailable. Try playing the video.',
+    '显示缩略图': 'Show Thumbnails',
+    '隐藏缩略图': 'Hide Thumbnails',
     '设置图片列': 'Set Image Column',
     '设置图片列前缀...': 'Set Image Column Prefix...',
     '图片/视频文件夹前缀（可选，留空不添加）：\n例如 /Users/me/media；单元格中的完整路径不受影响。': 'Image/video folder prefix (optional; leave blank for none):\nFor example /Users/me/media. Absolute paths in cells are used as-is.',

@@ -33,7 +33,7 @@ def test_mixed_column_routes_video_without_image_decoding(media, tmp_path, monke
     panel.set_context(pd.DataFrame({"media": ["clip.MP4", "", "photo.png"]}),
                       "media", str(tmp_path))
     panel.set_current_row(0)
-    assert video not in requested
+    assert video in requested  # Videos now request decoded preview thumbnails too.
     assert image in requested
     assert not panel.video_view.isHidden()
     assert panel.main_view.isHidden()

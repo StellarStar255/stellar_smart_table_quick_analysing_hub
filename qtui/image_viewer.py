@@ -290,6 +290,7 @@ class ImageViewer(QMainWindow):
     def closeEvent(self, event):
         if self.video_view is not None:
             self.video_view.player.stop()
+            self.video_view.frame_loader.clear()
         super().closeEvent(event)
 
     def _reveal_in_finder(self):

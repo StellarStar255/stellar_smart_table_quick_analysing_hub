@@ -41,6 +41,7 @@ python smart_table_quick_analysing_hub.py -h
 ## Features
 
 - **Image and video columns**: Right-click a column header and choose "Set as Image Column" to preview local images or videos (including mixed columns). Videos have play/pause and seek controls; double-click to open a separate viewer. Relative paths resolve from the spreadsheet folder. Video format support depends on the available media codecs.
+  - Videos show decoded preview frames before playback, including in the thumbnail strip. Mark multiple columns to compare the same row in vertically split panels; drag the divider to resize. Each panel shows its column name and keeps its own prefix. Thumbnail strips can be expanded individually.
   - Set an optional folder prefix when marking the column, or edit it later via "Set Image Column Prefix...". For example, prefix `/Users/me/media` plus cell `clip.mp4` opens `/Users/me/media/clip.mp4`. Absolute paths are used as-is; prefixes are remembered per file and column.
 
 ### 📊 File Operations
@@ -354,6 +355,7 @@ python smart_table_quick_analysing_hub.py -h
 ## 功能特性
 
 - **图片与视频列**：右键列头选择「设为图片列」，即可在右侧查看本地图片或视频，同一列可混放。视频支持播放、暂停和拖动进度，双击可打开独立查看窗口。相对路径以表格所在文件夹为基准，视频格式支持取决于可用的媒体解码器。
+  - 视频在播放前会显示实际预览画面，缩略条也显示视频画面。可将多列同时设为图片列，在右侧上下分割的面板中核对同一行，拖动分隔条可调节高度。各面板标明列名，前缀独立保存；多列时可按需展开各自的缩略条。
   - 设置时可填写文件夹前缀，也可通过「设置图片列前缀...」修改。例如前缀 `/Users/me/media` 加单元格 `clip.mp4`，即可打开 `/Users/me/media/clip.mp4`。完整路径按原样使用，前缀按文件和列记忆。
 
 ### 📊 文件操作
