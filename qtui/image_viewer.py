@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.i18n import tr
-from qtui.image_utils import load_image
+from qtui.image_utils import load_image, is_video
+from qtui.video_player import VideoPlayer
 
 
 def _copy_via_system_tool(image_path):
@@ -160,6 +161,7 @@ class ImageViewer(QMainWindow):
         self.view = None
         self._item = None
         self._fitted = False
+        self.video_view = None
         self.set_image(image_path, initial=True)
         self._setup_shortcuts()
 
@@ -167,6 +169,19 @@ class ImageViewer(QMainWindow):
         """在同一窗口换一张图。默认双击复用窗口，避免堆出一排查看器。"""
         self.image_path = image_path
         self.setWindowTitle(os.path.basename(image_path))
+        if self.video_view is not None:
+            self.video_view.set_path(None)
+            self.video_view = None
+        if is_video(image_path):
+            self.view = None
+            self._item = None
+            self._pixmap = QPixmap()
+            self.video_view = VideoPlayer(self)
+            self.setCentralWidget(self.video_view)
+            self.video_view.set_path(image_path)
+            if initial:
+                self.resize(900, 600)
+            return
         self._pixmap = (QPixmap.fromImage(load_image(image_path))
                         if os.path.exists(image_path) else QPixmap())
 
@@ -239,9 +254,10 @@ class ImageViewer(QMainWindow):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        copy_action = QAction(tr("复制图片"), menu)
-        copy_action.triggered.connect(self._copy_image)
-        menu.addAction(copy_action)
+        if not is_video(self.image_path):
+            copy_action = QAction(tr("复制图片"), menu)
+            copy_action.triggered.connect(self._copy_image)
+            menu.addAction(copy_action)
         reveal_action = QAction(tr("在Finder中显示"), menu)
         reveal_action.triggered.connect(self._reveal_in_finder)
         menu.addAction(reveal_action)
@@ -253,6 +269,8 @@ class ImageViewer(QMainWindow):
 
     def _copy_image(self):
         path = self.image_path
+        if is_video(path):
+            return
 
         def _done(ok):
             try:
@@ -268,6 +286,11 @@ class ImageViewer(QMainWindow):
                 QMessageBox.warning(self, tr("错误"), tr("复制图片失败"))
 
         copy_image_to_clipboard_async(path, _done)
+
+    def closeEvent(self, event):
+        if self.video_view is not None:
+            self.video_view.player.stop()
+        super().closeEvent(event)
 
     def _reveal_in_finder(self):
         system = platform.system()

@@ -40,6 +40,9 @@ python smart_table_quick_analysing_hub.py -h
 
 ## Features
 
+- **Image and video columns**: Right-click a column header and choose "Set as Image Column" to preview local images or videos (including mixed columns). Videos have play/pause and seek controls; double-click to open a separate viewer. Relative paths resolve from the spreadsheet folder. Video format support depends on the available media codecs.
+  - Set an optional folder prefix when marking the column, or edit it later via "Set Image Column Prefix...". For example, prefix `/Users/me/media` plus cell `clip.mp4` opens `/Users/me/media/clip.mp4`. Absolute paths are used as-is; prefixes are remembered per file and column.
+
 ### 📊 File Operations
 - **Multi-format support**: Open and save .xlsx, .xls, and .csv files
 - **Smart encoding detection**: Automatically detects CSV file encodings (UTF-8, GBK, GB2312, and more)
@@ -349,6 +352,9 @@ python smart_table_quick_analysing_hub.py -h
 
 
 ## 功能特性
+
+- **图片与视频列**：右键列头选择「设为图片列」，即可在右侧查看本地图片或视频，同一列可混放。视频支持播放、暂停和拖动进度，双击可打开独立查看窗口。相对路径以表格所在文件夹为基准，视频格式支持取决于可用的媒体解码器。
+  - 设置时可填写文件夹前缀，也可通过「设置图片列前缀...」修改。例如前缀 `/Users/me/media` 加单元格 `clip.mp4`，即可打开 `/Users/me/media/clip.mp4`。完整路径按原样使用，前缀按文件和列记忆。
 
 ### 📊 文件操作
 - **多格式支持**: 打开和保存 .xlsx, .xls, .csv 文件

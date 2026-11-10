@@ -7,8 +7,34 @@ load_image: 统一用 QImageReader 解码，
     解码，比"全量解码后再 scaled()"快数倍、内存也小得多）。
 """
 
+import os
+
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QImage, QImageReader, QImageIOHandler
+
+
+VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm", ".wmv",
+                    ".mpg", ".mpeg", ".3gp", ".mts", ".m2ts", ".ts", ".ogv"}
+
+
+def is_video(path):
+    return bool(path) and os.path.splitext(str(path))[1].lower() in VIDEO_EXTENSIONS
+
+
+def resolve_media_path(raw, base_dir="", prefix="", must_exist=True):
+    """Resolve local media, applying a directory prefix only to relative cells."""
+    raw = str(raw).strip()
+    if not raw or raw.lower() in ("nan", "none", "<na>"):
+        return None
+    raw = os.path.expanduser(raw)
+    if not os.path.isabs(raw):
+        raw = os.path.join(os.path.expanduser(prefix.strip()), raw)
+    candidates = ([os.path.normpath(raw)] if os.path.isabs(raw) else
+                  [os.path.abspath(os.path.join(base, raw))
+                   for base in (base_dir or os.getcwd(), os.getcwd())])
+    if not must_exist:
+        return candidates[0]
+    return next((path for path in candidates if os.path.isfile(path)), None)
 
 
 def load_image(path, max_size=None):

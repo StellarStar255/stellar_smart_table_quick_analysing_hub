@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import (
 )
 
 from qtui.i18n import tr
-from qtui.image_utils import load_image
+from qtui.image_utils import load_image, is_video, resolve_media_path
+from qtui.video_player import VideoPlayer
 
 STRIP_BEFORE, STRIP_AFTER = 10, 12      # 胶片条向前/向后渲染的行数
 THUMB_CACHE_LIMIT = 300
@@ -174,6 +175,7 @@ class ImagePreviewPanel(QWidget):
         self._df = None
         self._image_col = None
         self._base_dir = ""
+        self._path_prefix = ""
         self._current_row = -1
         self._zoom = 1.0
         self._entries = []   # 胶片条单元（按行号有序）
@@ -216,6 +218,10 @@ class ImagePreviewPanel(QWidget):
         self.main_view.doubleClicked.connect(self.openImageRequested.emit)
         self.main_view.menuRequested.connect(self._show_image_menu)
         layout.addWidget(self.main_view, 1)
+        self.video_view = VideoPlayer(self)
+        self.video_view.openRequested.connect(self.openImageRequested.emit)
+        self.video_view.hide()
+        layout.addWidget(self.video_view, 1)
         self._main_caption = QLabel("")
         self._main_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._main_caption.setStyleSheet(f"color: {HIGHLIGHT}; font-weight: bold;")
@@ -254,12 +260,16 @@ class ImagePreviewPanel(QWidget):
 
     # ---------- 外部接口 ----------
 
-    def set_context(self, df, image_col, base_dir):
+    def set_context(self, df, image_col, base_dir, prefix=""):
         self._df = df
         self._image_col = image_col
         self._base_dir = base_dir or ""
+        self._path_prefix = prefix
         self._hint.setVisible(image_col is None)
         if image_col is None:
+            self.video_view.set_path(None)
+            self.video_view.hide()
+            self.main_view.show()
             self._clear_strip()
             self.main_view.set_image(None, None, fade=False)
             self.main_view.setText("")
@@ -325,17 +335,7 @@ class ImagePreviewPanel(QWidget):
     # ---------- 路径 ----------
 
     def _resolve_path(self, raw):
-        raw = str(raw).strip()
-        if not raw or raw.lower() in ("nan", "none"):
-            return None
-        if os.path.isabs(raw):
-            return raw if os.path.exists(raw) else None
-        for base in (self._base_dir, os.getcwd()):
-            if base:
-                p = os.path.normpath(os.path.join(base, raw))
-                if os.path.exists(p):
-                    return p
-        return None
+        return resolve_media_path(raw, self._base_dir, self._path_prefix)
 
     def neighbor_with_image(self, step):
         """从当前行往 step 方向（-1 上 / +1 下）找下一张有图的行。
@@ -365,11 +365,18 @@ class ImagePreviewPanel(QWidget):
 
     def _update_main_image(self, fade=True):
         path = self._current_path()
+        video = is_video(path)
+        self.video_view.setVisible(video)
+        self.main_view.setVisible(not video)
+        self.video_view.set_path(path if video else None)
         if self._current_row >= 0:
             name = os.path.basename(path) if path else tr("无图片")
             self._main_caption.setText(tr("行 {} · {}").format(self._current_row + 2, name))  # 与网格行号一致（表头占第 1 行）
         else:
             self._main_caption.setText("")
+        if video:
+            self.main_view.set_image(None, None, fade=False)
+            return
         if path is None:
             self.main_view.set_image(None, None, fade=False)
             return
@@ -415,8 +422,10 @@ class ImagePreviewPanel(QWidget):
     def _show_image_menu(self, path, global_pos):
         """主图/缩略图的右键菜单：不用打开查看器就能复制。"""
         menu = QMenu(self)
-        menu.addAction(tr("复制图片"), lambda: self.copyImageRequested.emit(path))
-        menu.addAction(tr("打开大图"), lambda: self.openImageRequested.emit(path))
+        if not is_video(path):
+            menu.addAction(tr("复制图片"), lambda: self.copyImageRequested.emit(path))
+        menu.addAction(tr("打开视频") if is_video(path) else tr("打开大图"),
+                       lambda: self.openImageRequested.emit(path))
         menu.exec(global_pos)
 
     def _strip_range(self):
@@ -433,7 +442,7 @@ class ImagePreviewPanel(QWidget):
         cell.menuRequested.connect(self._show_image_menu)
         cell.set_focused(row == self._current_row)
         self._set_cell_pixmap(cell)
-        if path and path not in self._thumb_cache:
+        if path and not is_video(path) and path not in self._thumb_cache:
             self._request_thumb(path)
         return cell
 
@@ -508,6 +517,10 @@ class ImagePreviewPanel(QWidget):
         cell.img_label.setFixedSize(size)
         if cell.path is None:
             cell.img_label.setText(tr("无图"))
+            return
+        if is_video(cell.path):
+            cell.img_label.setText(tr("▶ 视频"))
+            cell.img_label.setToolTip(os.path.basename(cell.path))
             return
         pix = self._thumb_cache.get(cell.path)
         if pix is not None:

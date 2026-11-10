@@ -9,6 +9,14 @@
 """
 
 TRANSLATIONS = {
+    '设置图片列': 'Set Image Column',
+    '设置图片列前缀...': 'Set Image Column Prefix...',
+    '图片/视频文件夹前缀（可选，留空不添加）：\n例如 /Users/me/media；单元格中的完整路径不受影响。': 'Image/video folder prefix (optional; leave blank for none):\nFor example /Users/me/media. Absolute paths in cells are used as-is.',
+    '播放': 'Play',
+    '暂停': 'Pause',
+    '打开视频': 'Open Video',
+    '▶ 视频': '▶ Video',
+    '无法播放视频: {}': 'Unable to play video: {}',
 
     # ==== main_window ====
     '文件': 'File',

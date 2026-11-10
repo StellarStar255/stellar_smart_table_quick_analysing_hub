@@ -141,6 +141,7 @@ from .find_dialog import FindReplaceDialog
 from .sort_dialog import SortDialog
 from .image_panel import ImagePreviewPanel
 from qtui.i18n import tr
+from qtui.image_utils import is_video, resolve_media_path
 
 # 背景色选项（与 Tkinter 版一致的六色 + 清除）
 CELL_COLORS = [
@@ -1068,6 +1069,7 @@ class MainWindow(QMainWindow):
         self._filters_touched = set()
         self._filter_scan_pending = set()   # 还没读过文件里筛选的 sheet
         self.image_columns = set()       # 标记为图片列的列名
+        self.image_prefixes = {}         # 列名 -> 图片/视频路径前缀
         self._image_queue_win = None
         self._image_viewers = []
         self._lossy_confirmed = set()   # 已确认过"保存会丢失X"的文件
@@ -1726,6 +1728,7 @@ class MainWindow(QMainWindow):
         self._sheet_colors.clear()
         self.model.cell_colors.clear()
         self.image_columns = set()   # 先清图片列，modelReset 触发的面板同步才不会沿用旧列
+        self.image_prefixes = {}
         self.model.set_dataframe(df)
         self._reset_history()
         self._filters_touched = set()
@@ -3029,6 +3032,8 @@ class MainWindow(QMainWindow):
                     f["col"] = new
             self._rebuild_filter_bar()
             self._save_file_config()   # 记忆的筛选条件跟着改列名
+        if old in self.image_prefixes:
+            self.image_prefixes[new] = self.image_prefixes.pop(old)
         if old in self.image_columns:
             self.image_columns.discard(old)
             self.image_columns.add(new)
@@ -3814,7 +3819,8 @@ class MainWindow(QMainWindow):
             if str(col) in self.image_columns:
                 active_col = str(col)
                 break
-        self.image_panel.set_context(self.model.df, active_col, self._base_image_dir())
+        self.image_panel.set_context(self.model.df, active_col, self._base_image_dir(),
+                                     self.image_prefixes.get(active_col, ""))
         self._active_image_col = active_col
         self._image_synced_df = self.model.df
         return active_col
@@ -3832,7 +3838,17 @@ class MainWindow(QMainWindow):
         if self._active_image_col:
             self.image_dock.show()
 
-    def _set_image_column(self, colname):
+    def _configure_image_column(self, colname):
+        prefix, ok = QInputDialog.getText(
+            self, tr("设置图片列"),
+            tr("图片/视频文件夹前缀（可选，留空不添加）：\n例如 /Users/me/media；单元格中的完整路径不受影响。"),
+            text=self.image_prefixes.get(colname, ""))
+        if ok:
+            self._set_image_column(colname, prefix=prefix)
+
+    def _set_image_column(self, colname, prefix=None):
+        if prefix is not None:
+            self.image_prefixes[colname] = prefix.strip()
         self.image_columns = {colname}  # 与旧版一致：同时只有一个图片列
         self._update_image_context()
         self._save_file_config()
@@ -3852,6 +3868,8 @@ class MainWindow(QMainWindow):
 
     def open_image_viewer(self, path, new_window=None):
         """默认复用同一个查看器窗口（换图 + 置顶），Cmd/Ctrl+双击才另开一个用于对比。"""
+        if path == self.image_panel.video_view.path:
+            self.image_panel.video_view.player.pause()
         try:
             from .image_viewer import ImageViewer
         except Exception as e:
@@ -3930,11 +3948,9 @@ class MainWindow(QMainWindow):
         base = self._base_image_dir()
         paths = []
         for r in rows:
-            raw = str(self.model.df.iat[r, col_idx]).strip()
-            if not raw or raw.lower() in ("nan", "none"):
-                continue
-            p = raw if os.path.isabs(raw) else os.path.normpath(os.path.join(base, raw))
-            if os.path.exists(p):
+            p = resolve_media_path(self.model.df.iat[r, col_idx], base,
+                                   self.image_prefixes.get(colname, ""))
+            if p and not is_video(p):
                 paths.append(p)
         if not paths:
             QMessageBox.information(self, tr("图片队列"), tr("没有找到可用的图片路径"))
@@ -3955,6 +3971,10 @@ class MainWindow(QMainWindow):
             return
         entry = _file_config_entry(self.current_file)
         self.image_columns = set(entry.get("image_columns", []))
+        prefixes = entry.get("image_prefixes", {})
+        self.image_prefixes = ({k: v for k, v in prefixes.items()
+                                if isinstance(k, str) and isinstance(v, str)}
+                               if isinstance(prefixes, dict) else {})
 
     # 筛选条件随文件记忆：按 sheet 存（CSV 等单表文件用空串作键）。
     # 只是视图状态，写在侧车配置里，不改动文件内容
@@ -4079,6 +4099,7 @@ class MainWindow(QMainWindow):
                     cfg = json.load(f)
             cfg[os.path.abspath(self.current_file)] = {
                 "image_columns": sorted(self.image_columns),
+                "image_prefixes": dict(self.image_prefixes),
                 "last_sheet": self.current_sheet,
                 "filters": self._filters_snapshot()}
             os.makedirs(os.path.dirname(FILE_CONFIG_PATH), exist_ok=True)
@@ -4155,9 +4176,10 @@ class MainWindow(QMainWindow):
         if is_image_col and index is not None:
             menu.addAction(tr("查看图片"), lambda: self._view_cell_image(index))
         if is_image_col:
+            menu.addAction(tr("设置图片列前缀..."), lambda: self._configure_image_column(colname))
             menu.addAction(tr("取消图片列"), lambda: self._unset_image_column(colname))
         else:
-            menu.addAction(tr("设为图片列"), lambda: self._set_image_column(colname))
+            menu.addAction(tr("设为图片列"), lambda: self._configure_image_column(colname))
         menu.addAction(tr("图片队列复制..."), lambda: self._open_image_queue(
             colname if is_image_col else None))
 
@@ -4202,11 +4224,13 @@ class MainWindow(QMainWindow):
         raw = str(self.model.df.iat[index.row() - HEADER_ROWS, index.column()]).strip()
         if not raw or raw.lower() in ("nan", "none"):
             return
-        path = raw if os.path.isabs(raw) else os.path.normpath(
-            os.path.join(self._base_image_dir(), raw))
-        if os.path.exists(path):
+        colname = str(self.model.df.columns[index.column()])
+        prefix = self.image_prefixes.get(colname, "")
+        path = resolve_media_path(raw, self._base_image_dir(), prefix)
+        if path:
             self.open_image_viewer(path)
         else:
+            path = resolve_media_path(raw, self._base_image_dir(), prefix, must_exist=False)
             QMessageBox.warning(self, tr("查看图片"), tr("图片不存在:\n{}").format(path))
 
     def copy_selection_transposed(self):
