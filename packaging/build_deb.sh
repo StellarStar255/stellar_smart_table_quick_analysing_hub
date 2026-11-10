@@ -51,7 +51,7 @@ Priority: optional
 Architecture: $ARCH
 Installed-Size: $INSTALLED_SIZE
 Maintainer: StellarStar255 <goosehuangmatt@gmail.com>
-Depends: libxcb-cursor0 | libxcb-cursor-dev, policykit-1
+Depends: libxcb-cursor0 | libxcb-cursor-dev, libpulse0, policykit-1
 Description: Smart Table Hub - 智能表格快速分析工具
  基于 PyQt6 的 Excel/CSV 表格查看、编辑与快速分析工具，
  内置公式引擎与 Python 数据分析能力。

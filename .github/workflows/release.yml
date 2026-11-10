@@ -41,7 +41,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-14        # Apple Silicon
+          - runner: macos-15        # Apple Silicon（macos-14 已于 2026-11-02 下线）
             arch: arm64
           - runner: macos-15-intel  # Intel（macos-13 已于 2025-12 下线）
             arch: x86_64
@@ -108,7 +108,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libxcb-cursor0
+          sudo apt-get install -y libegl1 libxcb-cursor0 libpulse0
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt pyinstaller
       - name: Build deb
