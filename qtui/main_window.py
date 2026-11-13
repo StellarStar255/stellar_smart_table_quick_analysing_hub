@@ -3890,10 +3890,12 @@ class MainWindow(QMainWindow):
             self.image_dock.show()
 
     def _configure_image_column(self, colname):
+        default_prefix = (os.path.dirname(os.path.abspath(self.current_file))
+                          if self.current_file else "")
         prefix, ok = QInputDialog.getText(
             self, tr("设置图片列"),
-            tr("图片/视频文件夹前缀（可选，留空不添加）：\n例如 /Users/me/media；单元格中的完整路径不受影响。"),
-            text=self.image_prefixes.get(colname, ""))
+            tr("图片/视频文件夹前缀（可选，清空则不添加）：\n默认使用当前表格所在文件夹，可修改；末尾有无 / 均可。\n单元格中的完整路径不受影响。"),
+            text=self.image_prefixes.get(colname, default_prefix))
         if ok:
             self._set_image_column(colname, prefix=prefix)
 

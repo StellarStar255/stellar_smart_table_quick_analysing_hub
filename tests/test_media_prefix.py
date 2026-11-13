@@ -28,9 +28,10 @@ def media(tmp_path):
 
 
 @pytest.mark.parametrize("relative_prefix", [True, False])
-def test_prefix_resolves_images_and_videos(media, tmp_path, relative_prefix):
+@pytest.mark.parametrize("trailing_slash", ["", "/"])
+def test_prefix_resolves_images_and_videos(media, tmp_path, relative_prefix, trailing_slash):
     folder, image, video = media
-    prefix = folder.name if relative_prefix else str(folder)
+    prefix = (folder.name if relative_prefix else str(folder)) + trailing_slash
     assert resolve_media_path(image.name, str(tmp_path), prefix) == str(image)
     assert resolve_media_path(video.name, str(tmp_path), prefix) == str(video)
     assert resolve_media_path(str(image), str(tmp_path), "wrong folder") == str(image)
@@ -100,6 +101,35 @@ def test_cancel_keeps_existing_setting_and_blank_clears_prefix(win, media, monke
     win._configure_image_column("media")
     assert win.image_prefixes["media"] == ""
     assert win.image_panel._path_prefix == ""
+
+
+@pytest.mark.parametrize("saved_prefix", [None, "", "/custom/media/"])
+def test_prefix_prompt_defaults_to_workbook_folder_and_preserves_choice(
+        win, tmp_path, monkeypatch, saved_prefix):
+    win.current_file = str(tmp_path / "index.xlsx")
+    if saved_prefix is not None:
+        win.image_prefixes["media"] = saved_prefix
+    expected = str(tmp_path) if saved_prefix is None else saved_prefix
+
+    def accept_default(*args, **kwargs):
+        assert kwargs["text"] == expected
+        return kwargs["text"], True
+
+    monkeypatch.setattr(QInputDialog, "getText", accept_default)
+    win._configure_image_column("media")
+    assert win.image_prefixes["media"] == expected
+
+
+def test_unsaved_table_has_no_default_prefix(win, monkeypatch):
+    win.current_file = None
+
+    def accept_default(*args, **kwargs):
+        assert kwargs["text"] == ""
+        return "", True
+
+    monkeypatch.setattr(QInputDialog, "getText", accept_default)
+    win._configure_image_column("media")
+    assert win.image_prefixes["media"] == ""
 
 
 def test_cell_viewer_and_copy_queue_use_same_prefix(win, media, monkeypatch):

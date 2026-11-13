@@ -15,7 +15,7 @@ TRANSLATIONS = {
     '隐藏缩略图': 'Hide Thumbnails',
     '设置图片列': 'Set Image Column',
     '设置图片列前缀...': 'Set Image Column Prefix...',
-    '图片/视频文件夹前缀（可选，留空不添加）：\n例如 /Users/me/media；单元格中的完整路径不受影响。': 'Image/video folder prefix (optional; leave blank for none):\nFor example /Users/me/media. Absolute paths in cells are used as-is.',
+    '图片/视频文件夹前缀（可选，清空则不添加）：\n默认使用当前表格所在文件夹，可修改；末尾有无 / 均可。\n单元格中的完整路径不受影响。': 'Image/video folder prefix (optional; clear for none):\nDefaults to the current spreadsheet folder; edit as needed, with or without a trailing /.\nAbsolute paths in cells are used as-is.',
     '播放': 'Play',
     '暂停': 'Pause',
     '打开视频': 'Open Video',
