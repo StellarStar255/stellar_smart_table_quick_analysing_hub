@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -23,7 +24,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libfontconfig1 libglib2.0-0 libdbus-1-3 libxkbcommon0 libpulse0
+            libegl1 libgl1 libfontconfig1 libglib2.0-0 libdbus-1-3 libxkbcommon0 libpulse0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libxkbcommon-x11-0 libxcb-randr0 libxcb-xfixes0 xvfb xauth
 
       - name: 安装依赖
         run: |
@@ -32,3 +36,18 @@ jobs:
 
       - name: 运行测试
         run: python3 -m pytest tests/ -v
+
+      - name: Linux X11 navigator layout and visual regression
+        env:
+          QT_QPA_PLATFORM: xcb
+        run: |
+          xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_navigator_layout.py --output-dir "${{ runner.temp }}/navigator-layout/scale-1"
+          QT_SCALE_FACTOR=1.5 xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_navigator_layout.py --output-dir "${{ runner.temp }}/navigator-layout/scale-1.5"
+
+      - name: Upload navigator screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: navigator-layout-linux
+          path: ${{ runner.temp }}/navigator-layout/**/*.png
+          if-no-files-found: ignore

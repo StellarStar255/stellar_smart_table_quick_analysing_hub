@@ -43,6 +43,7 @@ python smart_table_quick_analysing_hub.py -h
 Latest release: [v1.16.6 — Multiple windows and shared navigation](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.6).
 
 - **Independent spreadsheet windows**: Open several files at once using the file picker, drag and drop, or command-line paths. Each document keeps its own edits, undo history, filters and previews. The Window Navigator lists all open documents; click to switch, close a selected window, or use Float Navigator / Dock Navigator. Reopen a hidden navigator from View → Window Navigator. Opening the same file again activates its existing window.
+  - The embedded navigator has its own resizable sidebar beside the table. Each row shows a filename and its folder to distinguish identically named workbooks; hover for the full path. Use the top-right arrows to float/dock or hide the sidebar, and the bottom close button to close the selected document.
 - **Image and video columns**: Right-click a column header and choose "Set as Image Column" to preview local images or videos (including mixed columns). Videos have play/pause and seek controls; double-click to open a separate viewer. Relative paths resolve from the spreadsheet folder. Video format support depends on the available media codecs.
   - Videos show decoded preview frames before playback, including in the thumbnail strip. Mark multiple columns to compare the same row in vertically split panels; drag the divider to resize. Each panel shows its column name and keeps its own prefix. Thumbnail strips can be expanded individually.
   - Set an optional folder prefix when marking the column, or edit it later via "Set Image Column Prefix...". For example, prefix `/Users/me/media` plus cell `clip.mp4` opens `/Users/me/media/clip.mp4`. Absolute paths are used as-is; prefixes are remembered per file and column.
@@ -368,6 +369,7 @@ python smart_table_quick_analysing_hub.py -h
 
 ### 📊 文件操作
 - **多个独立窗口**：打开对话框支持多选，也可一次拖入多个文件，每个窗口独立编辑、撤销、筛选和预览。窗口导航列出全部已打开的文件，点击切换或关闭选中的窗口，可通过「悬浮导航 / 内嵌导航」切换模式；隐藏后从「视图 → 窗口导航」重新显示。同一文件重复打开时激活已有窗口。
+  - 内嵌导航在表格左侧独立占位，可拖动分隔条调宽。条目分两行显示文件名和目录，便于区分同名表格；悬停查看完整路径。右上角箭头用于切换悬浮/内嵌或收起，底部关闭按钮只关闭选中的文档窗口。
 - **多格式支持**: 打开和保存 .xlsx, .xls, .csv 文件
 - **智能编码**: 自动检测CSV文件编码（UTF-8, GBK, GB2312等）
 - **快速导入导出**: 一键导入/导出CSV文件

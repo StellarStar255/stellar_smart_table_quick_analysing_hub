@@ -1482,7 +1482,30 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.filter_bar)
         layout.addWidget(self.table, 1)
         layout.addWidget(self._build_sheet_bar())
-        self.setCentralWidget(central)
+        self.document_widget = central
+        if self.window_manager:
+            from .window_manager import Navigator
+            self.document_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+            self.document_splitter.setChildrenCollapsible(False)
+            self.document_splitter.setHandleWidth(5)
+            # An embedded child from construction; old floating dock geometry
+            # can never move this sidebar over the menu/toolbars/table.
+            self.navigator_panel = Navigator(self.window_manager, parent=self.document_splitter)
+            self.navigator_panel.setMaximumWidth(360)
+            self.document_splitter.addWidget(self.navigator_panel)
+            self.document_splitter.addWidget(central)
+            self.document_splitter.setStretchFactor(0, 0)
+            self.document_splitter.setStretchFactor(1, 1)
+            width = max(200, min(360, self._settings.value("navigator/width", 240, type=int)))
+            self.document_splitter.setSizes([width, max(400, self.width() - width)])
+            self.document_splitter.splitterMoved.connect(self._save_navigator_width)
+            self.setCentralWidget(self.document_splitter)
+        else:
+            self.setCentralWidget(central)
+
+    def _save_navigator_width(self, *_):
+        if self.navigator_panel.isVisible():
+            self._settings.setValue("navigator/width", self.navigator_panel.width())
 
     def _build_sheet_bar(self):
         """表格底部的 Excel 式 Sheet 标签栏：点击切换、双击重命名、拖拽排序、右键菜单。"""

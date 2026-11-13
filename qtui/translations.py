@@ -10,6 +10,11 @@
 
 TRANSLATIONS = {
     '窗口导航': 'Window Navigator',
+    '收起导航': 'Hide Navigator',
+    '收起导航（可从“视图 → 窗口导航”恢复）': 'Hide navigator (restore from View → Window Navigator)',
+    '关闭选中的窗口': 'Close Selected Window',
+    '* 表示未保存': '* means unsaved',
+    '尚未保存到文件': 'Not saved to a file yet',
     '已打开的表格（* 表示未保存）': 'Open spreadsheets (* means unsaved)',
     '新建窗口': 'New Window',
     '关闭窗口': 'Close Window',
