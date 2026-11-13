@@ -1259,8 +1259,7 @@ class MainWindow(QMainWindow):
         # 视图
         view_menu = menubar.addMenu(tr("视图"))
         if self.window_manager:
-            self._add_action(view_menu, tr("窗口导航"),
-                             lambda: self.window_manager.show_navigator(self))
+            view_menu.addAction(self.navigator_action)
             self._add_action(view_menu, tr("关闭窗口"), self.close, "Ctrl+Shift+W")
             view_menu.addSeparator()
         self._add_action(view_menu, tr("放大"), self.zoom_in, "Ctrl+=")
@@ -1427,6 +1426,17 @@ class MainWindow(QMainWindow):
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         self.addToolBar(tb)
+        if self.window_manager:
+            self.navigator_action = QAction(tr("窗口导航"), self)
+            self.navigator_action.setCheckable(True)
+            self.navigator_action.setShortcut(QKeySequence("Ctrl+Shift+L"))
+            self.navigator_action.setToolTip(tr("显示或隐藏窗口导航（Ctrl+Shift+L；macOS 为 Cmd+Shift+L）"))
+            self.navigator_action.triggered.connect(
+                lambda visible: self.window_manager.set_navigator_visible(self, visible))
+            # Put recovery before document actions, so it remains accessible
+            # even when a narrow toolbar overflows.
+            tb.addAction(self.navigator_action)
+            tb.addSeparator()
         self._add_toolbar_buttons(tb, (
             ("新建", self.new_file), ("打开", self.open_file_dialog),
             ("保存", self.save_file), ("保存为", self.save_as_copy),

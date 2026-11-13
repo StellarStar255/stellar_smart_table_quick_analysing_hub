@@ -10,6 +10,7 @@
 
 TRANSLATIONS = {
     '窗口导航': 'Window Navigator',
+    '显示或隐藏窗口导航（Ctrl+Shift+L；macOS 为 Cmd+Shift+L）': 'Show or hide Window Navigator (Ctrl+Shift+L; Cmd+Shift+L on macOS)',
     '收起导航': 'Hide Navigator',
     '收起导航（可从“视图 → 窗口导航”恢复）': 'Hide navigator (restore from View → Window Navigator)',
     '关闭选中的窗口': 'Close Selected Window',

@@ -231,3 +231,52 @@ def test_long_paths_do_not_expand_sidebar_and_rows_survive_refresh(manager, tmp_
     _assert_sidebar_layout(window)
     # Synthetic path is deliberately not a real workbook; do not persist it.
     window.current_file = None
+
+
+def test_toolbar_and_view_action_restore_collapsed_sidebar(manager):
+    window = manager.create_window()
+    _app.processEvents()
+    action = window.navigator_action
+    toolbar = window.findChild(QToolBar, "main_toolbar")
+    assert toolbar.actions()[0] is action
+    assert toolbar.widgetForAction(action).isVisible()
+    view_menu = next(a.menu() for a in window.menuBar().actions()
+                     if a.text() == main_window.tr("视图"))
+    assert action in view_menu.actions()
+    assert action.isChecked()
+    window.navigator_panel.hide_button.click()
+    _app.processEvents()
+    assert not action.isChecked()
+    action.trigger()
+    _app.processEvents()
+    assert action.isChecked()
+    _assert_sidebar_layout(window)
+    # Repeated toolbar/menu toggles share the same state and shortcut.
+    for _ in range(3):
+        action.trigger()
+        _app.processEvents()
+        assert not window.navigator_panel.isVisible()
+        assert not action.isChecked()
+        action.trigger()
+        _app.processEvents()
+        _assert_sidebar_layout(window)
+        assert action.isChecked()
+
+
+def test_closed_floating_navigator_reopens_from_any_document_toolbar(manager):
+    first = manager.create_window()
+    second = manager.create_window()
+    manager.set_floating(True)
+    _app.processEvents()
+    for _ in range(3):
+        assert first.navigator_action.isChecked()
+        assert second.navigator_action.isChecked()
+        assert manager.navigator.close()
+        _app.processEvents()
+        assert not first.navigator_action.isChecked()
+        assert not second.navigator_action.isChecked()
+        second.navigator_action.trigger()
+        _app.processEvents()
+        assert manager.navigator.isVisible()
+        assert first.navigator_action.isChecked()
+        assert second.navigator_action.isChecked()

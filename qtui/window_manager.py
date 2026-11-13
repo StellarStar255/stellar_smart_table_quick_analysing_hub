@@ -129,6 +129,14 @@ class Navigator(QWidget):
         if floating:
             self.resize(280, 420)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.manager.sync_navigator_actions()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.manager.sync_navigator_actions()
+
     def refresh(self):
         # Keep rows (and scroll position) when only titles/active markers change.
         windows = self.manager.windows
@@ -252,6 +260,24 @@ class WindowManager(QObject):
         for window in self.windows:
             if hasattr(window, "navigator_panel"):
                 window.navigator_panel.refresh()
+        self.sync_navigator_actions()
+
+    def sync_navigator_actions(self):
+        for window in self.windows:
+            action = getattr(window, "navigator_action", None)
+            if action is not None:
+                visible = (self.navigator.isVisible() if self.floating
+                           else window.navigator_panel.isVisible())
+                action.setChecked(visible)
+
+    def set_navigator_visible(self, window, visible):
+        if visible:
+            self.show_navigator(window)
+        elif self.floating:
+            self.navigator.hide()
+        else:
+            window.navigator_panel.hide()
+        self.sync_navigator_actions()
 
     def set_floating(self, floating):
         self.floating = floating
@@ -269,6 +295,7 @@ class WindowManager(QObject):
             self.navigator.raise_()
         else:
             window.navigator_panel.show()
+        self.sync_navigator_actions()
 
     def unregister(self, window):
         if window in self.windows:

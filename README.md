@@ -40,7 +40,7 @@ python smart_table_quick_analysing_hub.py -h
 
 ## Features
 
-Latest release: [v1.16.7 — Redesigned embedded window navigation](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.7).
+Latest release: [v1.16.8 — Restore navigation from the toolbar](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.8).
 
 - **Independent spreadsheet windows**: Open several files at once using the file picker, drag and drop, or command-line paths. Each document keeps its own edits, undo history, filters and previews. The Window Navigator lists all open documents; click to switch, close a selected window, or use Float Navigator / Dock Navigator. Reopen a hidden navigator from View → Window Navigator. Opening the same file again activates its existing window.
   - The embedded navigator has its own resizable sidebar beside the table. Each row shows a filename and its folder to distinguish identically named workbooks; hover for the full path. Use the top-right arrows to float/dock or hide the sidebar, and the bottom close button to close the selected document.
@@ -103,6 +103,7 @@ Latest release: [v1.16.7 — Redesigned embedded window navigation](https://gith
 **File Operations**
 - `Ctrl+N`: New file
 - `Ctrl+Shift+N`: New window
+- `Ctrl+Shift+L`: Show or hide Window Navigator (also available at the left of the toolbar)
 - `Ctrl+Shift+W`: Close window (checks unsaved changes)
 - `Ctrl+Q`: Quit all windows (stops if closing is cancelled)
 - `Ctrl+O`: Open file
@@ -361,7 +362,7 @@ python smart_table_quick_analysing_hub.py -h
 
 ## 功能特性
 
-最新版本：[v1.16.7 — 重做内嵌窗口导航](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.7)。
+最新版本：[v1.16.8 — 工具栏恢复窗口导航](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.8)。
 
 - **图片与视频列**：右键列头选择「设为图片列」，即可在右侧查看本地图片或视频，同一列可混放。视频支持播放、暂停和拖动进度，双击可打开独立查看窗口。相对路径以表格所在文件夹为基准，视频格式支持取决于可用的媒体解码器。
   - 视频在播放前会显示实际预览画面，缩略条也显示视频画面。可将多列同时设为图片列，在右侧上下分割的面板中核对同一行，拖动分隔条可调节高度。各面板标明列名，前缀独立保存；多列时可按需展开各自的缩略条。
@@ -424,6 +425,7 @@ python smart_table_quick_analysing_hub.py -h
 **文件操作**
 - `Ctrl+N`: 新建文件
 - `Ctrl+Shift+N`: 新建窗口
+- `Ctrl+Shift+L`: 显示/隐藏窗口导航（也可点击工具栏最左侧的「窗口导航」）
 - `Ctrl+Shift+W`: 关闭窗口（检查未保存修改）
 - `Ctrl+Q`: 退出全部窗口（取消关闭时停止退出）
 - `Ctrl+O`: 打开文件
