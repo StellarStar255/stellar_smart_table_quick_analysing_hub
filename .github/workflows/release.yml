@@ -12,6 +12,15 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source tag/ref to build (blank uses the selected ref)'
+        type: string
+        default: ''
+      notarize:
+        description: 'Notarize on CI (disable only when completing notarization locally before publishing)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -39,6 +48,7 @@ jobs:
     needs: [verify-tag]
     if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-15        # Apple Silicon（macos-14 已于 2026-11-02 下线）
@@ -51,6 +61,8 @@ jobs:
       HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -78,7 +90,7 @@ jobs:
             | sed 's/.*"\(.*\)"/\1/')
           echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
       - name: Setup notarization profile
-        if: ${{ env.HAS_APPLE_ID == 'true' }}
+        if: ${{ env.HAS_APPLE_ID == 'true' && (github.event_name != 'workflow_dispatch' || inputs.notarize) }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -102,6 +114,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -126,6 +140,8 @@ jobs:
       HAS_WIN_CERT: ${{ secrets.WIN_CERT_PFX != '' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -158,6 +174,12 @@ jobs:
     needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+      - name: Read release version
+        id: version
+        run: python3 -c 'from version import __version__; print("tag=v" + __version__)' >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -170,6 +192,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           files: artifacts/*
           generate_release_notes: true
           # 校验安装包与 SHA256SUMS 后再正式公开。
