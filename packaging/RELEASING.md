@@ -11,12 +11,35 @@
    git push origin main --tags
    ```
 
-3. GitHub Actions 自动构建并发布 Release，产物：
+3. GitHub Actions 自动构建并生成草稿 Release，产物：
    - `SmartTableHub-<ver>-macos-arm64.dmg`（Apple Silicon）
    - `SmartTableHub-<ver>-macos-x86_64.dmg`（Intel Mac）
    - `SmartTableHub-<ver>-linux-amd64.deb`
    - `SmartTableHub-<ver>-windows-x64-setup.exe`
    - `SHA256SUMS.txt`（一键升级的完整性校验依据）
+
+4. 等待各平台构建和 CI 测试通过，核对四个安装包与 `SHA256SUMS.txt`，
+   确认两个 Mac 包的签名和公证有效，填写发布说明后再公开草稿：
+
+   ```bash
+   gh release edit v1.0.1 --draft=false --latest
+   ```
+
+### CI 公证凭据失效时
+
+如 Apple 在 CI 中返回 `401 Invalid credentials`，可以使用本机已有的有效
+`notarytool` 钥匙串配置接替公证，不改写已推送的版本标签：
+
+```bash
+gh workflow run release.yml --ref main -f source_ref=v1.0.1 -f notarize=false
+```
+
+该运行仍用 CI 的 Developer ID 证书签名，并只生成草稿。下载两个 Mac DMG，
+分别用 `xcrun notarytool submit --keychain-profile notary --wait` 完成公证，
+再用 `xcrun stapler staple` 和 `xcrun stapler validate` 附加、验证公证票据。
+验证应用代码签名后，重新计算四个平台安装包的 SHA256，替换草稿中的两个
+Mac 包和校验清单，核对远端大小与 SHA256，再公开发布。不可直接公开尚未
+公证的恢复构建。不要把钥匙串中的凭据提取到命令、日志或仓库中。
 
 ## 一键升级原理
 
