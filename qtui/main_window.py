@@ -1040,8 +1040,9 @@ class _ExcelTableView(QTableView):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self, initial_file=None):
+    def __init__(self, initial_file=None, window_manager=None, restore_session=True):
         super().__init__()
+        self.window_manager = window_manager
         self.setWindowTitle("Smart Table Hub (PyQt)")
         self.resize(1400, 860)
 
@@ -1176,16 +1177,25 @@ class MainWindow(QMainWindow):
 
         self.new_file(confirm=False)
 
+        self._initial_load_timer = QTimer(self)
+        self._initial_load_timer.setSingleShot(True)
         if initial_file:
-            QTimer.singleShot(100, lambda: self.load_file(initial_file))
-        elif self.recent_files and os.path.exists(self.recent_files[0]):
+            self._initial_load_timer.timeout.connect(lambda: self.load_file(initial_file))
+            self._initial_load_timer.start(100)
+        elif restore_session and self.recent_files and os.path.exists(self.recent_files[0]):
             # 恢复上次会话（与 Tkinter 版行为一致）
-            QTimer.singleShot(100, lambda: self.load_file(self.recent_files[0]))
+            recent_path = self.recent_files[0]
+            self._initial_load_timer.timeout.connect(lambda: self.load_file(recent_path))
+            self._initial_load_timer.start(100)
 
         # ---------- 启动后静默检查更新 ----------
         from qtui.updater import UpdateManager
         self._update_manager = UpdateManager(self)
-        QTimer.singleShot(3000, lambda: self._update_manager.check(silent=True))
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setSingleShot(True)
+        self._update_check_timer.timeout.connect(lambda: self._update_manager.check(silent=True))
+        if window_manager is None or not window_manager.windows:
+            self._update_check_timer.start(3000)
 
     # ================= UI 构建 =================
 
@@ -1195,6 +1205,9 @@ class MainWindow(QMainWindow):
         # 文件
         file_menu = menubar.addMenu(tr("文件"))
         self._add_action(file_menu, tr("新建"), self.new_file, "Ctrl+N")
+        if self.window_manager:
+            self._add_action(file_menu, tr("新建窗口"),
+                             lambda: self.window_manager.create_window(), "Ctrl+Shift+N")
         self._add_action(file_menu, tr("打开..."), self.open_file_dialog, "Ctrl+O")
         self._recent_menu = file_menu.addMenu(tr("打开最近的文件"))
         self._rebuild_recent_menu()
@@ -1211,7 +1224,9 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, tr("导入CSV..."), self.import_csv)
         self._add_action(file_menu, tr("导出CSV..."), self.export_csv)
         file_menu.addSeparator()
-        self._add_action(file_menu, tr("退出"), self.close, "Ctrl+Q")
+        self._add_action(file_menu, tr("退出"),
+                         self.window_manager.close_all if self.window_manager else self.close,
+                         "Ctrl+Q")
 
         # 编辑
         edit_menu = menubar.addMenu(tr("编辑"))
@@ -1243,6 +1258,11 @@ class MainWindow(QMainWindow):
 
         # 视图
         view_menu = menubar.addMenu(tr("视图"))
+        if self.window_manager:
+            self._add_action(view_menu, tr("窗口导航"),
+                             lambda: self.window_manager.show_navigator(self))
+            self._add_action(view_menu, tr("关闭窗口"), self.close, "Ctrl+Shift+W")
+            view_menu.addSeparator()
         self._add_action(view_menu, tr("放大"), self.zoom_in, "Ctrl+=")
         self._add_action(view_menu, tr("缩小"), self.zoom_out, "Ctrl+-")
         self._add_action(view_menu, tr("重置缩放"), self.zoom_reset, "Ctrl+0")
@@ -1375,7 +1395,8 @@ class MainWindow(QMainWindow):
 
     def _restart_app(self):
         import subprocess
-        if not self.close():   # 用户在"未保存"提示里取消
+        closed = self.window_manager.close_all() if self.window_manager else self.close()
+        if not closed:   # 用户在"未保存"提示里取消
             return
         subprocess.Popen(self._restart_command(), start_new_session=True)
         QTimer.singleShot(0, QApplication.quit)
@@ -1723,6 +1744,8 @@ class MainWindow(QMainWindow):
     # ================= 文件操作 =================
 
     def new_file(self, confirm=True):
+        if confirm and self.window_manager:
+            return self.window_manager.create_window()
         self._flush_preview()   # 预览框里未落盘的编辑先写回当前表，再决定是否保存
         if confirm and not self._check_save_before_discard():
             return
@@ -1774,10 +1797,10 @@ class MainWindow(QMainWindow):
             self.update_statusbar(tr("已关闭 {}").format(name))
 
     def open_file_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self, tr("打开文件"), "",
             tr("支持的文件 (*.xlsx *.xls *.csv *.tsv *.txt);;Excel (*.xlsx *.xls);;CSV/TSV (*.csv *.tsv *.txt);;所有文件 (*)"))
-        if path:
+        for path in paths:
             self.load_file(path)
 
     def _file_has_coord_marker(self, path):
@@ -1787,7 +1810,9 @@ class MainWindow(QMainWindow):
             cache[path] = file_io.xlsx_has_coord_marker(path)
         return cache[path]
 
-    def load_file(self, path):
+    def load_file(self, path, _in_window=False):
+        if self.window_manager and not _in_window:
+            return self.window_manager.open_file(path, source=self)
         if not os.path.exists(path):
             QMessageBox.warning(self, tr("打开文件"), tr("文件不存在:\n{}").format(path))
             self.recent_files = [p for p in self.recent_files if p != path]
@@ -1985,6 +2010,12 @@ class MainWindow(QMainWindow):
 
     def _do_save(self, path, switch_to=True):
         """同步等待后台保存完成（进度框模态），返回是否成功。"""
+        if self.window_manager:
+            owner = self.window_manager.find_window(path)
+            if owner is not None and owner is not self:
+                QMessageBox.warning(self, tr("保存"),
+                                    tr("此文件已在另一个窗口打开，请在对应窗口中保存：\n{}").format(path))
+                return False
         text_format = _is_text_format(path)
         # 多 sheet 工作簿写成文本只是导出当前 sheet，文档本身不算已保存
         export_only = text_format and len(self.sheet_names) > 1
@@ -2164,6 +2195,10 @@ class MainWindow(QMainWindow):
     def _save_recent(self):
         try:
             file_io.save_recent_files(self.recent_files, self.auto_save_cb.isChecked())
+            if self.window_manager:
+                for window in self.window_manager.windows:
+                    window.recent_files = list(self.recent_files)
+                    window._rebuild_recent_menu()
         except OSError as e:
             print(f"保存最近文件记录失败: {e}")
 
@@ -4477,15 +4512,22 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
+        paths = []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path.lower().endswith(_OPENABLE_EXTS):
                 event.acceptProposedAction()
                 # 加载带模态进度框（嵌套事件循环），不能在拖放事件处理中直接跑：
                 # 让拖放先结束，下一轮事件循环再加载
-                QTimer.singleShot(0, lambda p=path: self.load_file(p))
-                return
+                paths.append(path)
+        if paths:
+            QTimer.singleShot(0, lambda: self._open_dropped_files(paths))
+            return
         QMessageBox.information(self, tr("拖拽打开"), tr("仅支持 Excel / CSV 文件"))
+
+    def _open_dropped_files(self, paths):
+        for path in paths:
+            self.load_file(path)
 
     # ================= 关闭 =================
 
@@ -4509,6 +4551,16 @@ class MainWindow(QMainWindow):
                 manager.shutdown()
             for panel in self._image_panels.values():
                 panel.shutdown()
+            self._auto_save_timer.stop()
+            self._update_check_timer.stop()
+            self._initial_load_timer.stop()
+            self._release_excel_file()
+            for viewer in self._image_viewers:
+                viewer.close()
+            if self._image_queue_win is not None:
+                self._image_queue_win.close()
+            if self.window_manager:
+                self.window_manager.unregister(self)
             event.accept()
         else:
             event.ignore()

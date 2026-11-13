@@ -40,6 +40,9 @@ python smart_table_quick_analysing_hub.py -h
 
 ## Features
 
+Latest release: [v1.16.6 — Multiple windows and shared navigation](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.6).
+
+- **Independent spreadsheet windows**: Open several files at once using the file picker, drag and drop, or command-line paths. Each document keeps its own edits, undo history, filters and previews. The Window Navigator lists all open documents; click to switch, close a selected window, or use Float Navigator / Dock Navigator. Reopen a hidden navigator from View → Window Navigator. Opening the same file again activates its existing window.
 - **Image and video columns**: Right-click a column header and choose "Set as Image Column" to preview local images or videos (including mixed columns). Videos have play/pause and seek controls; double-click to open a separate viewer. Relative paths resolve from the spreadsheet folder. Video format support depends on the available media codecs.
   - Videos show decoded preview frames before playback, including in the thumbnail strip. Mark multiple columns to compare the same row in vertically split panels; drag the divider to resize. Each panel shows its column name and keeps its own prefix. Thumbnail strips can be expanded individually.
   - Set an optional folder prefix when marking the column, or edit it later via "Set Image Column Prefix...". For example, prefix `/Users/me/media` plus cell `clip.mp4` opens `/Users/me/media/clip.mp4`. Absolute paths are used as-is; prefixes are remembered per file and column.
@@ -98,6 +101,9 @@ python smart_table_quick_analysing_hub.py -h
 
 **File Operations**
 - `Ctrl+N`: New file
+- `Ctrl+Shift+N`: New window
+- `Ctrl+Shift+W`: Close window (checks unsaved changes)
+- `Ctrl+Q`: Quit all windows (stops if closing is cancelled)
 - `Ctrl+O`: Open file
 - `Ctrl+S`: Save (switches to the new file after saving)
 - `Ctrl+Shift+S`: Save As a copy (keep editing the original file)
@@ -354,11 +360,14 @@ python smart_table_quick_analysing_hub.py -h
 
 ## 功能特性
 
+最新版本：[v1.16.6 — 多窗口与统一导航](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.6)。
+
 - **图片与视频列**：右键列头选择「设为图片列」，即可在右侧查看本地图片或视频，同一列可混放。视频支持播放、暂停和拖动进度，双击可打开独立查看窗口。相对路径以表格所在文件夹为基准，视频格式支持取决于可用的媒体解码器。
   - 视频在播放前会显示实际预览画面，缩略条也显示视频画面。可将多列同时设为图片列，在右侧上下分割的面板中核对同一行，拖动分隔条可调节高度。各面板标明列名，前缀独立保存；多列时可按需展开各自的缩略条。
   - 设置时可填写文件夹前缀，也可通过「设置图片列前缀...」修改。例如前缀 `/Users/me/media` 加单元格 `clip.mp4`，即可打开 `/Users/me/media/clip.mp4`。完整路径按原样使用，前缀按文件和列记忆。
 
 ### 📊 文件操作
+- **多个独立窗口**：打开对话框支持多选，也可一次拖入多个文件，每个窗口独立编辑、撤销、筛选和预览。窗口导航列出全部已打开的文件，点击切换或关闭选中的窗口，可通过「悬浮导航 / 内嵌导航」切换模式；隐藏后从「视图 → 窗口导航」重新显示。同一文件重复打开时激活已有窗口。
 - **多格式支持**: 打开和保存 .xlsx, .xls, .csv 文件
 - **智能编码**: 自动检测CSV文件编码（UTF-8, GBK, GB2312等）
 - **快速导入导出**: 一键导入/导出CSV文件
@@ -412,6 +421,9 @@ python smart_table_quick_analysing_hub.py -h
 
 **文件操作**
 - `Ctrl+N`: 新建文件
+- `Ctrl+Shift+N`: 新建窗口
+- `Ctrl+Shift+W`: 关闭窗口（检查未保存修改）
+- `Ctrl+Q`: 退出全部窗口（取消关闭时停止退出）
 - `Ctrl+O`: 打开文件
 - `Ctrl+S`: 保存文件（保存后切换到新文件）
 - `Ctrl+Shift+S`: 保存为副本（继续编辑原文件）

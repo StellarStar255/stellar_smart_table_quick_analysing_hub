@@ -29,10 +29,11 @@ if not getattr(sys, "frozen", False):
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(_plugin_root, "platforms")
 
 from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QEvent, QTimer
 from PyQt6.QtWidgets import QApplication
 
 from qtui.i18n import tr
-from qtui.main_window import MainWindow
+from qtui.window_manager import WindowManager
 from version import __version__, APP_NAME
 
 _BASE_DIR = (getattr(sys, "_MEIPASS", None)
@@ -42,6 +43,18 @@ ICON_PATH = os.path.join(_BASE_DIR, "assets",
 
 
 CRASH_LOG_PATH = os.path.expanduser("~/.smart_table_hub/crash.log")
+
+
+class TableApplication(QApplication):
+    """Handle Finder's Open Document events within the running application."""
+    def event(self, event):
+        if event.type() == QEvent.Type.FileOpen:
+            path = event.file()
+            if path:
+                QTimer.singleShot(0, lambda: self.window_manager.open_file(
+                    path, source=self.window_manager.active_window))
+                return True
+        return super().event(event)
 
 
 def _install_excepthook():
@@ -84,21 +97,24 @@ def _install_excepthook():
 
 def main():
     parser = argparse.ArgumentParser(description="Smart Table Hub (PyQt6)")
-    parser.add_argument("file", nargs="?", default=None,
+    parser.add_argument("file", nargs="*", default=[],
                         help=tr("启动时打开的文件"))
     parser.add_argument("-f", "--file", dest="file_opt", default=None,
                         help=tr("启动时打开的文件（与位置参数等效，兼容旧版入口）"))
     args = parser.parse_args()
-    initial_file = args.file_opt or args.file
+    initial_files = ([args.file_opt] if args.file_opt else []) + args.file
 
     _install_excepthook()
-    app = QApplication(sys.argv)
+    app = TableApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
-    window = MainWindow(initial_file=initial_file)
-    window.show()
+    manager = WindowManager(app)
+    app.window_manager = manager
+    window = manager.create_window(restore_session=not initial_files)
+    for path in initial_files:
+        manager.open_file(path, source=window)
     from qtui.onboarding_tour import should_show_onboarding
     if should_show_onboarding(window._settings):
         window.schedule_onboarding_tour(800)

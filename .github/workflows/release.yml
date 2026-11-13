@@ -172,4 +172,6 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          # 校验安装包与 SHA256SUMS 后再正式公开。
+          draft: true
           fail_on_unmatched_files: true

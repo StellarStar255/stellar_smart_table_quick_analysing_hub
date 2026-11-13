@@ -9,6 +9,13 @@
 """
 
 TRANSLATIONS = {
+    '窗口导航': 'Window Navigator',
+    '已打开的表格（* 表示未保存）': 'Open spreadsheets (* means unsaved)',
+    '新建窗口': 'New Window',
+    '关闭窗口': 'Close Window',
+    '内嵌导航': 'Dock Navigator',
+    '悬浮导航': 'Float Navigator',
+    '此文件已在另一个窗口打开，请在对应窗口中保存：\n{}': 'This file is open in another window. Save it from that window:\n{}',
     '正在生成视频预览…': 'Generating video preview…',
     '无法生成视频预览，可尝试播放': 'Video preview unavailable. Try playing the video.',
     '显示缩略图': 'Show Thumbnails',
