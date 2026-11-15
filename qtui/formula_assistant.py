@@ -7,11 +7,11 @@ from PyQt6.QtGui import QGuiApplication, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QPushButton, QDialog, QDialogButtonBox, QLineEdit,
-    QComboBox, QTextBrowser, QAbstractItemView, QPlainTextEdit,
+    QComboBox, QTextBrowser, QAbstractItemView, QPlainTextEdit, QWidget, QScrollArea,
 )
 from core.formula_help import (
-    FUNCTIONS, COMMON, PARAMS, CATEGORIES, local, search_functions,
-    completion_span, active_call, diagnose, reference_tokens,
+    FUNCTIONS, PARAMS, CATEGORIES, local, search_functions,
+    completion_span, completion_functions, active_call, diagnose, reference_tokens,
 )
 
 REFERENCE_COLORS = ('#2674d9', '#c05a24', '#9b45b6', '#168568', '#bd4775', '#7772b8')
@@ -123,13 +123,24 @@ class FormulaAssistant(QObject):
         self.diagnostic = None
         self.forced = False
         self.span = None
-        self.panel = QFrame(view.window(), Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        # A normal child overlay has no native tooltip timeout or activation
+        # behavior. It stays with this document instead of another app window.
+        self.panel = QFrame(view.window())
         self.panel.setObjectName('formula_assistant')
         self.panel.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.panel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.panel.setFrameShape(QFrame.Shape.StyledPanel)
         self.panel.setStyleSheet('QFrame#formula_assistant { background: palette(base); border: 1px solid palette(mid); border-radius: 5px; }')
-        layout = QVBoxLayout(self.panel)
+        self.body = QWidget(self.panel)
+        layout = QVBoxLayout(self.body)
+        self.scroll = QScrollArea(self.panel)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.body)
+        outer = QVBoxLayout(self.panel)
+        outer.setContentsMargins(1, 1, 1, 1)
+        outer.addWidget(self.scroll)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(5)
         self.list = QListWidget()
@@ -164,13 +175,18 @@ class FormulaAssistant(QObject):
         self.list.itemClicked.connect(self.accept_completion)
         self.list.currentItemChanged.connect(self.show_candidate)
         self.editor.textChanged.connect(self.on_text)
-        self.editor.cursorPositionChanged.connect(self.refresh)
+        self.editor.cursorPositionChanged.connect(self.queue_refresh)
         self.editor.installEventFilter(self)
+        self.view.window().installEventFilter(self)
+        self.view.viewport().installEventFilter(self)
         self.editor.destroyed.connect(self.panel.deleteLater)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.refresh)
+
+    def queue_refresh(self, *_):
+        self.timer.start()
 
     def on_text(self, *_):
         self.suppressed = False
@@ -207,13 +223,14 @@ class FormulaAssistant(QObject):
         old_name = self.list.currentItem().data(Qt.ItemDataRole.UserRole) if self.list.currentItem() else None
         self.list.blockSignals(True)
         self.list.clear()
+        correction = False
         if self.span and not self.forced:
             query = self.span[2]
-            specs = search_functions(query) if query else [FUNCTIONS[n] for n in COMMON]
-            # Formula identifiers use prefix matching; the library searches uses.
-            specs = [s for s in specs if not query or not query.isascii() or s.name.startswith(query.upper())]
+            specs, correction = completion_functions(query)
             for spec in specs:
                 item = QListWidgetItem(f'{spec.name}    {spec.description}')
+                if correction:
+                    item.setText(item.text() + local(' · 拼写建议', ' · Spelling suggestion'))
                 item.setData(Qt.ItemDataRole.UserRole, spec.name)
                 self.list.addItem(item)
             row = next((i for i in range(self.list.count()) if self.list.item(i).data(Qt.ItemDataRole.UserRole) == old_name), 0)
@@ -230,7 +247,11 @@ class FormulaAssistant(QObject):
             self.help.setText(spec_html(FUNCTIONS[active[0].name], active[1]))
         elif text.strip() == '=':
             self.help.setText(local('选择函数，或输入单元格与运算符，例如 =B2*C2。', 'Choose a function or enter references and operators, e.g. =B2*C2.'))
-        self.diagnostic = diagnose(text, final=self.forced)
+        else:
+            self.help.setText(local('正在编辑公式 · 可输入函数名，或点选/拖选表格插入引用。<br>Tab 接受候选，Enter 检查并提交。',
+                                    'Editing formula · Type a function or click/drag cells to insert a reference.<br>Tab accepts a suggestion; Enter checks and commits.'))
+        partial_name = self.span and self.list.count() and not correction
+        self.diagnostic = diagnose(text, final=self.forced or not partial_name)
         d = self.diagnostic
         self.problem.setText(('⚠ ' if d and (self.forced or not d.incomplete) else '') + d.message if d else '')
         if d and self.forced:
@@ -248,18 +269,32 @@ class FormulaAssistant(QObject):
             return
         self.position()
         self.panel.show()
+        self.panel.raise_()
 
     def position(self):
+        host = self.editor.window()
+        if self.panel.parentWidget() is not host:
+            self.panel.setParent(host)
+            host.installEventFilter(self)
         screen = self.editor.screen() or QGuiApplication.primaryScreen()
-        bounds = screen.availableGeometry()
-        width = min(460, max(240, self.view.window().width() - 24), bounds.width() - 16)
+        bounds = host.rect()
+        width = min(460, max(200, bounds.width() - 16), screen.availableGeometry().width() - 16)
         self.panel.setFixedWidth(width)
-        self.panel.adjustSize()
-        origin = self.editor.mapToGlobal(QPoint(0, self.editor.height() + 4))
+        self.body.setMinimumWidth(max(160, width - 24))
+        self.body.layout().activate()
+        desired_height = self.body.layout().sizeHint().height() + 4
+        origin = host.mapFromGlobal(self.editor.mapToGlobal(QPoint(0, self.editor.height() + 4)))
         x = max(bounds.left() + 4, min(origin.x(), bounds.right() - width - 4))
-        y = origin.y()
-        if y + self.panel.height() > bounds.bottom() - 4:
-            y = self.editor.mapToGlobal(QPoint(0, 0)).y() - self.panel.height() - 4
+        editor_top = host.mapFromGlobal(self.editor.mapToGlobal(QPoint(0, 0))).y()
+        below = bounds.bottom() - origin.y() - 4
+        above = editor_top - bounds.top() - 8
+        if below >= desired_height or below >= above:
+            height = min(desired_height, max(64, below))
+            y = origin.y()
+        else:
+            height = min(desired_height, max(64, above))
+            y = editor_top - height - 4
+        self.panel.setFixedHeight(height)
         self.panel.move(x, max(bounds.top() + 4, y))
 
     def show_candidate(self, item, previous=None):
@@ -277,6 +312,9 @@ class FormulaAssistant(QObject):
         self.refresh()
 
     def accept_completion(self, *_):
+        if self.timer.isActive():
+            self.timer.stop()
+            self.refresh()
         item = self.list.currentItem()
         if not item or not self.span:
             return
@@ -293,6 +331,9 @@ class FormulaAssistant(QObject):
         self.refresh()
 
     def apply_fix(self):
+        if self.timer.isActive():
+            self.timer.stop()
+            self.refresh()
         d = self.diagnostic
         if d and d.replacement is not None:
             self.replace(d.start, d.end, d.replacement)
@@ -350,6 +391,9 @@ class FormulaAssistant(QObject):
         mods = event.modifiers()
         if self.composing:
             return False
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Up, Qt.Key.Key_Down) and self.timer.isActive():
+            self.timer.stop()
+            self.refresh()
         if key == Qt.Key.Key_F1 and self.editor.text().startswith('='):
             self.open_library()
             return True
@@ -377,6 +421,12 @@ class FormulaAssistant(QObject):
         self.view.viewport().update()
 
     def eventFilter(self, obj, event):
+        if obj is not self.editor:
+            if event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.Hide):
+                self.hide()
+            elif event.type() in (QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.WindowActivate):
+                self.timer.start()
+            return False
         if event.type() == QEvent.Type.FocusIn:
             self.timer.start()
         elif event.type() == QEvent.Type.InputMethod:

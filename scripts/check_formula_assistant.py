@@ -95,6 +95,19 @@ with tempfile.TemporaryDirectory(prefix='table-formula-ui-') as temp:
         editor.formula_assistant.refresh()
         return editor, editor.formula_assistant
 
+    def type_formula(text):
+        close_editor()
+        w.activateWindow()
+        w.raise_()
+        w.table.setCurrentIndex(w.model.index(1, 3))
+        w.table.setFocus()
+        app.processEvents()
+        QTest.keyClicks(w.table, '=')
+        editor = w._cell_delegate.active_editor
+        QTest.keyClicks(editor, text[1:], delay=15)
+        QTest.qWait(180)
+        return editor, editor.formula_assistant
+
     try:
         for language in ('zh', 'en'):
             formula_help.current_language = lambda lang=language: lang
@@ -104,10 +117,13 @@ with tempfile.TemporaryDirectory(prefix='table-formula-ui-') as temp:
                     w.resize(width, height)
                     app.processEvents()
                     prefix = f'{language}-{theme}-{width}'
-                    editor, helper = edit('=SU')
+                    editor, helper = type_formula('=SU')
                     assert helper.list.count() == 3
                     assert helper.panel.isVisible()
-                    assert editor.screen().availableGeometry().contains(helper.panel.frameGeometry())
+                    assert w.rect().contains(helper.panel.geometry())
+                    assert not helper.panel.isWindow()
+                    QTest.qWait(150)
+                    assert helper.panel.isVisible() and editor.hasFocus()
                     helper.panel.grab().save(str(args.output_dir / f'{prefix}-completion.png'))
                     QTest.keyClick(editor, Qt.Key.Key_Tab)
                     assert editor.text() == '=SUM('
@@ -120,11 +136,14 @@ with tempfile.TemporaryDirectory(prefix='table-formula-ui-') as temp:
                     assert len(w.table._formula_reference_spans) == 2
                     helper.panel.grab().save(str(args.output_dir / f'{prefix}-arguments.png'))
                     w.grab().save(str(args.output_dir / f'{prefix}-references.png'))
-                    editor, helper = edit('=SUMM(B2:B5)')
-                    QTest.keyClick(editor, Qt.Key.Key_Return)
+                    editor, helper = type_formula('=SUMM')
+                    assert helper.panel.isVisible()
                     assert helper.diagnostic.code == 'function'
+                    assert helper.list.currentItem().data(Qt.ItemDataRole.UserRole) == 'SUM'
                     helper.panel.grab().save(str(args.output_dir / f'{prefix}-error.png'))
                     helper.apply_fix()
+                    assert editor.text() == '=SUM('
+                    editor.insert('B2:B5)')
                     QTest.keyClick(editor, Qt.Key.Key_Return)
                     assert w.model.formulas[(0, 3)] == '=SUM(B2:B5)'
                     close_editor()

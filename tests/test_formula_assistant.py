@@ -351,3 +351,93 @@ class TestReferenceEditing:
         assert editor.text() == '=SUM(A2)'
         assert win._cell_delegate.active_editor is editor
         assert win.model.formulas == {}
+
+
+class TestAutomaticPopup:
+    """Real key events and timer delivery, without calling helper.refresh()."""
+    def start_typing(self, win, text):
+        win.activateWindow()
+        win.table.setCurrentIndex(win.model.index(1, 2))
+        win.table.setFocus()
+        _app.processEvents()
+        QTest.keyClicks(win.table, '=')
+        editor = win._cell_delegate.active_editor
+        QTest.keyClicks(editor, text, delay=15)
+        QTest.qWait(180)
+        return editor, editor.formula_assistant
+
+    def test_prefix_automatically_opens_and_stays_open(self, win):
+        editor, helper = self.start_typing(win, 'SU')
+        assert helper.panel.isVisible() and helper.list.count() == 3
+        assert helper.panel.parentWidget() is win
+        assert not helper.panel.isWindow()
+        QTest.qWait(350)
+        assert helper.panel.isVisible() and editor.hasFocus()
+        QTest.keyClick(editor, Qt.Key.Key_Tab)
+        assert editor.text() == '=SUM('
+
+    def test_typo_before_parenthesis_shows_choices_and_fix(self, win):
+        editor, helper = self.start_typing(win, 'SUMM')
+        assert helper.panel.isVisible()
+        assert helper.list.currentItem().data(Qt.ItemDataRole.UserRole) == 'SUM'
+        assert helper.diagnostic.code == 'function'
+        assert helper.fix.isVisible()
+        helper.apply_fix()
+        assert editor.text() == '=SUM('
+        assert not win.model.formulas
+
+    def test_typo_can_be_corrected_with_tab_without_enter(self, win):
+        editor, helper = self.start_typing(win, 'SUMM')
+        QTest.keyClick(editor, Qt.Key.Key_Tab)
+        assert editor.text() == '=SUM('
+        assert win._cell_delegate.active_editor is editor
+
+    def test_live_syntax_problem_without_enter(self, win):
+        editor, helper = self.start_typing(win, 'A2+*B2')
+        assert helper.panel.isVisible()
+        assert helper.diagnostic.code == 'syntax'
+        assert helper.problem.isVisible()
+        assert not win.model.formulas
+
+    def test_arithmetic_input_keeps_guidance_visible(self, win):
+        editor, helper = self.start_typing(win, 'A2+B2')
+        assert helper.panel.isVisible()
+        assert helper.help.text()
+        assert helper.diagnostic is None
+
+    def test_partial_function_name_is_not_an_error(self, win):
+        editor, helper = self.start_typing(win, 'SU')
+        assert helper.diagnostic is None
+
+    def test_overlay_stays_in_narrow_window_and_clear_of_editor(self, win):
+        win.resize(560, 460)
+        editor, helper = self.start_typing(win, 'SU')
+        assert win.rect().contains(helper.panel.geometry())
+        editor_rect = editor.geometry()
+        editor_rect.moveTopLeft(editor.mapTo(win, QPoint(0, 0)))
+        assert not helper.panel.geometry().intersects(editor_rect)
+
+    def test_preview_automatically_shows_typo_suggestions(self, win):
+        win.table.setCurrentIndex(win.model.index(1, 2))
+        preview = win.cell_preview_text
+        preview.setFocus()
+        preview.selectAll()
+        QTest.keyClicks(preview, '=SUMM', delay=15)
+        QTest.qWait(180)
+        helper = preview.formula_assistant
+        assert helper.panel.isVisible()
+        assert helper.list.count() > 0
+        assert helper.diagnostic.code == 'function'
+
+    def test_fast_typing_then_tab_uses_current_prefix(self, win):
+        win.activateWindow()
+        win.table.setCurrentIndex(win.model.index(1, 2))
+        win.table.setFocus()
+        _app.processEvents()
+        QTest.keyClicks(win.table, '=')
+        editor = win._cell_delegate.active_editor
+        QTest.keyClicks(editor, 'SUMIF')
+        # No event-loop wait: the debounce timer has not refreshed the list.
+        QTest.keyClick(editor, Qt.Key.Key_Tab)
+        assert editor.text() == '=SUMIF('
+        assert not win.model.formulas

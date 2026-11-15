@@ -160,6 +160,20 @@ def search_functions(query='', category=None):
     return sorted(specs, key=lambda s: (not s.name.casefold().startswith(q), s.name))
 
 
+def completion_functions(query):
+    """Prefix matches first; spelling suggestions remain explicit choices."""
+    if not query:
+        return [FUNCTIONS[name] for name in COMMON], False
+    if not query.isascii():
+        return search_functions(query), False
+    matches = [spec for spec in search_functions(query)
+               if spec.name.startswith(query.upper())]
+    if matches:
+        return matches, False
+    names = difflib.get_close_matches(query.upper(), FUNCTIONS, n=5, cutoff=.6)
+    return [FUNCTIONS[name] for name in names], bool(names)
+
+
 @dataclass(frozen=True)
 class Token:
     kind: str
@@ -328,6 +342,19 @@ def diagnose(text, final=False):
             if not valid_pairs:
                 msg += local(' 条件区域与条件必须成对填写。', ' Criteria ranges and criteria must be paired.')
             return Diagnostic('arguments', msg, c.start, c.end)
+    # A misspelled name needs guidance before the user types "(". Partial
+    # prefixes (SU) and references (A2) are normal input, not errors.
+    significant = [t for t in ts if t.kind != 'space']
+    if significant and significant[-1].kind == 'name':
+        t = significant[-1]
+        name = t.text.upper()
+        if (len(name) >= 3 and name not in ('TRUE', 'FALSE')
+                and not any(n.startswith(name) for n in FUNCTIONS)):
+            candidates, correction = completion_functions(name)
+            if correction:
+                suggested = candidates[0].name
+                return Diagnostic('function', local('未识别函数 {}，是否想输入 {}？', 'Unknown function {}; did you mean {}?').format(t.text, suggested),
+                                  t.start, t.end, suggested + '(')
     if stack:
         return Diagnostic('parenthesis', local('公式还缺少 {} 个右括号。', '{} closing parentheses still needed.').format(len(stack)), len(text), len(text), ')' * len(stack), True)
     if not final:
