@@ -142,7 +142,7 @@ class FloatingImageQueue(QWidget):
         self.preview_label.setFixedSize(_PREVIEW_MAX_W, _PREVIEW_MAX_H)
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet(
-            "background: #e9ecef; border: 1px solid #adb5bd; color: #666;")
+            "background: palette(base); border: 1px solid palette(mid); color: palette(placeholder-text);")
         self.preview_label.doubleClicked.connect(self._open_viewer)
         layout.addWidget(self.preview_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
@@ -162,13 +162,13 @@ class FloatingImageQueue(QWidget):
 
         # 文件名
         self.filename_label = QLabel("")
-        self.filename_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.filename_label.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
         self.filename_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.filename_label)
 
         # 状态反馈
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #28a745; font-size: 11px;")
+        self.status_label.setStyleSheet("color: palette(link); font-size: 11px;")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.status_label)
 

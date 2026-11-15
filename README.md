@@ -41,8 +41,9 @@ python smart_table_quick_analysing_hub.py -h
 
 ## Features
 
-Latest release: [v1.16.10 — Formula bar and argument wizard](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.10).
+Latest release: [v1.16.11 — Themes and control skins](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.11).
 
+- **Themes and control skins**: View → Appearance offers Follow system plus Deep blue, Night purple, Amber, Midnight, Light and Pink, matching Stellar Smart Terminal. Combine any theme with Standard, Rounded or Compact controls. Changes apply immediately across document windows and dialogs, and are remembered at restart. Compact mode reduces row spacing while respecting zoom. Formula hints, reference colors and Python syntax adapt to the background; workbook cell fills, data and undo history are preserved. 中文入口：视图 → 外观 → 主题 / 控件皮肤。
 - **Independent spreadsheet windows**: Open several files at once using the file picker, drag and drop, or command-line paths. Each document keeps its own edits, undo history, filters and previews. The Window Navigator lists all open documents; click to switch, close a selected window, or use Float Navigator / Dock Navigator. Reopen a hidden navigator from View → Window Navigator. Opening the same file again activates its existing window.
   - The embedded navigator has its own resizable sidebar beside the table. Each row shows a filename and its folder to distinguish identically named workbooks; hover for the full path. Use the top-right arrows to float/dock or hide the sidebar, and the bottom close button to close the selected document.
 - **Image and video columns**: Right-click a column header and choose "Set as Image Column" to preview local images or videos (including mixed columns). Videos have play/pause and seek controls; double-click to open a separate viewer. Relative paths resolve from the spreadsheet folder. Video format support depends on the available media codecs.

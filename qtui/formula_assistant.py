@@ -126,6 +126,9 @@ class FormulaAssistant(QObject):
         # A normal child overlay has no native tooltip timeout or activation
         # behavior. It stays with this document instead of another app window.
         self.panel = QFrame(view.window())
+        # It belongs to the window rather than the editor/dock. Start explicitly
+        # hidden so showing a window cannot expose an inactive editor's panel.
+        self.panel.hide()
         self.panel.setObjectName('formula_assistant')
         self.panel.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.panel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -201,9 +204,11 @@ class FormulaAssistant(QObject):
             self.view._formula_reference_spans = []
         refs = reference_tokens(self.editor.text()) if self.editor.text().startswith('=') else []
         colors = {}
+        from .themes import readable
+        background = self.editor.palette().base().color()
         for t in refs:
             key = t.text.upper().replace('$', '')
-            colors.setdefault(key, REFERENCE_COLORS[len(colors) % len(REFERENCE_COLORS)])
+            colors.setdefault(key, readable(REFERENCE_COLORS[len(colors) % len(REFERENCE_COLORS)], background).name())
         self.view._formula_reference_spans = [(t.text, colors[t.text.upper().replace('$', '')]) for t in refs]
         self.view.viewport().update()
 

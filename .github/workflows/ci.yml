@@ -69,3 +69,14 @@ jobs:
           name: formula-assistant-linux
           path: ${{ runner.temp }}/formula-assistant/**/*.png
           if-no-files-found: ignore
+
+      - name: Linux X11 themes and skins regression
+        run: xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_themes.py --platform xcb --output-dir "${{ runner.temp }}/themes"
+
+      - name: Upload theme screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: themes-linux
+          path: ${{ runner.temp }}/themes
+          if-no-files-found: ignore

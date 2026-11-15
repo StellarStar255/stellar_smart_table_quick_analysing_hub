@@ -103,6 +103,25 @@ def run(output_dir):
             assert not wb.resolve_pending()
             assert answered and wb.dirty and window.model.formulas[(0, 2)] == '=A2+1'
             report['checks'].append('unfinished draft confirmation preserves previous value')
+            from .themes import THEMES, SKINS, theme_palette
+            before = (window.model.df.copy(deep=True), dict(window.model.formulas),
+                      dict(window.model.cell_colors), len(window.model._undo_stack))
+            for theme in THEMES:
+                window._theme_actions[theme].trigger()
+                for skin in SKINS:
+                    window._skin_actions[skin].trigger()
+                    app.processEvents()
+                    assert window.appearance.theme == theme and window.appearance.skin == skin
+                    assert window.table.palette().base().color() == theme_palette(theme).base().color()
+                    assert wb.dirty and wb.edit.text() == '=SUM('
+                    pd.testing.assert_frame_equal(window.model.df, before[0])
+                    assert (window.model.formulas, window.model.cell_colors, len(window.model._undo_stack)) == before[1:]
+                    assert not window.cell_preview_text.formula_assistant.panel.isVisible()
+                if theme in ('light', 'purple'):
+                    window.grab().save(str(output / ('packaged-theme-' + theme + '.png')))
+            window.appearance.set_theme('system')
+            window.appearance.set_skin('standard')
+            report['checks'].append('18 theme/skin combinations preserve draft, data, formatting and undo')
             report['status'] = 'passed'
             print('PASS packaged formula UI:', json.dumps(report, ensure_ascii=False))
             return 0

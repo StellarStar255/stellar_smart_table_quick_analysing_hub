@@ -329,7 +329,7 @@ class AiSettingsDialog(QDialog):
             note_text = tr("Key 明文保存在本机应用设置里，只用于本功能。生成时只发送列名、类型和少量样例值，不上传整张表。")
         note = QLabel(note_text)
         note.setWordWrap(True)
-        note.setStyleSheet("color: gray;")
+        note.setStyleSheet("color: palette(placeholder-text);")
         lay.addWidget(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                    | QDialogButtonBox.StandardButton.Cancel)
@@ -379,7 +379,7 @@ class AiGenerateDialog(QDialog):
         else:
             self.fix_cb = None
         self.status = QLabel("")
-        self.status.setStyleSheet("color: gray;")
+        self.status.setStyleSheet("color: palette(placeholder-text);")
         lay.addWidget(self.status)
         row = QHBoxLayout()
         row.addStretch(1)

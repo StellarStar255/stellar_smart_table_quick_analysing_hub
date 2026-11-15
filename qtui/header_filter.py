@@ -332,7 +332,7 @@ class ColumnFilterPopup(QDialog):
         self.setSizeGripEnabled(False)
         # Popup 没有标题栏，自己画个边框，否则和表格糊成一片
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("ColumnFilterPopup { border: 1px solid #808080;"
+        self.setStyleSheet("ColumnFilterPopup { border: 1px solid palette(mid);"
                            " background: palette(window); }")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -386,7 +386,7 @@ class ColumnFilterPopup(QDialog):
 
         if self._truncated:
             hint = QLabel(tr("值太多，仅列出前 {} 个").format(MAX_VALUES))
-            hint.setStyleSheet("color: gray; font-size: 11px;")
+            hint.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
             layout.addWidget(hint)
 
         btn_row = QHBoxLayout()

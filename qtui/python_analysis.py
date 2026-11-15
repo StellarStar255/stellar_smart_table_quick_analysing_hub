@@ -321,10 +321,15 @@ class PythonHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document):
         super().__init__(document)
+        self.apply_palette()
+
+    def apply_palette(self):
+        from .themes import readable
+        background = QApplication.palette().base().color()
 
         def fmt(color, bold=False, italic=False):
             f = QTextCharFormat()
-            f.setForeground(QColor(color))
+            f.setForeground(readable(color, background))
             if bold:
                 f.setFontWeight(QFont.Weight.Bold)
             if italic:
@@ -1310,7 +1315,7 @@ class FigureGallery(QScrollArea):
                                 "预设里的 save_figure(fig, '文件名.png') 会同时保存文件；"
                                 "只想看不想存用 show_figure(fig)。"))
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty.setStyleSheet("color: gray;")
+        self._empty.setStyleSheet("color: palette(placeholder-text);")
         self._layout.addWidget(self._empty)
 
     def clear(self):
@@ -1608,6 +1613,9 @@ class PythonAnalysisWindow(QMainWindow):
                 tr("…还有 {} 列，请在引号里打字补全").format(len(cols) - limit)).setEnabled(False)
 
     def changeEvent(self, event):
+        if event.type() == event.Type.PaletteChange and hasattr(self, '_highlighter'):
+            self._highlighter.apply_palette()
+            self._highlighter.rehighlight()
         # 切回本窗口时刷新列名：用户可能在主窗口改了表头
         if event.type() == event.Type.ActivationChange and self.isActiveWindow():
             self.refresh_columns()

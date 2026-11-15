@@ -31,7 +31,6 @@ THUMB_CACHE_LIMIT = 300
 MAIN_CACHE_LIMIT = 24
 BASE_STRIP_THUMB = QSize(96, 72)        # 胶片条缩略图基准尺寸（缩放滑块调节）
 MAIN_LOAD_CAP = QSize(1600, 1200)       # 大图后台加载的分辨率上限
-HIGHLIGHT = "#4a9edb"
 
 
 class _LoaderSignals(QObject):
@@ -135,18 +134,18 @@ class _StripCell(QFrame):
         layout.addWidget(self.img_label)
         self.caption = QLabel(("▶ " if is_video(path) else "") + str(row + 2))
         self.caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.caption.setStyleSheet("font-size: 10px; color: gray;")
+        self.caption.setStyleSheet("font-size: 10px; color: palette(placeholder-text);")
         layout.addWidget(self.caption)
 
     def set_focused(self, focused):
         if focused:
             self.setStyleSheet(
-                f"_StripCell {{ border: 2px solid {HIGHLIGHT}; border-radius: 4px; }}")
+                "_StripCell { border: 2px solid palette(link); border-radius: 4px; }")
             self.caption.setStyleSheet(
-                f"font-size: 10px; font-weight: bold; color: {HIGHLIGHT};")
+                "font-size: 10px; font-weight: bold; color: palette(link);")
         else:
             self.setStyleSheet("_StripCell { border: 2px solid transparent; }")
-            self.caption.setStyleSheet("font-size: 10px; color: gray;")
+            self.caption.setStyleSheet("font-size: 10px; color: palette(placeholder-text);")
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.row)
@@ -240,7 +239,7 @@ class ImagePreviewPanel(QWidget):
         layout.addWidget(self.video_view, 1)
         self._main_caption = QLabel("")
         self._main_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._main_caption.setStyleSheet(f"color: {HIGHLIGHT}; font-weight: bold;")
+        self._main_caption.setStyleSheet("color: palette(link); font-weight: bold;")
         layout.addWidget(self._main_caption)
 
         # ---- 胶片条 ----

@@ -138,8 +138,7 @@ def _isna_scalar(v):
 from .dialogs import LoadingProgressDialog
 from .filter_dialog import FilterDialog
 from .header_filter import (ColumnFilterPopup, FilterHeaderView, arrow_rect_in,
-                            paint_arrow, MIN_SECTION_FOR_ARROW,
-                            ACCENT as FILTER_ACCENT)
+                            paint_arrow, MIN_SECTION_FOR_ARROW)
 from .find_dialog import FindReplaceDialog
 from .sort_dialog import SortDialog
 from .image_panel import ImagePreviewPanel
@@ -894,7 +893,7 @@ class _ExcelTableView(QTableView):
             painter = QPainter(self.viewport())
             painter.fillRect(QRect(header.gap_x(gap) - 1, 0, 3,
                                    self.viewport().height()),
-                             QColor(FILTER_ACCENT))
+                             self.palette().highlight().color())
             painter.end()
         handle = self._fill_handle_rect()
         if handle is None:
@@ -1323,6 +1322,10 @@ class MainWindow(QMainWindow):
         if window_manager is None or not window_manager.windows:
             self._update_check_timer.start(3000)
 
+        from .themes import manager
+        self.appearance = manager(self._settings)
+        self.appearance.register(self)
+
     # ================= UI 构建 =================
 
     def _build_menu(self):
@@ -1385,6 +1388,9 @@ class MainWindow(QMainWindow):
 
         # 视图
         view_menu = menubar.addMenu(tr("视图"))
+        from .themes import add_appearance_menu
+        add_appearance_menu(self, view_menu)
+        view_menu.addSeparator()
         if self.window_manager:
             view_menu.addAction(self.navigator_action)
             self._add_action(view_menu, tr("关闭窗口"), self.close, "Ctrl+Shift+W")
@@ -1686,7 +1692,7 @@ class MainWindow(QMainWindow):
         self.sheet_tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         # 原生样式在深色模式下当前标签几乎看不出来：当前 sheet 用表头同款橙色
         # 加粗高亮，其余标签用弱化的窗口色；颜色取自调色板，浅色/深色模式都适用
-        self.sheet_tabs.setStyleSheet("""
+        self._sheet_tab_stylesheet = """
             QTabBar::tab {
                 background: palette(window);
                 color: palette(text);
@@ -1705,7 +1711,8 @@ class MainWindow(QMainWindow):
                 border-top: 3px solid rgb(230, 126, 34);
                 border-bottom-color: palette(base);
             }
-        """)
+        """
+        self.sheet_tabs.setStyleSheet(self._sheet_tab_stylesheet)
         self.sheet_tabs.currentChanged.connect(self._on_sheet_tab_changed)
         self.sheet_tabs.tabBarDoubleClicked.connect(self._on_sheet_tab_double_clicked)
         self.sheet_tabs.tabMoved.connect(self._on_sheet_tab_moved)
@@ -4823,8 +4830,11 @@ class MainWindow(QMainWindow):
         font.setPointSizeF(self._base_font_size * self._zoom)
         self.table.setFont(font)
         self._cell_delegate.clear_cache()  # 字号变化后截断缓存全部失效
+        # A stylesheet's header padding otherwise clamps compact rows to the
+        # previous style's minimum. Keep enough room for the actual scaled font.
+        self.table.verticalHeader().setMinimumSectionSize(QFontMetrics(font).height() + 2)
         self.table.verticalHeader().setDefaultSectionSize(
-            int(self._base_row_height * self._zoom))
+            int(self._base_row_height * self._zoom * getattr(self, '_appearance_density', 1.0)))
         self.update_statusbar(tr("缩放: {}%").format(int(self._zoom * 100)))
 
     def refit_columns(self):

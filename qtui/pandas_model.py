@@ -104,6 +104,11 @@ class PandasTableModel(QAbstractTableModel):
 
     def __init__(self, df: pd.DataFrame = None, parent=None):
         super().__init__(parent)
+        self._formula_brush = _FORMULA_BRUSH
+        self._highlight_brush = _HIGHLIGHT_BRUSH
+        self._header_brush = _HEADER_ROW_BRUSH
+        self._header_text_brush = _HEADER_TEXT_BRUSH
+        self._formula_fill_brushes = {}
         self._df = df if df is not None else pd.DataFrame()
         self.modified = False
         # 撤销/重做栈：存 (row, col, old_value, new_value)
@@ -200,7 +205,7 @@ class PandasTableModel(QAbstractTableModel):
             if color:
                 return QColor(color)
             if index.row() == self.highlight_row:
-                return _HIGHLIGHT_BRUSH
+                return self._highlight_brush
             return None
         if role == Qt.ItemDataRole.TextAlignmentRole:
             arr, numeric = self._col_info(index.column())
@@ -213,7 +218,15 @@ class PandasTableModel(QAbstractTableModel):
             return _ALIGN_LEFT
         if role == Qt.ItemDataRole.ForegroundRole:
             if (row, index.column()) in self.formulas:
-                return _FORMULA_BRUSH
+                fill = self.cell_colors.get((row, index.column()))
+                if fill:
+                    if fill not in self._formula_fill_brushes:
+                        from .themes import readable
+                        if len(self._formula_fill_brushes) > 256:
+                            self._formula_fill_brushes.clear()
+                        self._formula_fill_brushes[fill] = readable(self._formula_brush, fill)
+                    return self._formula_fill_brushes[fill]
+                return self._formula_brush
             return None
         if role == Qt.ItemDataRole.ToolTipRole:
             formula = self.formulas.get((row, index.column()))
@@ -292,6 +305,16 @@ class PandasTableModel(QAbstractTableModel):
                 message += local(' 引用的 {} 也存在错误，请先检查该单元格。', ' Referenced cell {} also has an error; check it first.').format(targets[0][0])
         return message
 
+    def set_ui_palette(self, palette, custom=True):
+        """Repaint-only appearance: no model signals, edits or undo entries."""
+        from .themes import readable
+        self._formula_brush = readable(FORMULA_TEXT_COLOR, palette.base().color())
+        self._highlight_brush = QColor(palette.highlight().color()) if custom else QColor(_HIGHLIGHT_BRUSH)
+        self._highlight_brush.setAlpha(46)
+        self._header_brush = palette.highlight().color() if custom else _HEADER_ROW_BRUSH
+        self._header_text_brush = readable('#ffffff', self._header_brush) if custom else _HEADER_TEXT_BRUSH
+        self._formula_fill_brushes.clear()
+
     def _header_row_data(self, col, role):
         """视图第 0 行：列名（可编辑重命名），加粗并以底色区分。
 
@@ -310,14 +333,14 @@ class PandasTableModel(QAbstractTableModel):
             color = self.cell_colors.get((-1, col))
             if color:
                 return QColor(color)
-            return _HEADER_ROW_BRUSH
+            return self._header_brush
         if role == Qt.ItemDataRole.FontRole:
             return _HEADER_ROW_FONT
         if role == Qt.ItemDataRole.ForegroundRole:
             # 默认橙底固定配白字；自定义底色返回 None，
             # 由绘制委托按底色亮度自动选黑/白字
             if (-1, col) not in self.cell_colors:
-                return _HEADER_TEXT_BRUSH
+                return self._header_text_brush
             return None
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return _ALIGN_LEFT
