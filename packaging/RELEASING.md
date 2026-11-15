@@ -1,5 +1,9 @@
 # 发版指南
 
+## 支持平台
+
+从 v1.16.10 起，Mac 只构建和发布 Apple Silicon（arm64）包，不再构建、发布或支持 Intel Mac 包。历史版本附件保留。最终附件必须恰好为 Apple Silicon DMG、Windows EXE、Linux DEB 和 SHA256SUMS.txt 共四项；校验清单只包含这三个安装包。
+
 ## 发一个新版本
 
 1. 修改 `version.py` 中的 `__version__`（唯一的版本来源）。
@@ -13,13 +17,12 @@
 
 3. GitHub Actions 自动构建；各平台须运行打包程序的 `--smoke-formulas` 按键/选区/草稿检查，成功后生成草稿 Release。产物：
    - `SmartTableHub-<ver>-macos-arm64.dmg`（Apple Silicon）
-   - `SmartTableHub-<ver>-macos-x86_64.dmg`（Intel Mac）
    - `SmartTableHub-<ver>-linux-amd64.deb`
    - `SmartTableHub-<ver>-windows-x64-setup.exe`
    - `SHA256SUMS.txt`（一键升级的完整性校验依据）
 
-4. 等待各平台构建和 CI 测试通过，核对四个安装包与 `SHA256SUMS.txt`，
-   确认两个 Mac 包的签名和公证有效，填写发布说明后再公开草稿：
+4. 等待各平台构建和 CI 测试通过，核对三个安装包与 `SHA256SUMS.txt`，
+   确认 Apple Silicon Mac 包的签名和公证有效，填写发布说明后再公开草稿：
 
    ```bash
    gh release edit v1.0.1 --draft=false --latest
@@ -34,11 +37,11 @@
 gh workflow run release.yml --ref main -f source_ref=v1.0.1 -f notarize=false
 ```
 
-该运行仍用 CI 的 Developer ID 证书签名，并只生成草稿。下载两个 Mac DMG，
-分别用 `xcrun notarytool submit --keychain-profile notary --wait` 完成公证，
+该运行仍用 CI 的 Developer ID 证书签名，并只生成草稿。下载 Apple Silicon DMG，
+用 `xcrun notarytool submit --keychain-profile notary --wait` 完成公证，
 再用 `xcrun stapler staple` 和 `xcrun stapler validate` 附加、验证公证票据。
-验证应用代码签名后，重新计算四个平台安装包的 SHA256，替换草稿中的两个
-Mac 包和校验清单，核对远端大小与 SHA256，再公开发布。不可直接公开尚未
+验证应用代码签名后，重新计算三个平台安装包的 SHA256，替换草稿中的
+Apple Silicon Mac 包和校验清单，核对远端大小与 SHA256，再公开发布。不可直接公开尚未
 公证的恢复构建。不要把钥匙串中的凭据提取到命令、日志或仓库中。
 
 ## 一键升级原理

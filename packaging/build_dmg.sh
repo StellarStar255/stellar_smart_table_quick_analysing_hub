@@ -9,6 +9,10 @@ cd "$(dirname "$0")/.."
 
 VERSION=$(python3 -c "from version import __version__; print(__version__)")
 ARCH=$(uname -m)
+if [ "$ARCH" != "arm64" ]; then
+    echo "macOS builds support Apple Silicon (arm64) only; Intel Macs are no longer supported."
+    exit 1
+fi
 APP="dist/SmartTableHub.app"
 DMG="dist/SmartTableHub-${VERSION}-macos-${ARCH}.dmg"
 

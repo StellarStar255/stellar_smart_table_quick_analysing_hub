@@ -13,9 +13,10 @@ Download the installer for your platform from [Releases](https://github.com/Stel
 | Platform | Installer |
 |---|---|
 | macOS (Apple Silicon) | `SmartTableHub-<版本>-macos-arm64.dmg` |
-| macOS (Intel) | `SmartTableHub-<版本>-macos-x86_64.dmg` |
 | Ubuntu / Debian | `SmartTableHub-<版本>-linux-amd64.deb` |
 | Windows 10/11 (64-bit) | `SmartTableHub-<版本>-windows-x64-setup.exe` |
+
+From v1.16.10, macOS releases support **Apple Silicon only**. Intel Macs are no longer supported; [v1.16.9](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.9) is the last historical release with an Intel package.
 
 Once installed, the app checks for new versions automatically. You can also update in one click via "Help → Check for Updates..." (download → SHA256 verification → silent install → automatic restart).
 
@@ -160,7 +161,7 @@ python smart_table_quick_analysing_hub.py
 ## System Requirements
 
 - Python 3.8 or later
-- OS: Windows, macOS, Linux
+- OS: Windows, macOS (Apple Silicon only), Linux
 
 ## Dependencies
 
@@ -333,9 +334,10 @@ Issues and Pull Requests are welcome!
 | 平台 | 安装包 |
 |---|---|
 | macOS（Apple Silicon） | `SmartTableHub-<版本>-macos-arm64.dmg` |
-| macOS（Intel） | `SmartTableHub-<版本>-macos-x86_64.dmg` |
 | Ubuntu / Debian | `SmartTableHub-<版本>-linux-amd64.deb` |
 | Windows 10/11（64 位） | `SmartTableHub-<版本>-windows-x64-setup.exe` |
+
+从 v1.16.10 起，Mac **仅支持 Apple Silicon（Apple 芯片）**，Intel Mac 停止支持；[v1.16.9](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.9) 是最后提供 Intel 包的历史版本。
 
 安装后应用会自动检查新版本，也可通过菜单「帮助 → 检查更新...」
 一键升级（下载 → SHA256 校验 → 静默安装 → 自动重启）。
@@ -484,7 +486,7 @@ python smart_table_quick_analysing_hub.py
 ## 系统要求
 
 - Python 3.8 或更高版本
-- 操作系统: Windows, macOS, Linux
+- 操作系统: Windows, macOS（仅 Apple Silicon）,Linux
 
 ## 依赖库
 
