@@ -224,50 +224,72 @@ class PandasTableModel(QAbstractTableModel):
             return formula
         return None
 
-    def formula_error_details(self, row, col):
-        """Explain an existing result; bounded dependency tracing never recalculates."""
-        from core.formula_help import diagnose, error_help, local
+    def formula_error_targets(self, row, col):
+        """Return bounded, clickable (address, view row, column) error targets."""
         from itertools import islice
         key = (row, col)
-        formula = self.formulas.get(key)
+        if key not in self.formulas:
+            return []
+        value = self._df.iat[row, col]
+        def neighbors(cell):
+            result = set(islice(self._formula_deps.get(cell, ()), 128))
+            for r0, r1, c0, c1 in islice(self._formula_ranges.get(cell, ()), 32):
+                if r0 <= cell[0] <= r1 and c0 <= cell[1] <= c1:
+                    result.add(cell)
+                for candidate in islice(self.formulas, 512):
+                    if r0 <= candidate[0] <= r1 and c0 <= candidate[1] <= c1:
+                        result.add(candidate)
+            return sorted(result)
+        path = []
+        if value == '#CIRC!':
+            pending, seen = [(key, [key])], set()
+            while pending and len(seen) < 128:
+                cell, chain = pending.pop()
+                if cell in seen or len(chain) > 32:
+                    continue
+                seen.add(cell)
+                for dep in neighbors(cell):
+                    if dep in chain:
+                        path = chain + [dep]
+                        pending.clear()
+                        break
+                    if dep in self.formulas and dep not in seen:
+                        pending.append((dep, chain + [dep]))
+        else:
+            candidates = set(neighbors(key))
+            # Small ranges can also contain imported/static error cells. Bound
+            # the scan so locating an error never expands an entire column.
+            remaining = 4096
+            for r0, r1, c0, c1 in islice(self._formula_ranges.get(key, ()), 32):
+                size = (r1 - r0 + 1) * (c1 - c0 + 1)
+                if size <= remaining:
+                    candidates.update((r, c) for r in range(r0, r1 + 1) for c in range(c0, c1 + 1))
+                    remaining -= size
+            for r, c in sorted(candidates):
+                if 0 <= r < len(self._df) and 0 <= c < len(self._df.columns) and FormulaEngine.is_error(self._df.iat[r, c]):
+                    path.append((r, c))
+                    if len(path) >= 32: break
+        return [(FormulaEngine.col_index_to_letter(c) + str(r + 2), r + self.HEADER_ROWS, c)
+                for r, c in path[:32]]
+
+    def formula_error_details(self, row, col, targets=None):
+        """Explain an existing result without recalculating or changing cells."""
+        from core.formula_help import diagnose, error_help, local
+        formula = self.formulas.get((row, col))
         if not formula:
             return ''
-        value = self._df.iat[row, col]
         detail = diagnose(formula, final=True)
         if detail:
             return detail.message
+        value = self._df.iat[row, col]
         message = error_help(value)
-        def address(cell):
-            return FormulaEngine.col_index_to_letter(cell[1]) + str(cell[0] + 2)
-        if value == '#CIRC!':
-            # Expand only formula nodes, never every cell in a large range.
-            pending = [(key, [key])]
-            seen = set()
-            while pending and len(seen) < 128:
-                cell, path = pending.pop()
-                if cell in seen or len(path) > 32:
-                    continue
-                seen.add(cell)
-                neighbors = set(islice(self._formula_deps.get(cell, ()), 128))
-                for bounds in islice(self._formula_ranges.get(cell, ()), 32):
-                    r0, r1, c0, c1 = bounds
-                    if r0 <= cell[0] <= r1 and c0 <= cell[1] <= c1:
-                        neighbors.add(cell)
-                    for candidate in islice(self.formulas, 512):
-                        if r0 <= candidate[0] <= r1 and c0 <= candidate[1] <= c1:
-                            neighbors.add(candidate)
-                for dep in neighbors:
-                    if dep in path:
-                        cycle = path + [dep]
-                        return message + ' ' + ' → '.join(address(c) for c in cycle)
-                    if dep in self.formulas and dep not in seen:
-                        pending.append((dep, path + [dep]))
-            return message
-        for dep in islice(self._formula_deps.get(key, ()), 128):
-            r, c = dep
-            if 0 <= r < len(self._df) and 0 <= c < len(self._df.columns):
-                if FormulaEngine.is_error(self._df.iat[r, c]):
-                    return message + local(' 引用的 {} 也存在错误，请先检查该单元格。', ' Referenced cell {} also has an error; check it first.').format(address(dep))
+        if targets is None:
+            targets = self.formula_error_targets(row, col)
+        if targets:
+            if value == '#CIRC!':
+                message += ' ' + ' → '.join(item[0] for item in targets)
+            else:
+                message += local(' 引用的 {} 也存在错误，请先检查该单元格。', ' Referenced cell {} also has an error; check it first.').format(targets[0][0])
         return message
 
     def _header_row_data(self, col, role):

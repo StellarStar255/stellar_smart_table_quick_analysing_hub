@@ -101,7 +101,11 @@ def main():
                         help=tr("启动时打开的文件"))
     parser.add_argument("-f", "--file", dest="file_opt", default=None,
                         help=tr("启动时打开的文件（与位置参数等效，兼容旧版入口）"))
+    parser.add_argument('--smoke-formulas', metavar='OUTPUT_DIR', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.smoke_formulas:
+        from qtui.formula_smoke import run
+        return sys.exit(run(args.smoke_formulas))
     initial_files = ([args.file_opt] if args.file_opt else []) + args.file
 
     _install_excepthook()

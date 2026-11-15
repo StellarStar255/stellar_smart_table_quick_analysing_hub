@@ -256,7 +256,8 @@ class TestPreview:
         assert not win._preview_formula_pending
         assert preview.toPlainText() == '0'
 
-    def test_preview_context_change_preserves_invalid_formula_source(self, win):
+    def test_preview_context_change_preserves_invalid_formula_source(self, win, monkeypatch):
+        monkeypatch.setattr(win.formula_workbench, "ask_draft", lambda _: "store")
         win.table.setCurrentIndex(win.model.index(1, 2))
         win.cell_preview_text.setPlainText('=SUMM(A2)')
         win.table.setCurrentIndex(win.model.index(2, 2))

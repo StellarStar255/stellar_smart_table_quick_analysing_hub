@@ -46,7 +46,7 @@ jobs:
 
   build-macos:
     needs: [verify-tag]
-    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    if: ${{ !cancelled() && always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +102,15 @@ jobs:
           echo "NOTARY_PROFILE=ci-notary" >> "$GITHUB_ENV"
       - name: Build dmg
         run: bash packaging/build_dmg.sh
+      - name: Smoke packaged formula UI
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: 'dist/SmartTableHub.app/Contents/MacOS/SmartTableHub --smoke-formulas "${{ runner.temp }}/formula-smoke"'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: formula-smoke-${{ matrix.arch }}
+          path: ${{ runner.temp }}/formula-smoke
       - uses: actions/upload-artifact@v7
         with:
           name: dmg-${{ matrix.arch }}
@@ -109,7 +118,7 @@ jobs:
 
   build-linux:
     needs: [verify-tag]
-    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    if: ${{ !cancelled() && always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     # 刻意用较老的 LTS：在老 glibc 上构建的 deb 能装到更多发行版上
     runs-on: ubuntu-22.04
     steps:
@@ -127,6 +136,15 @@ jobs:
           python3 -m pip install -r requirements.txt pyinstaller
       - name: Build deb
         run: bash packaging/build_deb.sh
+      - name: Smoke packaged formula UI
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: 'dist/SmartTableHub/SmartTableHub --smoke-formulas "${{ runner.temp }}/formula-smoke"'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: formula-smoke-linux
+          path: ${{ runner.temp }}/formula-smoke
       - uses: actions/upload-artifact@v7
         with:
           name: deb
@@ -134,7 +152,7 @@ jobs:
 
   build-windows:
     needs: [verify-tag]
-    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    if: ${{ !cancelled() && always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     runs-on: windows-latest
     env:
       HAS_WIN_CERT: ${{ secrets.WIN_CERT_PFX != '' }}
@@ -165,6 +183,21 @@ jobs:
         env:
           WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
         run: powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1
+      - name: Smoke packaged formula UI
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $outDir = Join-Path $env:RUNNER_TEMP 'formula-smoke'
+          $process = Start-Process -FilePath 'dist\SmartTableHub\SmartTableHub.exe' -ArgumentList @('--smoke-formulas', $outDir) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Formula smoke failed: $($process.ExitCode)" }
+          $report = Get-Content (Join-Path $outDir 'report.json') -Raw | ConvertFrom-Json
+          if ($report.status -ne 'passed' -or -not $report.frozen) { throw 'Packaged formula UI verification failed' }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: formula-smoke-windows
+          path: ${{ runner.temp }}/formula-smoke
       - uses: actions/upload-artifact@v7
         with:
           name: exe
@@ -172,7 +205,7 @@ jobs:
 
   release:
     needs: [build-macos, build-linux, build-windows]
-    if: ${{ always() && needs.build-macos.result == 'success' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' }}
+    if: ${{ !cancelled() && always() && needs.build-macos.result == 'success' && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -183,8 +216,20 @@ jobs:
         run: python3 -c 'from version import __version__; print("tag=v" + __version__)' >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
         with:
+          name: dmg-arm64
           path: artifacts
-          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: dmg-x86_64
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: deb
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: exe
+          path: artifacts
       - name: Generate checksums
         run: |
           cd artifacts

@@ -248,11 +248,14 @@ class FormulaAssistant(QObject):
         elif text.strip() == '=':
             self.help.setText(local('选择函数，或输入单元格与运算符，例如 =B2*C2。', 'Choose a function or enter references and operators, e.g. =B2*C2.'))
         else:
-            self.help.setText(local('正在编辑公式 · 可输入函数名，或点选/拖选表格插入引用。<br>Tab 接受候选，Enter 检查并提交。',
-                                    'Editing formula · Type a function or click/drag cells to insert a reference.<br>Tab accepts a suggestion; Enter checks and commits.'))
+            self.help.setText(local('Enter 确认 · Esc 取消 · 可点选表格插入引用。',
+                                    'Enter commits · Esc cancels · Click cells to insert references.'))
         partial_name = self.span and self.list.count() and not correction
         self.diagnostic = diagnose(text, final=self.forced or not partial_name)
         d = self.diagnostic
+        compact = not self.list.count() and not active and d is None
+        self.browse.setVisible(not compact)
+        self.keys.setVisible(not compact)
         self.problem.setText(('⚠ ' if d and (self.forced or not d.incomplete) else '') + d.message if d else '')
         if d and self.forced:
             self.problem.setText(self.problem.text() + local(' 修改后再次提交；Esc 取消本次编辑。', ' Edit and submit again; Esc cancels this edit.'))
@@ -284,6 +287,10 @@ class FormulaAssistant(QObject):
         self.body.layout().activate()
         desired_height = self.body.layout().sizeHint().height() + 4
         origin = host.mapFromGlobal(self.editor.mapToGlobal(QPoint(0, self.editor.height() + 4)))
+        workbench = getattr(self.editor, 'workbench', None)
+        if workbench and self.editor is workbench.edit:
+            # Keep the fixed bar's result preview visible above its suggestions.
+            origin.setY(host.mapFromGlobal(workbench.widget.mapToGlobal(QPoint(0, workbench.widget.height() + 4))).y())
         x = max(bounds.left() + 4, min(origin.x(), bounds.right() - width - 4))
         editor_top = host.mapFromGlobal(self.editor.mapToGlobal(QPoint(0, 0))).y()
         below = bounds.bottom() - origin.y() - 4
@@ -454,6 +461,12 @@ class FormulaPreviewEdit(QPlainTextEdit):
     Plain text keeps its existing delayed save behavior. Formula drafts are only
     committed on Enter or context change, so typing never stores half a formula.
     """
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        workbench = getattr(self, 'workbench', None)
+        if workbench:
+            workbench.take_for_preview()
+
     def text(self):
         return self.toPlainText()
 
@@ -484,18 +497,18 @@ class FormulaPreviewEdit(QPlainTextEdit):
         if helper and helper.handle_key(event):
             return
         if self.text().startswith('=') and event.key() == Qt.Key.Key_F4:
-            self.window().table.toggle_absolute_ref(self)
+            self.workbench.window.table.toggle_absolute_ref(self)
             return
         if self.text().startswith('=') and event.key() == Qt.Key.Key_Escape:
-            self.window()._cancel_preview_formula()
+            self.workbench.window._cancel_preview_formula()
             return
         if self.text().startswith('=') and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 if helper.validate_commit():
-                    self.window()._save_cell_preview()
+                    self.workbench.window._save_cell_preview()
                 return
             # Formulas are single expressions; Enter validates and saves them.
             if helper.validate_commit():
-                self.window()._save_cell_preview()
+                self.workbench.window._save_cell_preview()
             return
         super().keyPressEvent(event)

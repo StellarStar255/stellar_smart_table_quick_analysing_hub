@@ -27,6 +27,8 @@ def win():
         pd.DataFrame({'X': ['a', 'b', 'c'], 'Y': ['1', '2', '3']}))
     w.show()
     yield w
+    w.formula_workbench.cancel_bar()
+    w._cancel_preview_formula()
     w.model.modified = False
     w.close()
 

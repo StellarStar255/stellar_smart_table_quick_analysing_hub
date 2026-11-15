@@ -11,7 +11,7 @@
    git push origin main --tags
    ```
 
-3. GitHub Actions 自动构建并生成草稿 Release，产物：
+3. GitHub Actions 自动构建；各平台须运行打包程序的 `--smoke-formulas` 按键/选区/草稿检查，成功后生成草稿 Release。产物：
    - `SmartTableHub-<ver>-macos-arm64.dmg`（Apple Silicon）
    - `SmartTableHub-<ver>-macos-x86_64.dmg`（Intel Mac）
    - `SmartTableHub-<ver>-linux-amd64.deb`
@@ -98,3 +98,13 @@ bash packaging/build_deb.sh
 # Windows
 powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1
 ```
+
+## 推送被 GH007 邮箱隐私保护拒绝
+
+保持 GitHub 的邮箱隐私保护开启。本仓库提交应使用 GitHub 提供的隐私邮箱：
+
+```bash
+git config --local user.email 17609819+StellarStar255@users.noreply.github.com
+```
+
+修改配置只影响之后的提交。已被拒绝且尚未公开的提交，还需先保留本地备份，再修正作者和提交者邮箱。确认远端没有这些提交后，普通 push 即可；不要为此关闭隐私保护、强推或改写已公开的历史。

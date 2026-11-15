@@ -64,6 +64,8 @@ def h():
     w.model.modified = False
     w.table.setFocus()
     yield Harness(w)
+    w.formula_workbench.cancel_bar()
+    w._cancel_preview_formula()
     w.model.modified = False
     w.close()
 

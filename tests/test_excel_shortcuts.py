@@ -32,6 +32,8 @@ def win():
     }))
     w.show()
     yield w
+    w.formula_workbench.cancel_bar()
+    w._cancel_preview_formula()
     w.model.modified = False
     w.close()
 

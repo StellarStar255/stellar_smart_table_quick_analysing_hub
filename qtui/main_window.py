@@ -21,7 +21,7 @@ import pandas as pd
 
 from PyQt6.QtCore import (
     Qt, QTimer, QSettings, QEvent, QPoint, QRect, QItemSelection,
-    QItemSelectionModel, pyqtSignal, QPersistentModelIndex, QModelIndex,
+    QItemSelectionModel, pyqtSignal, QPersistentModelIndex, QModelIndex, QSignalBlocker,
 )
 from PyQt6.QtGui import (
     QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
 from core.formula_engine import FormulaEngine
 from core.formula_help import local, reference_tokens
 from .formula_assistant import FormulaAssistant, FormulaLibrary, FormulaPreviewEdit
+from .formula_workbench import FormulaWorkbench
 from . import file_io, filter_engine, xlsx_filters
 from .pandas_model import PandasTableModel, to_numeric_or_keep
 
@@ -214,10 +215,32 @@ class _FastCellDelegate(QStyledItemDelegate):
         editor._edit_index = QPersistentModelIndex(index)   # 点选时区分"本格"与被盖住的邻格
         editor._point_drag = False
         if isinstance(editor, QLineEdit) and index.row() > 0:
+            editor.setMaxLength(2147483647)
             editor.formula_assistant = FormulaAssistant(editor, view)
+            workbench = getattr(view.window(), 'formula_workbench', None)
+            if workbench:
+                editor.textChanged.connect(lambda _text, e=editor, w=workbench: w.cell_editor_changed(e))
         if not typing and isinstance(editor, QLineEdit):
             QTimer.singleShot(0, lambda e=editor: self._caret_to_end(e))
         return editor
+
+    def setEditorData(self, editor, index):
+        workbench = getattr(self.parent().window(), 'formula_workbench', None)
+        pending_preview = (workbench and getattr(workbench.window, '_preview_cell', None) == (index.row(), index.column())
+                           and (getattr(workbench.window, '_preview_formula_pending', False)
+                                or workbench.window._preview_save_timer.isActive()))
+        if workbench and isinstance(editor, QLineEdit) and ((workbench.dirty and workbench.cell == index) or pending_preview):
+            text = workbench.edit.text() if workbench.dirty else workbench.window.cell_preview_text.toPlainText()
+            workbench.dirty = False
+            workbench.window._preview_formula_pending = False
+            workbench.window._preview_save_timer.stop()
+            editor.setText(text)
+            if getattr(editor, '_typing_mode', False):
+                editor.selectAll()
+            workbench.update_state()
+            QTimer.singleShot(0, workbench.update_state)
+        else:
+            super().setEditorData(editor, index)
 
     @staticmethod
     def _caret_to_end(editor):
@@ -239,6 +262,9 @@ class _FastCellDelegate(QStyledItemDelegate):
         if editor is self.active_editor:
             self.active_editor = None
         super().destroyEditor(editor, index)
+        window = self.parent().window()
+        if hasattr(window, 'formula_workbench'):
+            QTimer.singleShot(0, window._after_cell_editor_closed)
 
     def eventFilter(self, editor, event):
         view = self.parent()
@@ -299,6 +325,9 @@ class _FastCellDelegate(QStyledItemDelegate):
                 and editor is self.active_editor):
             view = self.parent()
             assistant = getattr(editor, 'formula_assistant', None)
+            workbench = getattr(view.window(), 'formula_workbench', None)
+            if workbench and QApplication.focusWidget() in (workbench.edit, getattr(workbench.window, 'cell_preview_text', None)):
+                return True
             if (getattr(editor, '_formula_library_open', False)
                     or event.reason() in (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason)):
                 return True
@@ -678,6 +707,9 @@ class _ExcelTableView(QTableView):
     def _formula_editor(self):
         """正在编辑且内容以 = 开头的单元格编辑器；否则 None。"""
         editor = getattr(self.itemDelegate(), 'active_editor', None)
+        workbench = getattr(self.window(), 'formula_workbench', None)
+        if editor is None and workbench and (workbench.dirty or workbench.edit.hasFocus()):
+            editor = workbench.edit
         if (isinstance(editor, QLineEdit) and editor.isVisible()
                 and editor.text().startswith('=')):
             return editor
@@ -882,6 +914,11 @@ class _ExcelTableView(QTableView):
     # ---------- 鼠标事件分发（公式点选 / 填充柄 / 默认） ----------
 
     def keyPressEvent(self, event):
+        workbench = getattr(self.window(), 'formula_workbench', None)
+        if workbench and workbench.picking is not None and event.key() == Qt.Key.Key_Escape:
+            workbench.finish_pick()
+            event.accept()
+            return
         key = event.key()
         mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
         arrows = (Qt.Key.Key_Down, Qt.Key.Key_Up,
@@ -976,6 +1013,11 @@ class _ExcelTableView(QTableView):
             self._typing_pending = False
 
     def mousePressEvent(self, event):
+        workbench = getattr(self.window(), 'formula_workbench', None)
+        if workbench and workbench.picking is not None and event.button() == Qt.MouseButton.LeftButton:
+            workbench.pick(self.indexAt(event.position().toPoint()))
+            event.accept()
+            return
         self._tab_origin_col = None
         editor = self._formula_editor()
         if editor is None and event.button() == Qt.MouseButton.LeftButton:
@@ -1010,6 +1052,11 @@ class _ExcelTableView(QTableView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        workbench = getattr(self.window(), 'formula_workbench', None)
+        if workbench and workbench.picking is not None and workbench.pick_anchor is not None:
+            workbench.pick(self.indexAt(event.position().toPoint()))
+            event.accept()
+            return
         if self._resizing_last_column:
             self.horizontalHeader().update_last_resize(event.position().toPoint().x())
             event.accept()
@@ -1039,6 +1086,11 @@ class _ExcelTableView(QTableView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        workbench = getattr(self.window(), 'formula_workbench', None)
+        if workbench and workbench.picking is not None and event.button() == Qt.MouseButton.LeftButton:
+            workbench.pick(self.indexAt(event.position().toPoint()), finish=True)
+            event.accept()
+            return
         if self._resizing_last_column and event.button() == Qt.MouseButton.LeftButton:
             header = self.horizontalHeader()
             header.update_last_resize(event.position().toPoint().x())
@@ -1571,11 +1623,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.filter_bar)
+        self.formula_workbench = FormulaWorkbench(self)
+        layout.addWidget(self.formula_workbench.widget)
         self.formula_feedback = QWidget()
         feedback_layout = QHBoxLayout(self.formula_feedback)
         feedback_layout.setContentsMargins(8, 5, 8, 5)
         self.formula_error_label = QLabel()
-        self.formula_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.formula_error_label.setTextFormat(Qt.TextFormat.RichText)
+        self.formula_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.formula_error_label.setOpenExternalLinks(False)
+        self.formula_error_label.linkActivated.connect(self.formula_workbench.jump_error)
         self.formula_error_label.setWordWrap(True)
         feedback_layout.addWidget(self.formula_error_label, 1)
         self.formula_edit_button = QPushButton(local('编辑公式', 'Edit formula'))
@@ -1670,6 +1727,7 @@ class MainWindow(QMainWindow):
         self.cell_preview_dock = QDockWidget(tr("单元格内容"), self)
         self.cell_preview_dock.setObjectName("cell_preview_dock")
         self.cell_preview_text = FormulaPreviewEdit()
+        self.cell_preview_text.workbench = self.formula_workbench
         self.cell_preview_text.formula_assistant = FormulaAssistant(self.cell_preview_text, self.table)
         self._preview_formula_pending = False
         self.cell_preview_text.setPlaceholderText(tr("选中单元格后在此查看/编辑内容"))
@@ -1874,7 +1932,8 @@ class MainWindow(QMainWindow):
     def new_file(self, confirm=True):
         if confirm and self.window_manager:
             return self.window_manager.create_window()
-        self._flush_preview()   # 预览框里未落盘的编辑先写回当前表，再决定是否保存
+        if self._flush_preview() is False:
+            return False
         if confirm and not self._check_save_before_discard():
             return
         self._end_onboarding_for_document_change()
@@ -1914,7 +1973,8 @@ class MainWindow(QMainWindow):
 
     def close_file(self):
         """关闭当前文件回到空白表格，程序保持运行。"""
-        self._flush_preview()
+        if self._flush_preview() is False:
+            return False
         if not self._check_save_before_discard():
             return
         name = os.path.basename(self.current_file) if self.current_file else None
@@ -1946,7 +2006,8 @@ class MainWindow(QMainWindow):
             self.recent_files = [p for p in self.recent_files if p != path]
             self._save_recent()
             return
-        self._flush_preview()
+        if self._flush_preview() is False:
+            return False
         if not self._check_save_before_discard():
             return
 
@@ -2021,7 +2082,8 @@ class MainWindow(QMainWindow):
     def save_file(self):
         """保存到当前文件。未命名或旧版 .xls（只能写出 xlsx）时转到另存为。
         返回是否真正保存成功——"未保存修改"提示里选"保存"后取消/失败都不能丢数据。"""
-        self._flush_preview()
+        if self._flush_preview() is False:
+            return False
         if not self.current_file:
             return self._save_as(switch_to=True)
         if os.path.splitext(self.current_file)[1].lower() == ".xls":
@@ -2031,7 +2093,8 @@ class MainWindow(QMainWindow):
         return self._do_save(self.current_file)
 
     def save_as_copy(self):
-        self._flush_preview()
+        if self._flush_preview() is False:
+            return False
         return self._save_as(switch_to=False)
 
     def _ask_save_path(self, switch_to):
@@ -2382,7 +2445,8 @@ class MainWindow(QMainWindow):
         if not self._auto_save_enabled_for(path):
             return
         if (self.table.state() == QAbstractItemView.State.EditingState
-                or self._preview_save_timer.isActive()):
+                or self._preview_save_timer.isActive() or self._preview_formula_pending
+                or self.formula_workbench.dirty):
             self._auto_save_timer.start()   # 正在输入，别弹窗打断，稍后再试
             return
         if self._auto_save_lossy_ok(path):
@@ -2599,7 +2663,9 @@ class MainWindow(QMainWindow):
         return result
 
     def switch_sheet(self, name):
-        self._flush_preview()   # 预览框里的编辑属于当前 sheet，换表前先写回
+        if self._flush_preview() is False:
+            self._refresh_sheet_tabs()
+            return False
         # 保存当前 sheet 状态（含筛选和公式）
         dropped_view_formulas = 0
         if self.current_sheet:
@@ -3478,7 +3544,8 @@ class MainWindow(QMainWindow):
 
         idx_map 不为 None 时不重新筛选，直接按这份行映射重建视图（撤销/重做筛选用）。
         """
-        self._flush_preview()   # 视图即将整表替换，预览框里的编辑先写回原格
+        if self._flush_preview() is False:
+            return False
         before, history = self._view_snapshot, self.model.take_history()
         frozen_view = 0
         if self.original_df is None:
@@ -3531,7 +3598,8 @@ class MainWindow(QMainWindow):
                 self.clear_all_filters()
 
     def clear_all_filters(self):
-        self._flush_preview()   # 筛选视图里的编辑先经 dataChanged 同步回 original_df
+        if self._flush_preview() is False:
+            return False
         before, history = self._view_snapshot, self.model.take_history()
         # 筛选中输入的公式是视图坐标，恢复原表时转为静态值（值已同步）
         frozen_view = len(self.model.formulas) if self.original_df is not None else 0
@@ -3940,6 +4008,10 @@ class MainWindow(QMainWindow):
 
     def open_formula_library(self):
         editor = self._cell_delegate.active_editor
+        if editor is None and (self.formula_workbench.edit.hasFocus() or self.formula_workbench.dirty):
+            editor = self.formula_workbench.edit
+        if editor is None and self.cell_preview_text.hasFocus():
+            editor = self.cell_preview_text
         if editor is not None:
             editor._formula_library_open = True
             if hasattr(editor, 'formula_assistant'):
@@ -3981,7 +4053,13 @@ class MainWindow(QMainWindow):
         value = self.model.data(idx, Qt.ItemDataRole.DisplayRole)
         formula = self.model.formulas.get(key)
         if formula and FormulaEngine.is_error(value):
-            self.formula_error_label.setText(value + '  ' + self.model.formula_error_details(*key))
+            from html import escape
+            targets = self.model.formula_error_targets(*key)
+            links = ' · '.join('<a href="{},{}">{}</a>'.format(r, c, escape(name)) for name, r, c in targets)
+            message = escape(value + '  ' + self.model.formula_error_details(*key, targets=targets))
+            if links:
+                message += '<br>' + local('点击定位：', 'Go to: ') + links
+            self.formula_error_label.setText(message)
             self.formula_feedback.show()
         else:
             self.formula_feedback.hide()
@@ -3995,12 +4073,14 @@ class MainWindow(QMainWindow):
         但不会发 currentChanged，定时器到点会把文字写进新表的同一坐标；
         所有整表替换的入口都必须先调用这里。
         """
+        workbench = getattr(self, 'formula_workbench', None)
+        if workbench and not workbench.resolve_pending():
+            return False
         timer = getattr(self, "_preview_save_timer", None)
         if timer is not None and (timer.isActive() or getattr(self, '_preview_formula_pending', False)):
             timer.stop()
-            # Context changes preserve source text even if it cannot yet compute,
-            # just like importing/pasting an erroneous formula. Enter validates.
             self._save_cell_preview(validate=False)
+        return True
 
     def _on_model_reset_preview(self):
         """模型整表重置后旧的预览坐标已失效：作废未落盘的编辑并清空预览框。"""
@@ -4015,10 +4095,33 @@ class MainWindow(QMainWindow):
         self.cell_preview_text.clear()
         self._preview_loading = False
 
+    def _after_cell_editor_closed(self):
+        wb = self.formula_workbench
+        if wb._closed:
+            return
+        if not wb.dirty and not self._preview_formula_pending and not self._preview_save_timer.isActive():
+            wb.sync()
+            current = self.table.currentIndex()
+            if current.isValid():
+                self._load_preview_cell(current)
+        wb.update_state()
+
+    def _load_preview_cell(self, current):
+        self._preview_loading = True
+        self.cell_preview_text.setPlainText(self.model.data(current, Qt.ItemDataRole.EditRole) or '')
+        self._preview_loading = False
+        self._preview_formula_pending = False
+        self._preview_cell = (current.row(), current.column())
+        self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
+
     def _on_current_cell_changed(self, current, previous):
+        if self._flush_preview() is False:
+            with QSignalBlocker(self.table.selectionModel()):
+                self.table.setCurrentIndex(previous)
+            self._refresh_formula_feedback()
+            return
         self._refresh_formula_feedback()
-        # 400ms 延迟保存还没触发就切换单元格：先写回原单元格，否则编辑丢失
-        self._flush_preview()
+        self.formula_workbench.sync()
         if current.isValid():
             self._preview_loading = True
             # EditRole：公式单元格显示公式本身，可直接编辑
@@ -4047,6 +4150,8 @@ class MainWindow(QMainWindow):
             self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
             self.cell_preview_text.formula_assistant.suppressed = True
             self.cell_preview_text.formula_assistant.clear()
+            if hasattr(self, 'formula_workbench'):
+                self.formula_workbench.sync()
 
     def _on_preview_text_changed(self):
         if not self._preview_loading and getattr(self, "_preview_cell", None):
@@ -4055,12 +4160,17 @@ class MainWindow(QMainWindow):
                 self._preview_save_timer.stop()
                 self._preview_formula_pending = True
                 self.cell_preview_dock.setWindowTitle(local('单元格内容 · 公式草稿（Enter 提交）', 'Cell contents · Formula draft (Enter to commit)'))
-                self.cell_preview_text.setToolTip(local('按 Enter 检查并提交，Esc 取消。切换单元格时保留原公式，错误可稍后修正。', 'Enter checks and commits; Esc cancels. Changing cells preserves the formula, including errors for later correction.'))
+                self.cell_preview_text.setToolTip(local('按 Enter 检查并提交，Esc 取消。未完成的草稿在切换、保存或关闭前会询问处理方式。', 'Enter checks and commits; Esc cancels. Unfinished drafts require a decision before switching, saving or closing.'))
             else:
                 self._preview_formula_pending = False
                 self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
                 self.cell_preview_text.setToolTip('')
                 self._preview_save_timer.start()
+            if hasattr(self, 'formula_workbench'):
+                self.formula_workbench.dirty = False
+                self.formula_workbench.set_bar(text)
+                self.formula_workbench.update_state()
+                self.formula_workbench.schedule()
 
     def _save_cell_preview(self, validate=True):
         if not getattr(self, "_preview_cell", None):
@@ -4076,6 +4186,8 @@ class MainWindow(QMainWindow):
         self._preview_formula_pending = False
         self.cell_preview_text.setToolTip('')
         self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
+        self.formula_workbench.update_state()
+        self.formula_workbench.schedule()
 
     # ================= 图片列 / 图片预览 =================
 
@@ -4749,7 +4861,9 @@ class MainWindow(QMainWindow):
     # ================= 关闭 =================
 
     def closeEvent(self, event):
-        self._flush_preview()   # 400ms 内的最后一笔预览编辑不能丢
+        if self._flush_preview() is False:
+            event.ignore()
+            return
         analysis_win = getattr(self, "_analysis_win", None)
         if analysis_win is not None and analysis_win.isVisible():
             # 分析窗口里代码还在跑时它会拒绝关闭：主窗口也不能关，
@@ -4758,6 +4872,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         if self._check_save_before_discard():
+            self.formula_workbench.shutdown()
             self._save_recent()
             self._save_file_config()   # 记住最后停留的 sheet / 图片列
             self._settings.setValue("window/geometry", self.saveGeometry())

@@ -57,6 +57,11 @@ jobs:
           xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_formula_assistant.py --platform xcb --output-dir "${{ runner.temp }}/formula-assistant/scale-1"
           QT_SCALE_FACTOR=1.5 xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_formula_assistant.py --platform xcb --output-dir "${{ runner.temp }}/formula-assistant/scale-1.5"
 
+      - name: Formula workbench X11 keyboard and draft regression
+        env:
+          QT_QPA_PLATFORM: xcb
+        run: xvfb-run -a -s '-screen 0 2560x1600x24' python3 smart_table_quick_analysing_hub.py --smoke-formulas "${{ runner.temp }}/formula-assistant/workbench"
+
       - name: Upload formula assistant screenshots
         if: always()
         uses: actions/upload-artifact@v7

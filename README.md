@@ -68,6 +68,7 @@ Latest release: [v1.16.9 — Formula input assistant](https://github.com/Stellar
 - **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A2:A10)`, `=IF(A2>10, "high", "low")`
 - **47 function names**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / INT / ROUND / ROUNDUP / ROUNDDOWN / POWER / SQRT / MOD / CONCAT / CONCATENATE / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
+- **Formula bar and wizard**: Edit complete formulas with explicit commit/cancel, see background result previews, fill function arguments by picking ranges, and click error references to navigate. Unfinished drafts require a decision before context changes.
 - **Formula assistance**: Function completion (Tab), cursor-aware argument help, searchable `fx` library, error explanations and colored reference ranges. [Usage guide](docs/formulas.md).
 - **Auto recalculation**: Dependent formulas update when referenced cells change
 - **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill; filtering suspends formulas and restores them when filters are cleared
@@ -391,6 +392,7 @@ python smart_table_quick_analysing_hub.py -h
 - **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A2:A10)`、`=IF(A2>10, "高", "低")`
 - **47 个函数名**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / INT / ROUND / ROUNDUP / ROUNDDOWN / POWER / SQRT / MOD / CONCAT / CONCATENATE / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
+- **公式栏与参数向导**：查看完整公式并确认/取消，后台预览结果，逐项填写参数并选区，点击错误地址定位；未完成草稿在切换、保存或关闭前明确处理。
 - **公式输入助手**：Tab 补全函数、按光标位置解释参数、`fx` 搜索函数与示例、错误原因和修正建议、引用区域着色。[使用说明](docs/formulas.md)。
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
 - **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）；筛选期间公式挂起，清除筛选后恢复重算
