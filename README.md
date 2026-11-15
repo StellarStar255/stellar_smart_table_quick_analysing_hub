@@ -40,7 +40,7 @@ python smart_table_quick_analysing_hub.py -h
 
 ## Features
 
-Latest release: [v1.16.8 — Restore navigation from the toolbar](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.8).
+Latest release: [v1.16.9 — Formula input assistant](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.9).
 
 - **Independent spreadsheet windows**: Open several files at once using the file picker, drag and drop, or command-line paths. Each document keeps its own edits, undo history, filters and previews. The Window Navigator lists all open documents; click to switch, close a selected window, or use Float Navigator / Dock Navigator. Reopen a hidden navigator from View → Window Navigator. Opening the same file again activates its existing window.
   - The embedded navigator has its own resizable sidebar beside the table. Each row shows a filename and its folder to distinguish identically named workbooks; hover for the full path. Use the top-right arrows to float/dock or hide the sidebar, and the bottom close button to close the selected document.
@@ -66,8 +66,9 @@ Latest release: [v1.16.8 — Restore navigation from the toolbar](https://github
 ### 🧮 Cell Formulas
 - **Excel-consistent grid**: Fixed letter columns (A/B/C...), row 1 is the editable header row, data starts at row 2 — formula coordinates mean exactly the same thing here and in Excel
 - **Excel-style formulas**: Type `=` in any cell, e.g. `=SUM(A2:A10)`, `=IF(A2>10, "high", "low")`
-- **43 functions**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
+- **47 function names**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / INT / ROUND / ROUNDUP / ROUNDDOWN / POWER / SQRT / MOD / CONCAT / CONCATENATE / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM, with arbitrary nesting
 - **Excel syntax**: `=` and `<>` comparisons, TRUE/FALSE, absolute references (`$A$1`), criteria like `">10"` and wildcards in COUNTIF/SUMIF
+- **Formula assistance**: Function completion (Tab), cursor-aware argument help, searchable `fx` library, error explanations and colored reference ranges. [Usage guide](docs/formulas.md).
 - **Auto recalculation**: Dependent formulas update when referenced cells change
 - **References follow your data**: Formulas adjust automatically on sort and row/column insert/delete (deleted references show `#REF!`); copy/paste shifts relative references like Excel fill; filtering suspends formulas and restores them when filters are cleared
 - **Error codes**: `#DIV/0!`, `#NAME?`, `#NUM!`, `#VALUE!`, `#REF!`, `#N/A`
@@ -260,7 +261,7 @@ Alternatively, click a column header for quick sorting.
 | Free, no subscription | ✅ | ❌ (desktop app is paid; the web version is free with limited features) |
 | Open source | ✅ | ❌ |
 | Linux support | ✅ | ❌ |
-| Cell formulas | ✅ (43 functions) | ✅ |
+| Cell formulas | ✅ (47 function names) | ✅ |
 | Charts | ⚠️ Planned | ✅ |
 
 > Comparison based on publicly available information as of September 2026 and may become outdated.
@@ -362,7 +363,7 @@ python smart_table_quick_analysing_hub.py -h
 
 ## 功能特性
 
-最新版本：[v1.16.8 — 工具栏恢复窗口导航](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.8)。
+最新版本：[v1.16.9 — 公式输入助手](https://github.com/StellarStar255/stellar_smart_table_quick_analysing_hub/releases/tag/v1.16.9)。
 
 - **图片与视频列**：右键列头选择「设为图片列」，即可在右侧查看本地图片或视频，同一列可混放。视频支持播放、暂停和拖动进度，双击可打开独立查看窗口。相对路径以表格所在文件夹为基准，视频格式支持取决于可用的媒体解码器。
   - 视频在播放前会显示实际预览画面，缩略条也显示视频画面。可将多列同时设为图片列，在右侧上下分割的面板中核对同一行，拖动分隔条可调节高度。各面板标明列名，前缀独立保存；多列时可按需展开各自的缩略条。
@@ -388,8 +389,9 @@ python smart_table_quick_analysing_hub.py -h
 ### 🧮 单元格公式
 - **Excel 一致的网格**: 固定字母列（A/B/C...），第 1 行是可编辑的表头行，数据从第 2 行起——公式坐标与 Excel 完全一致，跨应用含义相同
 - **Excel 风格公式**: 单元格输入 `=` 即可，如 `=SUM(A2:A10)`、`=IF(A2>10, "高", "低")`
-- **43 个函数**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / ROUND / POWER / SQRT / MOD / CONCAT / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
+- **47 个函数名**: SUM / AVERAGE / MAX / MIN / COUNT / COUNTA / COUNTIF / SUMIF / AVERAGEIF / COUNTIFS / SUMIFS / AVERAGEIFS / IF / IFERROR / AND / OR / NOT / VLOOKUP / XLOOKUP / INDEX / MATCH / TODAY / NOW / DATE / YEAR / MONTH / DAY / WEEKDAY / DAYS / DATEDIF / ABS / INT / ROUND / ROUNDUP / ROUNDDOWN / POWER / SQRT / MOD / CONCAT / CONCATENATE / LEFT / RIGHT / MID / LEN / UPPER / LOWER / TRIM，支持任意嵌套
 - **Excel 语法**: `=`、`<>` 比较符，TRUE/FALSE，绝对引用（`$A$1`），COUNTIF/SUMIF 支持 `">10"` 条件和通配符
+- **公式输入助手**：Tab 补全函数、按光标位置解释参数、`fx` 搜索函数与示例、错误原因和修正建议、引用区域着色。[使用说明](docs/formulas.md)。
 - **自动重算**: 被引用单元格变化时依赖公式自动更新
 - **引用跟随数据**: 排序、插入/删除行列后公式自动调整（被删引用显示 `#REF!`），复制粘贴时相对引用平移（同 Excel 填充）；筛选期间公式挂起，清除筛选后恢复重算
 - **错误码**: `#DIV/0!`、`#NAME?`、`#NUM!`、`#VALUE!`、`#REF!`、`#N/A`
@@ -579,7 +581,7 @@ python smart_table_quick_analysing_hub.py
 | 免费、无需订阅 | ✅ | ❌（桌面版收费；网页版免费但功能受限） |
 | 开源 | ✅ | ❌ |
 | Linux 支持 | ✅ | ❌ |
-| 单元格公式 | ✅（43 函数） | ✅ |
+| 单元格公式 | ✅（47 个函数名） | ✅ |
 | 图表 | ⚠️ 待开发 | ✅ |
 
 > 对比基于 2026 年 9 月的公开信息，可能随时间变化。

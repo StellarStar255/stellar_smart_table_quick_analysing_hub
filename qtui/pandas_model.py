@@ -216,8 +216,59 @@ class PandasTableModel(QAbstractTableModel):
                 return _FORMULA_BRUSH
             return None
         if role == Qt.ItemDataRole.ToolTipRole:
-            return self.formulas.get((row, index.column()))
+            formula = self.formulas.get((row, index.column()))
+            if formula:
+                value = self._col_info(index.column())[0][row]
+                if FormulaEngine.is_error(value):
+                    return formula + '\n' + value + ': ' + self.formula_error_details(row, index.column())
+            return formula
         return None
+
+    def formula_error_details(self, row, col):
+        """Explain an existing result; bounded dependency tracing never recalculates."""
+        from core.formula_help import diagnose, error_help, local
+        from itertools import islice
+        key = (row, col)
+        formula = self.formulas.get(key)
+        if not formula:
+            return ''
+        value = self._df.iat[row, col]
+        detail = diagnose(formula, final=True)
+        if detail:
+            return detail.message
+        message = error_help(value)
+        def address(cell):
+            return FormulaEngine.col_index_to_letter(cell[1]) + str(cell[0] + 2)
+        if value == '#CIRC!':
+            # Expand only formula nodes, never every cell in a large range.
+            pending = [(key, [key])]
+            seen = set()
+            while pending and len(seen) < 128:
+                cell, path = pending.pop()
+                if cell in seen or len(path) > 32:
+                    continue
+                seen.add(cell)
+                neighbors = set(islice(self._formula_deps.get(cell, ()), 128))
+                for bounds in islice(self._formula_ranges.get(cell, ()), 32):
+                    r0, r1, c0, c1 = bounds
+                    if r0 <= cell[0] <= r1 and c0 <= cell[1] <= c1:
+                        neighbors.add(cell)
+                    for candidate in islice(self.formulas, 512):
+                        if r0 <= candidate[0] <= r1 and c0 <= candidate[1] <= c1:
+                            neighbors.add(candidate)
+                for dep in neighbors:
+                    if dep in path:
+                        cycle = path + [dep]
+                        return message + ' ' + ' → '.join(address(c) for c in cycle)
+                    if dep in self.formulas and dep not in seen:
+                        pending.append((dep, path + [dep]))
+            return message
+        for dep in islice(self._formula_deps.get(key, ()), 128):
+            r, c = dep
+            if 0 <= r < len(self._df) and 0 <= c < len(self._df.columns):
+                if FormulaEngine.is_error(self._df.iat[r, c]):
+                    return message + local(' 引用的 {} 也存在错误，请先检查该单元格。', ' Referenced cell {} also has an error; check it first.').format(address(dep))
+        return message
 
     def _header_row_data(self, col, role):
         """视图第 0 行：列名（可编辑重命名），加粗并以底色区分。

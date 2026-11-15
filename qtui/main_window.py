@@ -36,6 +36,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.formula_engine import FormulaEngine
+from core.formula_help import local, reference_tokens
+from .formula_assistant import FormulaAssistant, FormulaLibrary, FormulaPreviewEdit
 from . import file_io, filter_engine, xlsx_filters
 from .pandas_model import PandasTableModel, to_numeric_or_keep
 
@@ -211,6 +213,8 @@ class _FastCellDelegate(QStyledItemDelegate):
         editor._typing_mode = typing
         editor._edit_index = QPersistentModelIndex(index)   # 点选时区分"本格"与被盖住的邻格
         editor._point_drag = False
+        if isinstance(editor, QLineEdit) and index.row() > 0:
+            editor.formula_assistant = FormulaAssistant(editor, view)
         if not typing and isinstance(editor, QLineEdit):
             QTimer.singleShot(0, lambda e=editor: self._caret_to_end(e))
         return editor
@@ -230,6 +234,8 @@ class _FastCellDelegate(QStyledItemDelegate):
     }
 
     def destroyEditor(self, editor, index):
+        if hasattr(editor, 'formula_assistant'):
+            editor.formula_assistant.clear()
         if editor is self.active_editor:
             self.active_editor = None
         super().destroyEditor(editor, index)
@@ -238,10 +244,17 @@ class _FastCellDelegate(QStyledItemDelegate):
         view = self.parent()
         if (event.type() == QEvent.Type.KeyPress and editor is self.active_editor
                 and isinstance(editor, QLineEdit) and isinstance(view, _ExcelTableView)):
+            assistant = getattr(editor, 'formula_assistant', None)
+            if assistant and assistant.composing:
+                return False
+            if assistant and assistant.handle_key(event):
+                return True
             key = event.key()
             mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
             shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if assistant and not assistant.validate_commit():
+                    return True
                 if mods & Qt.KeyboardModifier.ControlModifier:
                     # Excel：Ctrl+Enter 提交且不移动；有多格选区时填满整个选区
                     view.commit_and_fill(editor)
@@ -253,9 +266,13 @@ class _FastCellDelegate(QStyledItemDelegate):
                 view.toggle_absolute_ref(editor)
                 return True
             if key == Qt.Key.Key_Tab:
+                if assistant and not assistant.validate_commit():
+                    return True
                 view.commit_and_move(editor, 0, 1, tab=True)
                 return True
             if key == Qt.Key.Key_Backtab:
+                if assistant and not assistant.validate_commit():
+                    return True
                 view.commit_and_move(editor, 0, -1, tab=True)
                 return True
             if (key in self._ARROW_DELTAS and mods == Qt.KeyboardModifier.NoModifier
@@ -281,12 +298,19 @@ class _FastCellDelegate(QStyledItemDelegate):
         if (event.type() == QEvent.Type.FocusOut
                 and editor is self.active_editor):
             view = self.parent()
+            assistant = getattr(editor, 'formula_assistant', None)
+            if (getattr(editor, '_formula_library_open', False)
+                    or event.reason() in (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason)):
+                return True
             if (isinstance(view, _ExcelTableView)
                     and view._formula_editor() is editor
                     and view._point_insert_start(editor) is not None):
                 w = QApplication.focusWidget()
                 if w is view or w is view.viewport():
                     return False
+            if assistant and not assistant.validate_commit():
+                QTimer.singleShot(0, editor.setFocus)
+                return True
         return super().eventFilter(editor, event)
 
     def _point_mode_mouse(self, editor, event):
@@ -392,6 +416,14 @@ class _FastCellDelegate(QStyledItemDelegate):
                 filtered = (index.column() in header.filtered_columns
                             if isinstance(header, FilterHeaderView) else False)
                 paint_arrow(painter, arrow_box, filtered, pen_color)
+
+        if (index.row() > 0 and (index.row() - HEADER_ROWS, index.column()) in model.formulas
+                and FormulaEngine.is_error(text)):
+            painter.save()
+            painter.setPen(QPen(QColor('#d17b20'), 2))
+            painter.drawLine(rect.right() - 8, rect.top() + 2, rect.right() - 2, rect.top() + 2)
+            painter.drawLine(rect.right() - 2, rect.top() + 2, rect.right() - 2, rect.top() + 8)
+            painter.restore()
 
         # 当前单元格边框（保留可见的焦点指示）
         if option.state & QStyle.StateFlag.State_HasFocus:
@@ -503,6 +535,9 @@ class _ExcelTableView(QTableView):
 
     def commit_and_move(self, editor, dr, dc, enter=False, tab=False):
         """提交编辑器内容、关闭编辑器（不自动打开下一格的编辑器），再移动。"""
+        assistant = getattr(editor, 'formula_assistant', None)
+        if assistant and not assistant.validate_commit():
+            return
         self.commitData(editor)
         self.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
         self.move_relative(dr, dc, enter=enter, tab=tab)
@@ -510,6 +545,9 @@ class _ExcelTableView(QTableView):
     def commit_and_fill(self, editor):
         """Ctrl+Enter：提交编辑器、留在原格；选区有多格时把输入填进每一格
         （公式按相对位置平移，与 Excel 一致）。"""
+        assistant = getattr(editor, 'formula_assistant', None)
+        if assistant and not assistant.validate_commit():
+            return
         text = editor.text()
         cur = self.currentIndex()
         self.commitData(editor)
@@ -532,8 +570,6 @@ class _ExcelTableView(QTableView):
         if filled and hasattr(win, "update_statusbar"):
             win.update_statusbar(tr("已填充 {} 个单元格").format(filled))
 
-    _REF_TOKEN = re.compile(r'\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?')
-
     @staticmethod
     def _cycle_absolute(ref):
         """A1 -> $A$1 -> A$1 -> $A1 -> A1（区域按首端点的状态整体切换）。"""
@@ -549,13 +585,16 @@ class _ExcelTableView(QTableView):
 
     def toggle_absolute_ref(self, editor):
         """F4：切换光标所在（或紧邻）引用的绝对/相对形式。"""
-        text, pos = editor.text(), editor.cursorPosition()
-        for m in self._REF_TOKEN.finditer(text):
-            if m.start() <= pos <= m.end():
-                new = self._cycle_absolute(m.group())
-                editor.setText(text[:m.start()] + new + text[m.end():])
-                editor.setCursorPosition(m.start() + len(new))
-                editor._point_span = None   # 点选记录已失效
+        text = editor.text()
+        pos = len(text.encode('utf-16-le')[:editor.cursorPosition() * 2].decode('utf-16-le', errors='ignore'))
+        for token in reference_tokens(text):
+            if token.start <= pos <= token.end:
+                new = self._cycle_absolute(token.text)
+                start = len(text[:token.start].encode('utf-16-le')) // 2
+                length = len(token.text.encode('utf-16-le')) // 2
+                editor.setSelection(start, length)
+                editor.insert(new)
+                editor._point_span = None
                 return True
         return False
 
@@ -783,6 +822,39 @@ class _ExcelTableView(QTableView):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        spans = getattr(self, '_formula_reference_spans', [])
+        if spans:
+            painter = QPainter(self.viewport())
+            painter.setClipRect(self.viewport().rect())
+            m = self.model()
+            top = max(0, self.rowAt(0))
+            bottom = self.rowAt(self.viewport().height() - 1)
+            if bottom < 0:
+                bottom = m.rowCount() - 1
+            left = max(0, self.columnAt(0))
+            right = self.columnAt(self.viewport().width() - 1)
+            if right < 0:
+                right = m.columnCount() - 1
+            for ref, color in spans:
+                ends = ref.split(':')
+                try:
+                    def rc(value):
+                        match = re.fullmatch(r'\$?([A-Za-z]+)\$?(\d+)', value)
+                        return int(match.group(2)) - 1, FormulaEngine.col_letter_to_index(match.group(1))
+                    r0, c0 = rc(ends[0]); r1, c1 = rc(ends[-1])
+                    r0, r1 = sorted((r0, r1)); c0, c1 = sorted((c0, c1))
+                    r0, r1 = max(r0, top), min(r1, bottom, m.rowCount() - 1)
+                    c0, c1 = max(c0, left), min(c1, right, m.columnCount() - 1)
+                    if r0 > r1 or c0 > c1:
+                        continue
+                    rect = self.visualRect(m.index(r0, c0)).united(self.visualRect(m.index(r1, c1)))
+                    fill = QColor(color); fill.setAlpha(22)
+                    painter.fillRect(rect, fill)
+                    painter.setPen(QPen(QColor(color), 2))
+                    painter.drawRect(rect.adjusted(1, 1, -1, -1))
+                except (ValueError, AttributeError):
+                    continue
+            painter.end()
         header = self.horizontalHeader()
         gap = getattr(header, "drop_gap", None)
         if gap is not None:
@@ -1136,6 +1208,8 @@ class MainWindow(QMainWindow):
         self._build_docks()
         self._build_menu()
         self._build_statusbar()
+        self.model.dataChanged.connect(self._refresh_formula_feedback)
+        self.model.modelReset.connect(self._refresh_formula_feedback)
         self._apply_zoom()
         self.table.selectionModel().currentChanged.connect(self._on_current_cell_changed)
         # 列重命名联动：同步筛选条件/original_df；失败时状态栏提示
@@ -1242,6 +1316,7 @@ class MainWindow(QMainWindow):
         self._add_action(edit_menu, tr("向下填充"), lambda: self.table.fill_selection(True), "Ctrl+D")
         self._add_action(edit_menu, tr("向右填充"), lambda: self.table.fill_selection(False), "Ctrl+R")
         self._add_action(edit_menu, tr("自动求和"), self.auto_sum, "Alt+=")
+        self._add_action(edit_menu, local("插入函数…", "Insert Function…"), self.open_formula_library)
         self._add_action(edit_menu, tr("插入日期"), lambda: self.insert_datetime(False), "Ctrl+;")
         self._add_action(edit_menu, tr("插入时间"), lambda: self.insert_datetime(True),
                          ["Ctrl+Shift+;", "Ctrl+:"])
@@ -1442,6 +1517,12 @@ class MainWindow(QMainWindow):
             ("保存", self.save_file), ("保存为", self.save_as_copy),
             ("关闭文件", self.close_file)))
         tb.addSeparator()
+        self.formula_library_button = QPushButton('fx')
+        self.formula_library_button.setToolTip(local('插入函数：搜索用途、查看参数与示例', 'Insert Function: search purposes, arguments and examples'))
+        self.formula_library_button.setAccessibleName(local('插入函数', 'Insert Function'))
+        self.formula_library_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.formula_library_button.clicked.connect(self.open_formula_library)
+        tb.addWidget(self.formula_library_button)
         self._add_toolbar_buttons(tb, (
             ("撤销", self.undo), ("重做", self.redo), ("查找", self.open_find_dialog)))
         tb.addSeparator()
@@ -1490,6 +1571,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.filter_bar)
+        self.formula_feedback = QWidget()
+        feedback_layout = QHBoxLayout(self.formula_feedback)
+        feedback_layout.setContentsMargins(8, 5, 8, 5)
+        self.formula_error_label = QLabel()
+        self.formula_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.formula_error_label.setWordWrap(True)
+        feedback_layout.addWidget(self.formula_error_label, 1)
+        self.formula_edit_button = QPushButton(local('编辑公式', 'Edit formula'))
+        self.formula_edit_button.clicked.connect(self.edit_current_formula)
+        feedback_layout.addWidget(self.formula_edit_button)
+        self.formula_feedback.hide()
+        layout.addWidget(self.formula_feedback)
         layout.addWidget(self.table, 1)
         layout.addWidget(self._build_sheet_bar())
         self.document_widget = central
@@ -1576,7 +1669,9 @@ class MainWindow(QMainWindow):
         # 单元格内容预览（可编辑，方便查看/修改长文本）
         self.cell_preview_dock = QDockWidget(tr("单元格内容"), self)
         self.cell_preview_dock.setObjectName("cell_preview_dock")
-        self.cell_preview_text = QPlainTextEdit()
+        self.cell_preview_text = FormulaPreviewEdit()
+        self.cell_preview_text.formula_assistant = FormulaAssistant(self.cell_preview_text, self.table)
+        self._preview_formula_pending = False
         self.cell_preview_text.setPlaceholderText(tr("选中单元格后在此查看/编辑内容"))
         self.cell_preview_dock.setWidget(self.cell_preview_text)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cell_preview_dock)
@@ -1926,6 +2021,7 @@ class MainWindow(QMainWindow):
     def save_file(self):
         """保存到当前文件。未命名或旧版 .xls（只能写出 xlsx）时转到另存为。
         返回是否真正保存成功——"未保存修改"提示里选"保存"后取消/失败都不能丢数据。"""
+        self._flush_preview()
         if not self.current_file:
             return self._save_as(switch_to=True)
         if os.path.splitext(self.current_file)[1].lower() == ".xls":
@@ -1935,6 +2031,7 @@ class MainWindow(QMainWindow):
         return self._do_save(self.current_file)
 
     def save_as_copy(self):
+        self._flush_preview()
         return self._save_as(switch_to=False)
 
     def _ask_save_path(self, switch_to):
@@ -3680,7 +3777,13 @@ class MainWindow(QMainWindow):
         # 一次公式重算；_mark_modified 也只在批后触发一次
         self.model.set_cells(entries)
         self._mark_modified()
-        self.update_statusbar(tr("已粘贴 {} 行").format(len(rows)))
+        errors = sum(1 for r, c, value in entries
+                     if r > 0 and isinstance(value, str) and value.startswith('=')
+                     and FormulaEngine.is_error(self.model.data(self.model.index(r, c), Qt.ItemDataRole.DisplayRole)))
+        message = tr("已粘贴 {} 行").format(len(rows))
+        if errors:
+            message += local('；其中 {} 个公式计算出错，选中错误单元格可查看原因。', '; {} formulas have errors. Select an error cell for details.').format(errors)
+        self.update_statusbar(message)
 
     def _append_empty_rows(self, n):
         """在表尾追加 n 个空行——走可撤销的结构操作，而不是 set_dataframe
@@ -3835,6 +3938,54 @@ class MainWindow(QMainWindow):
         self.table.setCurrentIndex(index)
         self.table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
+    def open_formula_library(self):
+        editor = self._cell_delegate.active_editor
+        if editor is not None:
+            editor._formula_library_open = True
+            if hasattr(editor, 'formula_assistant'):
+                editor.formula_assistant.hide()
+        dialog = FormulaLibrary(self)
+        try:
+            accepted = dialog.exec()
+        finally:
+            if editor is not None:
+                editor._formula_library_open = False
+        if not accepted or not dialog.selected_function:
+            if editor is not None:
+                editor.setFocus()
+            return
+        if editor is None:
+            idx = self.table.currentIndex()
+            if not idx.isValid() or idx.row() == 0:
+                self.update_statusbar(local('请先选择一个数据单元格。', 'Select a data cell first.'))
+                return
+            self.table.edit(idx)
+            editor = self._cell_delegate.active_editor
+        if editor is not None and hasattr(editor, 'formula_assistant'):
+            editor.formula_assistant.insert_function(dialog.selected_function)
+
+    def edit_current_formula(self):
+        index = self.table.currentIndex()
+        if index.isValid() and index.row() > 0:
+            self.table.setFocus()
+            self.table.edit(index)
+
+    def _refresh_formula_feedback(self, *_):
+        if not hasattr(self, 'formula_feedback'):
+            return
+        idx = self.table.currentIndex()
+        if not idx.isValid() or idx.row() == 0:
+            self.formula_feedback.hide()
+            return
+        key = (idx.row() - HEADER_ROWS, idx.column())
+        value = self.model.data(idx, Qt.ItemDataRole.DisplayRole)
+        formula = self.model.formulas.get(key)
+        if formula and FormulaEngine.is_error(value):
+            self.formula_error_label.setText(value + '  ' + self.model.formula_error_details(*key))
+            self.formula_feedback.show()
+        else:
+            self.formula_feedback.hide()
+
     # ================= 单元格内容预览 =================
 
     def _flush_preview(self):
@@ -3845,9 +3996,11 @@ class MainWindow(QMainWindow):
         所有整表替换的入口都必须先调用这里。
         """
         timer = getattr(self, "_preview_save_timer", None)
-        if timer is not None and timer.isActive():
+        if timer is not None and (timer.isActive() or getattr(self, '_preview_formula_pending', False)):
             timer.stop()
-            self._save_cell_preview()
+            # Context changes preserve source text even if it cannot yet compute,
+            # just like importing/pasting an erroneous formula. Enter validates.
+            self._save_cell_preview(validate=False)
 
     def _on_model_reset_preview(self):
         """模型整表重置后旧的预览坐标已失效：作废未落盘的编辑并清空预览框。"""
@@ -3856,11 +4009,14 @@ class MainWindow(QMainWindow):
             return
         timer.stop()
         self._preview_cell = None
+        self._preview_formula_pending = False
+        self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
         self._preview_loading = True
         self.cell_preview_text.clear()
         self._preview_loading = False
 
     def _on_current_cell_changed(self, current, previous):
+        self._refresh_formula_feedback()
         # 400ms 延迟保存还没触发就切换单元格：先写回原单元格，否则编辑丢失
         self._flush_preview()
         if current.isValid():
@@ -3880,18 +4036,46 @@ class MainWindow(QMainWindow):
             for panel in self._image_panels.values():
                 panel.set_current_row(-1)
 
+    def _cancel_preview_formula(self):
+        cell = getattr(self, '_preview_cell', None)
+        if cell:
+            self._preview_save_timer.stop()
+            self._preview_loading = True
+            self.cell_preview_text.setPlainText(self.model.data(self.model.index(*cell), Qt.ItemDataRole.EditRole) or '')
+            self._preview_loading = False
+            self._preview_formula_pending = False
+            self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
+            self.cell_preview_text.formula_assistant.suppressed = True
+            self.cell_preview_text.formula_assistant.clear()
+
     def _on_preview_text_changed(self):
         if not self._preview_loading and getattr(self, "_preview_cell", None):
-            self._preview_save_timer.start()
+            text = self.cell_preview_text.toPlainText()
+            if text.startswith('='):
+                self._preview_save_timer.stop()
+                self._preview_formula_pending = True
+                self.cell_preview_dock.setWindowTitle(local('单元格内容 · 公式草稿（Enter 提交）', 'Cell contents · Formula draft (Enter to commit)'))
+                self.cell_preview_text.setToolTip(local('按 Enter 检查并提交，Esc 取消。切换单元格时保留原公式，错误可稍后修正。', 'Enter checks and commits; Esc cancels. Changing cells preserves the formula, including errors for later correction.'))
+            else:
+                self._preview_formula_pending = False
+                self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
+                self.cell_preview_text.setToolTip('')
+                self._preview_save_timer.start()
 
-    def _save_cell_preview(self):
+    def _save_cell_preview(self, validate=True):
         if not getattr(self, "_preview_cell", None):
             return
         row, col = self._preview_cell   # 视图坐标；行 0 = 表头（编辑即重命名）
         if row > len(self.model.df) or col >= len(self.model.df.columns):
             return
-        self.model.setData(self.model.index(row, col),
-                           self.cell_preview_text.toPlainText())
+        text = self.cell_preview_text.toPlainText()
+        if validate and row > 0 and text.startswith('='):
+            if not self.cell_preview_text.formula_assistant.validate_commit():
+                return
+        self.model.setData(self.model.index(row, col), text)
+        self._preview_formula_pending = False
+        self.cell_preview_text.setToolTip('')
+        self.cell_preview_dock.setWindowTitle(tr('单元格内容'))
 
     # ================= 图片列 / 图片预览 =================
 

@@ -51,3 +51,16 @@ jobs:
           name: navigator-layout-linux
           path: ${{ runner.temp }}/navigator-layout/**/*.png
           if-no-files-found: ignore
+
+      - name: Linux X11 formula assistant interaction and visual regression
+        run: |
+          xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_formula_assistant.py --platform xcb --output-dir "${{ runner.temp }}/formula-assistant/scale-1"
+          QT_SCALE_FACTOR=1.5 xvfb-run -a -s '-screen 0 2560x1600x24' python3 scripts/check_formula_assistant.py --platform xcb --output-dir "${{ runner.temp }}/formula-assistant/scale-1.5"
+
+      - name: Upload formula assistant screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: formula-assistant-linux
+          path: ${{ runner.temp }}/formula-assistant/**/*.png
+          if-no-files-found: ignore
