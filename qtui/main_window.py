@@ -24,7 +24,7 @@ from PyQt6.QtCore import (
     QItemSelectionModel, pyqtSignal, QPersistentModelIndex, QModelIndex, QSignalBlocker,
 )
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen,
+    QAction, QKeySequence, QFont, QFontMetrics, QColor, QPainter, QPen, QTextOption,
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QTableView, QVBoxLayout, QHBoxLayout, QWidget, QLabel,
@@ -1734,6 +1734,8 @@ class MainWindow(QMainWindow):
         self.cell_preview_dock = QDockWidget(tr("单元格内容"), self)
         self.cell_preview_dock.setObjectName("cell_preview_dock")
         self.cell_preview_text = FormulaPreviewEdit()
+        # 按词边界折行，避免将 JSON 字段名、英文单词等从中间拆开。
+        self.cell_preview_text.setWordWrapMode(QTextOption.WrapMode.WordWrap)
         self.cell_preview_text.workbench = self.formula_workbench
         self.cell_preview_text.formula_assistant = FormulaAssistant(self.cell_preview_text, self.table)
         self._preview_formula_pending = False
