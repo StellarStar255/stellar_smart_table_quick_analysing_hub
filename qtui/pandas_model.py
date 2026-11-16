@@ -309,10 +309,10 @@ class PandasTableModel(QAbstractTableModel):
         """Repaint-only appearance: no model signals, edits or undo entries."""
         from .themes import readable
         self._formula_brush = readable(FORMULA_TEXT_COLOR, palette.base().color())
-        self._highlight_brush = QColor(palette.highlight().color()) if custom else QColor(_HIGHLIGHT_BRUSH)
-        self._highlight_brush.setAlpha(46)
-        self._header_brush = palette.highlight().color() if custom else _HEADER_ROW_BRUSH
-        self._header_text_brush = readable('#ffffff', self._header_brush) if custom else _HEADER_TEXT_BRUSH
+        self._highlight_brush = QColor(palette.link().color()) if custom else QColor(_HIGHLIGHT_BRUSH)
+        self._highlight_brush.setAlpha(22 if custom else 46)
+        self._header_brush = palette.button().color() if custom else _HEADER_ROW_BRUSH
+        self._header_text_brush = palette.buttonText().color() if custom else _HEADER_TEXT_BRUSH
         self._formula_fill_brushes.clear()
 
     def _header_row_data(self, col, role):
@@ -337,7 +337,7 @@ class PandasTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.FontRole:
             return _HEADER_ROW_FONT
         if role == Qt.ItemDataRole.ForegroundRole:
-            # 默认橙底固定配白字；自定义底色返回 None，
+            # 默认表头使用界面主题文字色；自定义底色返回 None，
             # 由绘制委托按底色亮度自动选黑/白字
             if (-1, col) not in self.cell_colors:
                 return self._header_text_brush

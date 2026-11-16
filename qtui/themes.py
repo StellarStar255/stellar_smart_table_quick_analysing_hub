@@ -13,14 +13,15 @@ def label(zh, en):
     return en if current_language() == 'en' else zh
 
 
-# Same palette family as Stellar Smart Terminal; no runtime dependency on it.
+# Neutral surfaces carry the data; each theme's hue is reserved for accents.
+# Fields: zh, en, shadow, window, canvas, control, border, accent, text, muted.
 THEMES = {
-    'deep_blue': ('深蓝', 'Deep blue', '#0f0f1a', '#1a1a2e', '#16213e', '#2d2d44', '#3d3d5c', '#667eea', '#eaeaea', '#888888'),
-    'purple': ('暗夜紫', 'Night purple', '#13111a', '#1e1a2e', '#2a2440', '#3a3350', '#4a4360', '#a855f7', '#f0e6ff', '#9988aa'),
-    'amber': ('琥珀', 'Amber', '#0f0d0b', '#171310', '#1f1a16', '#2a231d', '#362d25', '#f59e0b', '#f2ece4', '#a09384'),
-    'midnight': ('午夜黑', 'Midnight', '#000000', '#0a0a0a', '#141414', '#1e1e1e', '#2a2a2a', '#3b82f6', '#f5f5f5', '#888888'),
-    'light': ('浅色', 'Light', '#ececef', '#f5f5f7', '#ffffff', '#e3e3e8', '#d1d1d6', '#007aff', '#1d1d1f', '#6e6e73'),
-    'pink': ('粉红', 'Pink', '#1a0a14', '#2e1a28', '#3e2838', '#4e3848', '#5e4858', '#ec4899', '#fce7f3', '#aa8899'),
+    'deep_blue': ('深蓝', 'Deep blue', '#111720', '#1e2733', '#18212c', '#283443', '#344252', '#8bb8ec', '#e2eaf3', '#9aaabd'),
+    'purple': ('暗夜紫', 'Night purple', '#17151e', '#26232f', '#1f1d27', '#312d3b', '#403a4c', '#b8a1df', '#e9e4f0', '#aaa0ba'),
+    'amber': ('琥珀', 'Amber', '#191714', '#2b2722', '#231f1b', '#363029', '#463d33', '#d8b27c', '#eee7dd', '#b4a695'),
+    'midnight': ('午夜黑', 'Midnight', '#101113', '#222428', '#1a1c20', '#2d3035', '#3a3e45', '#a0b9d8', '#e5e7eb', '#a0a6b0'),
+    'light': ('浅色', 'Light', '#dce1e8', '#f3f5f8', '#ffffff', '#eaeef3', '#d5dce5', '#3569a8', '#263244', '#68778b'),
+    'pink': ('粉红', 'Pink', '#1c1619', '#2e252a', '#251e22', '#3a2e34', '#4b3c43', '#d9a0b3', '#f0e5e9', '#b9a0aa'),
 }
 SKINS = {'standard': ('标准', 'Standard'), 'rounded': ('圆润', 'Rounded'), 'compact': ('紧凑', 'Compact')}
 
@@ -51,13 +52,23 @@ def readable(color, background, minimum=4.5):
     return target
 
 
+def blend(background, foreground, amount):
+    a, b = QColor(background), QColor(foreground)
+    return QColor.fromRgbF(*[
+        x + (y - x) * amount for x, y in zip(
+            (a.redF(), a.greenF(), a.blueF()),
+            (b.redF(), b.greenF(), b.blueF()))])
+
+
 def theme_palette(key):
     _, _, darkest, window, base, button, border, accent, text, dim = THEMES[key]
     p = QPalette()
+    # Selection is a quiet tinted surface, independent of the focus/link accent.
+    selection = blend(base, accent, .16 if key == 'light' else .26)
     roles = {
-        'Window': window, 'WindowText': text, 'Base': base, 'AlternateBase': window,
-        'Text': text, 'Button': button, 'ButtonText': text, 'Highlight': accent,
-        'HighlightedText': readable('#ffffff', accent), 'Link': readable(accent, base),
+        'Window': window, 'WindowText': text, 'Base': base, 'AlternateBase': blend(base, window, .45),
+        'Text': text, 'Button': button, 'ButtonText': text, 'Highlight': selection,
+        'HighlightedText': readable(text, selection), 'Link': readable(accent, base),
         'LinkVisited': readable('#a855f7', base), 'PlaceholderText': readable(dim, base),
         'Light': border, 'Midlight': button, 'Mid': border, 'Dark': darkest,
         'Shadow': darkest, 'ToolTipBase': button, 'ToolTipText': text,
@@ -79,10 +90,10 @@ def set_color_scheme(hints, scheme):
             setter(scheme)
 
 
-def stylesheet(skin):
+def stylesheet(skin, custom=False):
     radius, padding = {'standard': (4, '4px 8px'), 'rounded': (10, '6px 10px'), 'compact': (2, '2px 5px')}[skin]
     # Palette roles also cover dialogs and widgets created after switching.
-    return f"""
+    sheet = f"""
     QToolTip {{ background: palette(tool-tip-base); color: palette(tool-tip-text); border: 1px solid palette(mid); padding: 5px; }}
     QToolBar {{ border: none; spacing: 3px; padding: 2px; }}
     QPushButton, QToolButton, QComboBox {{ background: palette(button); color: palette(button-text); border: 1px solid palette(mid); border-radius: {radius}px; padding: {padding}; }}
@@ -103,6 +114,29 @@ def stylesheet(skin):
     QTabBar::tab {{ background: palette(button); color: palette(text); padding: {padding}; border-radius: {radius}px; }}
     QTabBar::tab:selected {{ background: palette(base); color: palette(link); }}
     """
+    if custom:
+        sheet += """
+        QMainWindow::separator { background: palette(window); width: 5px; height: 5px; }
+        QMainWindow::separator:hover { background: palette(mid); }
+        QPushButton:hover, QToolButton:hover, QComboBox:hover { background: palette(midlight); border-color: palette(link); }
+        QPushButton:default { border-color: palette(link); }
+        QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: palette(link); }
+        QHeaderView::section { border: none; border-right: 1px solid palette(mid); border-bottom: 1px solid palette(mid); }
+        QDockWidget::title { background: palette(window); color: palette(window-text); padding: 6px; }
+        QTabBar::tab { margin: 2px; }
+        QTabBar::tab:selected { background: palette(highlight); color: palette(highlighted-text); }
+        QMenu { padding: 4px; }
+        QMenu::item { padding: 6px 24px; border-radius: 3px; }
+        QScrollBar:vertical { background: palette(base); width: 12px; margin: 2px; }
+        QScrollBar:horizontal { background: palette(base); height: 12px; margin: 2px; }
+        QScrollBar::handle { background: palette(mid); border-radius: 4px; }
+        QScrollBar::handle:vertical { min-height: 24px; }
+        QScrollBar::handle:horizontal { min-width: 24px; }
+        QScrollBar::handle:hover { background: palette(placeholder-text); }
+        QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+        """
+    return sheet
 
 
 class ThemeManager(QObject):
@@ -178,7 +212,7 @@ class ThemeManager(QObject):
             # Set the palette before stylesheet polishing (also affects native popups).
             self.app.setPalette(palette)
             self._styled = self.theme != 'system' or self.skin != 'standard'
-            self.app.setStyleSheet(self.original_sheet + (stylesheet(self.skin) if self._styled else ''))
+            self.app.setStyleSheet(self.original_sheet + (stylesheet(self.skin, custom=self.theme != 'system') if self._styled else ''))
             for window in list(self.windows):
                 if sip.isdeleted(window):
                     self.windows.discard(window)
